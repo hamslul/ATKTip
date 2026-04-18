@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Dalamud.NET.Sdk/14.0.2">
+
+  <PropertyGroup>
+    <Version>0.1.0</Version>
+    <Author>ATK</Author>
+    <Name>ATKTip</Name>
+    <Punchline>FFLogs-powered average rotation timelines for every fight and job.</Punchline>
+    <Description>Displays aggregated skill timelines from top FFLogs parses. Shows what the average top player does at any given moment in a fight, with a live overlay that tracks your current encounter.</Description>
+    <PackageProjectUrl>https://github.com/ATK/ATKTip</PackageProjectUrl>
+    <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
+    <IsPackable>false</IsPackable>
+    <DalamudApiLevel>14</DalamudApiLevel>
+    <Tags>combat,timeline,fflogs,rotation,overlay,raid</Tags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <OutputPath>bin\x64\Release</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+</Project>

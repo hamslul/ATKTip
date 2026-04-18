@@ -1,0 +1,1383 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Numerics;
+using Dalamud.Bindings.ImGui;
+using Dalamud.Game.ClientState.Conditions;
+using Dalamud.Interface.Windowing;
+using Dalamud.Interface.Textures;
+using Dalamud.Plugin.Services;
+using FFXIVClientStructs.FFXIV.Client.Game;
+using ATKTip.Data;
+
+namespace ATKTip.Windows;
+
+/// <summary>
+/// Overlay window that renders an ATR-exact two-pass timeline:
+///   Pass 1 (General layer) — horizontal GCD/oGCD bars
+///   Pass 2 (Icon layer)    — action icons drawn on top of bars
+/// Boss casts are rendered in a strip anchored to the bottom edge.
+/// </summary>
+public sealed class OverlayWindow : Window, IDisposable
+{
+    private readonly Plugin plugin;
+    private readonly ICondition condition;
+    private readonly IDutyState dutyState;
+    private readonly IFramework framework;
+    private readonly IPluginLog log;
+
+    // ── Auto-execute (hidden feature) ──
+    /// <summary>
+    /// When true, each timeline entry is automatically executed via
+    /// <c>ActionManager.UseAction</c> the moment it crosses the red bar during live combat.
+    /// Enabled by clicking the Config tab label 7 times in a row in the main window.
+    /// </summary>
+    public bool AutoExecuteEnabled { get; set; }
+    // Queue-based auto-execute state.
+    // autoExecQueue  – actions waiting to fire; one dequeued per frame when AnimationLock == 0.
+    //                  Tuple includes wall-clock enqueue time so stale entries can be purged.
+    // autoExecQueued – timeline keys already seen (enqueued OR window-expired); prevents re-enqueue.
+    private readonly Queue<(double scheduledAt, int abilityId, long enqueuedAtMs)> autoExecQueue  = new();
+    private readonly HashSet<(double timeSec, int abilityId)>                      autoExecQueued = [];
+    private double autoExecLastElapsed = -1.0;   // tracks previous frame's elapsed for backward-scrub detection
+
+    // ── ATR geometry constants (match ATR defaults exactly) ──
+    // GCDHeightHigh / GCDHeightLow control the vertical extent of the GCD bar.
+    // ATR defaults: high=0.5, low=0.8 → bar spans centerY+0 to centerY+0.3*iconSize.
+    private const float GCDHeightHigh  = 0.5f;
+    private const float GCDHeightLow   = 0.8f;
+    // OGCDOffset: fraction of GCD icon size above center the oGCD sits.
+    private const float OGCDOffset     = 0.1f;
+    // GCD window duration (no live cast data available, use the standard 2.5 s).
+    private const float GCDWindowSec   = 2.5f;
+    // oGCD animlock window (shorter bar for oGCDs).
+    private const float OGCDWindowSec  = 0.8f;
+    // Rounding radius for bars (matches ATR GCDRound default ~4).
+    private const float BarRound       = 4.0f;
+    // Gap between stacked icons in the same bucket.
+    private const float IconGap        = 2.0f;
+
+    // ── ATR-exact colours ──
+    // GCD bar: dark background, blue cast fill, white border.
+    private static readonly Vector4 ColGCDBackground  = new(0.20f, 0.20f, 0.20f, 1.00f);
+    private static readonly Vector4 ColGCDCast        = new(0.40f, 0.60f, 0.90f, 1.00f);
+    private static readonly Vector4 ColGCDBorder      = new(1.00f, 1.00f, 1.00f, 0.80f);
+    // oGCD bar: same dark background, green cast fill (distinguishes from GCDs).
+    private static readonly Vector4 ColOGCDBackground = new(0.20f, 0.20f, 0.20f, 1.00f);
+    private static readonly Vector4 ColOGCDCast       = new(0.40f, 0.85f, 0.45f, 1.00f);
+    private static readonly Vector4 ColOGCDBorder     = new(1.00f, 1.00f, 1.00f, 0.70f);
+    // Center guide line (ATR GridCenterLine).
+    private static readonly Vector4 ColCenterLine     = new(0.80f, 0.80f, 0.80f, 0.50f);
+    // Now / start line (ATR GridStartLine — red vertical bar at current time).
+    private static readonly Vector4 ColNowLine        = new(0.80f, 0.20f, 0.20f, 1.00f);
+    // Grid lines.
+    private static readonly Vector4 ColGrid           = new(1.00f, 1.00f, 1.00f, 0.12f);
+    private static readonly Vector4 ColGridMajor      = new(1.00f, 1.00f, 1.00f, 0.28f);
+    private static readonly Vector4 ColGridLabel      = new(1.00f, 1.00f, 1.00f, 0.22f);
+
+    // ── Combat tracking ──
+    private bool     inCombat;
+    private DateTime combatStartTime;
+    private double   combatElapsedSec;
+    /// <summary>When true the view is frozen at <see cref="combatElapsedSec"/> so the
+    /// user can study upcoming abilities without the red line advancing.</summary>
+    private bool     combatViewPaused;
+    /// <summary>Set when the user clicks × to close the overlay mid-combat.
+    /// Suppresses ants and auto-execute until a fresh timeline is loaded.</summary>
+    private bool     overlayDismissed;
+    /// <summary>
+    /// True when the active timeline was loaded because the player entered a
+    /// mapped encounter zone (set by <see cref="PrepareCombatPreview"/>).
+    /// When false (e.g. user manually loaded from the viewer), combat events are
+    /// ignored so attacking a training dummy doesn't accidentally start playback.
+    /// </summary>
+    private bool     isEncounterZone;
+
+    // ── Preview (scrub) mode ──
+    private bool     isPreview;
+    private bool     previewAutoplay;
+    private DateTime previewStartTime;
+    private double   previewManualTimeSec;
+    private bool     isScrubbing;
+
+    // ── Timeline data ──
+    private AggregatedTimeline?      activeTimeline;
+    private string                   activeTimelineKey = string.Empty;
+    private Dictionary<int, bool>    skillVisibility   = [];
+
+    // ── Caches ──
+    private readonly Dictionary<int, uint> iconIdCache = [];
+    private readonly ConcurrentDictionary<int, bool> oGcdCache = new();
+
+    private Configuration Cfg => plugin.Configuration;
+
+    // ═══════════════════════════════════════════════════════════════════
+
+    public OverlayWindow(Plugin plugin, ICondition condition, IDutyState dutyState, IFramework framework, IPluginLog log)
+        : base("ATKTip##Overlay",
+            ImGuiWindowFlags.NoTitleBar      |
+            ImGuiWindowFlags.NoScrollbar     |
+            ImGuiWindowFlags.NoScrollWithMouse |
+            ImGuiWindowFlags.NoCollapse)
+    {
+        this.plugin     = plugin;
+        this.condition  = condition;
+        this.dutyState  = dutyState;
+        this.framework  = framework;
+        this.log        = log;
+
+        condition.ConditionChange += OnConditionChange;
+        dutyState.DutyWiped      += OnDutyWiped;
+        dutyState.DutyCompleted  += OnDutyCompleted;
+        framework.Update         += OnFrameworkUpdate;
+
+        RespectCloseHotkey = false;
+
+        SizeConstraints = new WindowSizeConstraints
+        {
+            MinimumSize = new Vector2(300,  60),
+            MaximumSize = new Vector2(float.MaxValue, 400),
+        };
+    }
+
+    // ── Public API ──────────────────────────────────────────────────────
+
+    /// <summary>True when a timeline is loaded and ready to display.</summary>
+    public bool HasActiveTimeline => activeTimeline != null;
+
+    public void SetTimeline(AggregatedTimeline? timeline, string key)
+    {
+        activeTimeline    = timeline;
+        activeTimelineKey = key;
+        overlayDismissed  = false;      // fresh load — re-enable ants and auto-exec
+        skillVisibility.Clear();
+        oGcdCache.Clear();
+        autoExecQueue.Clear();
+        autoExecQueued.Clear();
+        autoExecLastElapsed = -1.0;
+
+        if (timeline != null)
+        {
+            var hidden = plugin.Configuration.HiddenAbilities.GetValueOrDefault(key);
+            foreach (var id in timeline.Entries.Select(e => e.AbilityId).Distinct())
+                skillVisibility[id] = hidden == null || !hidden.Contains(id);
+
+            // Pre-classify every entry as GCD or oGCD once at load time so per-frame
+            // loops can use the cached flag instead of re-querying RecastDatabase.
+            foreach (var e in timeline.Entries)
+                e.IsGcd = !IsOGCD(e.AbilityId);
+        }
+    }
+
+    public void StartPreview(AggregatedTimeline timeline)
+    {
+        var key = TimelineDatabase.MakeKey(timeline.EncounterId, timeline.SpecName);
+        SetTimeline(timeline, key);
+        isPreview            = true;
+        previewAutoplay      = false;   // start paused — user presses play to begin
+        previewStartTime     = DateTime.UtcNow;
+        previewManualTimeSec = 0;
+        combatElapsedSec     = 0;
+        isScrubbing          = false;
+        autoExecQueue.Clear();
+        autoExecQueued.Clear();
+        autoExecLastElapsed  = -1.0;
+        IsOpen               = true;
+    }
+
+    public void StopPreview()
+    {
+        isPreview            = false;
+        previewAutoplay      = false;
+        combatElapsedSec     = 0;
+        previewManualTimeSec = 0;
+        isScrubbing          = false;
+        isEncounterZone      = false;
+        IsOpen               = false;
+    }
+
+    /// <summary>
+    /// Clears the active timeline and closes the overlay when the player leaves
+    /// a mapped instance. Does not affect manually-started previews.
+    /// </summary>
+    public void ClearForZoneChange()
+    {
+        SetTimeline(null, string.Empty);
+        isPreview        = false;
+        previewAutoplay  = false;
+        combatElapsedSec = 0;
+        inCombat         = false;
+        isScrubbing      = false;
+        isEncounterZone  = false;
+        IsOpen           = false;
+    }
+
+    /// <summary>
+    /// Opens the overlay in a paused preview at t=0 so the player can study the
+    /// timeline before the pull. When combat starts, OnConditionChange locks the
+    /// overlay and switches to live tracking automatically.
+    /// </summary>
+    public void PrepareCombatPreview(AggregatedTimeline timeline)
+    {
+        var key = TimelineDatabase.MakeKey(timeline.EncounterId, timeline.SpecName);
+        SetTimeline(timeline, key);
+        isPreview            = true;
+        previewAutoplay      = false;   // paused — user scrubs freely
+        previewStartTime     = DateTime.UtcNow;
+        previewManualTimeSec = 0;
+        combatElapsedSec     = 0;
+        isScrubbing          = false;
+        isEncounterZone      = true;    // loaded by EncounterTracker — respond to combat events
+        autoExecQueue.Clear();
+        autoExecQueued.Clear();
+        autoExecLastElapsed  = -1.0;
+        IsOpen               = true;
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="abilityId"/> should have native FFXIV ants
+    /// this frame.  Called from the <c>IsActionHighlighted</c> hook on the game thread.
+    /// Uses per-type (GCD / oGCD) timing windows and enable flags.
+    /// </summary>
+    public bool IsAbilityInAntsWindow(int abilityId)
+    {
+        if (!Cfg.AntsEnabled) return false;
+        if (activeTimeline == null) return false;
+        if (!inCombat && !isPreview) return false;
+        if (overlayDismissed) return false;
+
+        // Compute elapsed time fresh so the hook (game thread) stays in sync with
+        // the red line regardless of when the last Draw() frame ran.
+        var elapsed = inCombat
+            ? (DateTime.UtcNow - combatStartTime).TotalSeconds
+            : combatElapsedSec;   // preview uses the scrub position set on the UI thread
+
+        if (IsOGCD(abilityId))
+        {
+            if (!Cfg.OgcdAntsEnabled) return false;
+
+            var before        = (double)Cfg.AntsDurationBefore;
+            var after         = (double)Cfg.AntsDurationAfter;
+            // oGCD visual positions are shifted by OGCDHorizontalOffset pixels.
+            var ogcdTimeDelta = Cfg.OverlayPixelsPerSec > 0f
+                ? (double)Cfg.OGCDHorizontalOffset / (double)Cfg.OverlayPixelsPerSec
+                : 0.0;
+
+            foreach (var e in activeTimeline.Entries)
+            {
+                if (e.AbilityId != abilityId) continue;
+                if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
+                var rel = (e.TimeOffsetSec + ogcdTimeDelta) - elapsed;
+                if (rel >= -after && rel <= before) return true;
+            }
+            return false;
+        }
+        else
+        {
+            if (!Cfg.GcdAntsEnabled) return false;
+
+            var before    = (double)Cfg.GcdAntsDurationBefore;
+            var after     = (double)Cfg.GcdAntsDurationAfter;
+
+            // GCDs: exactly one glows — the entry closest to the red line.
+            Data.TimelineEntry? bestGcd = null;
+            var minAbsRel = double.MaxValue;
+            foreach (var e in activeTimeline.Entries)
+            {
+                if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
+                if (!e.IsGcd) continue;
+                var rel = e.TimeOffsetSec - elapsed;
+                if (rel < -after || rel > before) continue;
+                var absRel = Math.Abs(rel);
+                if (absRel < minAbsRel) { minAbsRel = absRel; bestGcd = e; }
+            }
+            return bestGcd != null && bestGcd.AbilityId == abilityId;
+        }
+    }
+
+    /// <summary>
+    /// Returns the sets of ability IDs that should display custom ants this frame,
+    /// split by type so <see cref="AntsController"/> can render each with its own style.
+    /// </summary>
+    public (HashSet<int> Gcd, HashSet<int> Ogcd) GetAntsAbilityIds()
+    {
+        var gcd  = new HashSet<int>();
+        var ogcd = new HashSet<int>();
+        if (!Cfg.AntsEnabled) return (gcd, ogcd);
+        if (overlayDismissed) return (gcd, ogcd);
+        if (activeTimeline == null) return (gcd, ogcd);
+        if (!inCombat && !isPreview) return (gcd, ogcd);
+
+        var elapsed = inCombat
+            ? (DateTime.UtcNow - combatStartTime).TotalSeconds
+            : combatElapsedSec;
+
+        // ── oGCDs ─────────────────────────────────────────────────────────
+        if (Cfg.OgcdAntsEnabled)
+        {
+            var before        = (double)Cfg.AntsDurationBefore;
+            var after         = (double)Cfg.AntsDurationAfter;
+            var ogcdTimeDelta = Cfg.OverlayPixelsPerSec > 0f
+                ? (double)Cfg.OGCDHorizontalOffset / (double)Cfg.OverlayPixelsPerSec
+                : 0.0;
+
+            foreach (var e in activeTimeline.Entries)
+            {
+                if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
+                if (e.IsGcd) continue;
+                var rel = (e.TimeOffsetSec + ogcdTimeDelta) - elapsed;
+                if (rel >= -after && rel <= before) ogcd.Add(e.AbilityId);
+            }
+        }
+
+        // ── GCDs — exactly one (the entry closest to the red line) ─────────
+        if (Cfg.GcdAntsEnabled)
+        {
+            var before    = (double)Cfg.GcdAntsDurationBefore;
+            var after     = (double)Cfg.GcdAntsDurationAfter;
+
+            Data.TimelineEntry? bestGcd = null;
+            var minAbsRel = double.MaxValue;
+            foreach (var e in activeTimeline.Entries)
+            {
+                if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
+                if (!e.IsGcd) continue;
+                var rel = e.TimeOffsetSec - elapsed;
+                if (rel < -after || rel > before) continue;
+                var absRel = Math.Abs(rel);
+                if (absRel < minAbsRel) { minAbsRel = absRel; bestGcd = e; }
+            }
+            if (bestGcd != null) gcd.Add(bestGcd.AbilityId);
+        }
+
+        return (gcd, ogcd);
+    }
+
+    // ── Combat events ───────────────────────────────────────────────────
+
+    private void OnConditionChange(ConditionFlag flag, bool value)
+    {
+        if (flag != ConditionFlag.InCombat) return;
+
+        if (value && !inCombat)
+        {
+            // Only start live tracking for timelines loaded by EncounterTracker
+            // (i.e. the player is actually in a mapped encounter zone).
+            // Ignoring combat from training dummies, open-world mobs, etc.
+            if (!isEncounterZone) return;
+
+            inCombat             = true;
+            isPreview            = false;
+            previewAutoplay      = false;
+            isScrubbing          = false;
+            combatViewPaused     = false;
+            combatStartTime      = DateTime.UtcNow;
+            combatElapsedSec     = 0;
+            autoExecQueue.Clear();
+            autoExecQueued.Clear();
+
+            // Lock overlay when the fight starts so it stays in place
+            Cfg.OverlayLocked = true;
+            plugin.SaveConfig();
+
+            if (activeTimeline != null && Cfg.OverlayEnabled)
+                IsOpen = true;
+        }
+        else if (!value && inCombat)
+        {
+            inCombat = false;
+            // Instead of going blank, resume paused preview at the time combat ended.
+            if (activeTimeline != null)
+            {
+                isPreview            = true;
+                previewAutoplay      = false;
+                previewManualTimeSec = combatElapsedSec;
+                isScrubbing          = false;
+            }
+        }
+    }
+
+    private void OnDutyWiped(object? s, ushort t)
+    {
+        inCombat = false;
+        autoExecQueue.Clear();
+        autoExecQueued.Clear();
+        // Wipe — snap back to t=0 in paused preview.
+        if (activeTimeline != null)
+        {
+            isPreview            = true;
+            previewAutoplay      = false;
+            combatElapsedSec     = 0;
+            previewManualTimeSec = 0;
+            isScrubbing          = false;
+        }
+    }
+
+    private void OnDutyCompleted(object? s, ushort t)
+    {
+        inCombat = false;
+        // Completion — stay paused at wherever the timeline is.
+        if (activeTimeline != null)
+        {
+            isPreview            = true;
+            previewAutoplay      = false;
+            previewManualTimeSec = combatElapsedSec;
+            isScrubbing          = false;
+        }
+    }
+
+    // ── Window lifecycle ────────────────────────────────────────────────
+
+    public override bool DrawConditions()
+    {
+        if (isPreview && activeTimeline != null) return true;
+        return Cfg.OverlayEnabled && activeTimeline != null;
+    }
+
+    public override void PreDraw()
+    {
+        // Lock applies in ALL modes (including preview) — respects config.
+        if (Cfg.OverlayLocked && !isScrubbing)
+            Flags |= ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize;
+        else
+            Flags &= ~(ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize);
+
+        // Always allow mouse input so the lock / close / pause buttons remain
+        // clickable during live combat as well as in preview mode.
+        Flags &= ~ImGuiWindowFlags.NoInputs;
+
+        ImGui.SetNextWindowBgAlpha(0.0f);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // DRAW
+    // ═══════════════════════════════════════════════════════════════════
+
+    public override void Draw()
+    {
+        if (activeTimeline == null) return;
+
+        // Config shortcuts
+        var pxPerSec   = Cfg.OverlayPixelsPerSec;
+        var iconSize   = Cfg.OverlayIconSize;
+        var pastAlpha  = Cfg.OverlayPastAlpha;
+        var bgOpacity  = Cfg.OverlayBgOpacity;
+        var showGrid   = Cfg.OverlayShowGrid;
+        var timeBehind = Cfg.OverlayTimeBehind;
+        var maxStack   = Cfg.OverlayMaxStackedIcons;
+        var fightDur   = activeTimeline.AverageDurationMs / 1000.0;
+
+        // ── Time update ──────────────────────────────────────────────
+        if (isPreview)
+        {
+            if (previewAutoplay)
+            {
+                combatElapsedSec = (DateTime.UtcNow - previewStartTime).TotalSeconds;
+                if (fightDur > 0 && combatElapsedSec > fightDur + 5)
+                {
+                    previewStartTime = DateTime.UtcNow;
+                    combatElapsedSec = 0;
+                }
+                previewManualTimeSec = combatElapsedSec;
+            }
+            else
+            {
+                combatElapsedSec = previewManualTimeSec;
+            }
+        }
+        else if (inCombat)
+        {
+            // Only advance the view clock when not manually paused.
+            if (!combatViewPaused)
+                combatElapsedSec = (DateTime.UtcNow - combatStartTime).TotalSeconds;
+        }
+
+        var isActive   = inCombat || isPreview;
+        var drawList   = ImGui.GetWindowDrawList();
+        var wPos       = ImGui.GetWindowPos();
+        var wSize      = ImGui.GetWindowSize();
+
+        // ── Background ───────────────────────────────────────────────
+        drawList.AddRectFilled(wPos, wPos + wSize,
+            ImGui.GetColorU32(new Vector4(0.06f, 0.06f, 0.10f, bgOpacity)), 4.0f);
+
+        // ── Scrub / control bar (preview AND live combat) ────────────
+        // Row: [▶/⏸] [🔒] [track...........] [time] [×]
+        var scrubH = 0.0f;
+        if ((isPreview || inCombat) && fightDur > 0)
+        {
+            const float btnH   = 18.0f;
+            const float btnW   = 18.0f;
+            const float margin = 4.0f;
+            const float btnGap = 3.0f;
+            const float trackH = 6.0f;
+
+            var sTop = wPos.Y + 3f;
+            var midY = sTop + btnH / 2f;
+
+            // Button X anchors
+            var playX  = wPos.X + margin;
+            var lockX  = playX  + btnW + btnGap;
+            var closeX = wPos.X + wSize.X - margin - btnW;
+
+            // Track sits between lock button and close button
+            var trackL = lockX + btnW + btnGap;
+            var trackR = closeX - btnGap;
+            var trackW = MathF.Max(trackR - trackL, 1f);
+
+            var frac = (float)Math.Clamp(combatElapsedSec / fightDur, 0.0, 1.0);
+
+            // Track background
+            drawList.AddRectFilled(
+                new Vector2(trackL, midY - trackH / 2f),
+                new Vector2(trackR, midY + trackH / 2f),
+                ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.10f)), 3f);
+
+            // Filled portion
+            if (frac > 0)
+                drawList.AddRectFilled(
+                    new Vector2(trackL,               midY - trackH / 2f),
+                    new Vector2(trackL + trackW * frac, midY + trackH / 2f),
+                    ImGui.GetColorU32(new Vector4(0.40f, 0.70f, 1.00f, 0.55f)), 3f);
+
+            // Playhead pip
+            drawList.AddCircleFilled(
+                new Vector2(trackL + trackW * frac, midY),
+                5.0f, ImGui.GetColorU32(new Vector4(0.65f, 0.88f, 1.00f, 0.95f)));
+
+            // Time label below track (right-aligned to track end)
+            var timeLabel = FormatTime(combatElapsedSec) + " / " + FormatTime(fightDur);
+            var labelSz   = ImGui.CalcTextSize(timeLabel);
+            drawList.AddText(
+                new Vector2(trackR - labelSz.X, sTop + btnH + 1f),
+                ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.35f)),
+                timeLabel);
+
+            // ── Play / Pause button ───────────────────────────────────
+            var playTL    = new Vector2(playX,        sTop);
+            var playBR    = new Vector2(playX + btnW, sTop + btnH);
+            var playHover = ImGui.IsMouseHoveringRect(playTL, playBR);
+
+            drawList.AddRectFilled(playTL, playBR,
+                ImGui.GetColorU32(playHover
+                    ? new Vector4(0.30f, 0.65f, 1.00f, 0.90f)
+                    : new Vector4(0.15f, 0.35f, 0.65f, 0.72f)), 3f);
+
+            // Show pause icon when playing/live, play icon when paused/frozen.
+            var showingPauseIcon = inCombat ? !combatViewPaused : previewAutoplay;
+            if (showingPauseIcon)
+            {
+                // Pause: two vertical bars
+                var bw  = 2.5f;
+                var bh  = btnH * 0.55f;
+                var cx2 = playX + btnW / 2f;
+                var ty  = midY - bh / 2f;
+                drawList.AddRectFilled(
+                    new Vector2(cx2 - bw * 2f, ty), new Vector2(cx2 - bw * 0.5f, ty + bh),
+                    ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.95f)));
+                drawList.AddRectFilled(
+                    new Vector2(cx2 + bw * 0.5f, ty), new Vector2(cx2 + bw * 2f, ty + bh),
+                    ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.95f)));
+            }
+            else
+            {
+                // Play: right-pointing triangle
+                var th  = btnH * 0.55f;
+                var cx2 = playX + btnW / 2f - 1f;
+                drawList.AddTriangleFilled(
+                    new Vector2(cx2 - th * 0.4f, midY - th / 2f),
+                    new Vector2(cx2 - th * 0.4f, midY + th / 2f),
+                    new Vector2(cx2 + th * 0.6f, midY),
+                    ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.95f)));
+            }
+
+            if (playHover && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+            {
+                if (inCombat)
+                {
+                    // Toggle freeze — pause freezes the view, play re-syncs to live.
+                    combatViewPaused = !combatViewPaused;
+                    if (!combatViewPaused)
+                        combatElapsedSec = (DateTime.UtcNow - combatStartTime).TotalSeconds;
+                }
+                else if (previewAutoplay)
+                {
+                    previewAutoplay      = false;
+                    previewManualTimeSec = combatElapsedSec;
+                }
+                else
+                {
+                    previewAutoplay  = true;
+                    previewStartTime = DateTime.UtcNow - TimeSpan.FromSeconds(previewManualTimeSec);
+                }
+            }
+
+            // ── Lock button ───────────────────────────────────────────
+            var lockTL    = new Vector2(lockX,        sTop);
+            var lockBR    = new Vector2(lockX + btnW, sTop + btnH);
+            var lockHover = ImGui.IsMouseHoveringRect(lockTL, lockBR);
+            var isLocked  = Cfg.OverlayLocked;
+
+            drawList.AddRectFilled(lockTL, lockBR,
+                ImGui.GetColorU32(lockHover
+                    ? new Vector4(0.70f, 0.60f, 0.20f, 0.90f)
+                    : isLocked
+                        ? new Vector4(0.45f, 0.35f, 0.10f, 0.78f)
+                        : new Vector4(0.18f, 0.22f, 0.28f, 0.68f)), 3f);
+
+            DrawLockIcon(drawList,
+                new Vector2(lockX + btnW / 2f, sTop + btnH / 2f),
+                MathF.Min(btnW, btnH) * 0.80f,
+                isLocked,
+                ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.92f)));
+
+            if (lockHover && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+            {
+                Cfg.OverlayLocked = !Cfg.OverlayLocked;
+                plugin.SaveConfig();
+            }
+
+            // ── Close button ──────────────────────────────────────────
+            var closeTL    = new Vector2(closeX,        sTop);
+            var closeBR    = new Vector2(closeX + btnW, sTop + btnH);
+            var closeHover = ImGui.IsMouseHoveringRect(closeTL, closeBR);
+
+            drawList.AddRectFilled(closeTL, closeBR,
+                ImGui.GetColorU32(closeHover
+                    ? new Vector4(0.85f, 0.20f, 0.20f, 0.92f)
+                    : new Vector4(0.50f, 0.10f, 0.10f, 0.72f)), 3f);
+
+            var xLbl = "x";
+            var xSz  = ImGui.CalcTextSize(xLbl);
+            drawList.AddText(
+                new Vector2(closeX + (btnW - xSz.X) / 2f, sTop + (btnH - xSz.Y) / 2f),
+                ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.95f)), xLbl);
+
+            if (closeHover && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+            {
+                // Always kill auto-execute (+ its DTR bar entry) when the user
+                // manually closes the overlay.
+                if (AutoExecuteEnabled)
+                {
+                    AutoExecuteEnabled = false;
+                    plugin.MainWindow.ApplyAutoExecDtr(false);
+                }
+
+                if (inCombat)
+                {
+                    overlayDismissed = true;    // suppress ants + auto-exec for rest of pull
+                    IsOpen = false;
+                }
+                else
+                    StopPreview();
+
+                return;
+            }
+
+            // ── Scrub input (track hit area) ──────────────────────────
+            // Available in preview always; in combat only when the view is paused.
+            var scrubAllowed = isPreview || combatViewPaused;
+            var barTL = new Vector2(trackL, midY - trackH / 2f - 4f);
+            var barBR = new Vector2(trackR, midY + trackH / 2f + 4f);
+
+            if (scrubAllowed && ImGui.IsMouseHoveringRect(barTL, barBR) && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+                isScrubbing = true;
+
+            if (isScrubbing)
+            {
+                if (ImGui.IsMouseDown(ImGuiMouseButton.Left))
+                {
+                    var mfrac        = Math.Clamp((ImGui.GetMousePos().X - trackL) / trackW, 0.0, 1.0);
+                    combatElapsedSec = mfrac * fightDur;
+                    if (isPreview)
+                    {
+                        previewAutoplay      = false;
+                        previewManualTimeSec = combatElapsedSec;
+                    }
+                    else
+                    {
+                        combatViewPaused = true;
+                    }
+                }
+                else
+                {
+                    isScrubbing = false;
+                }
+            }
+
+            // Scroll wheel nudge (preview always; combat only when paused)
+            if (scrubAllowed && ImGui.IsWindowHovered())
+            {
+                var wheel = ImGui.GetIO().MouseWheel;
+                if (MathF.Abs(wheel) > 0.01f)
+                {
+                    combatElapsedSec = Math.Clamp(combatElapsedSec - wheel * 2.0, 0.0, fightDur);
+                    if (isPreview)
+                    {
+                        previewAutoplay      = false;
+                        previewManualTimeSec = combatElapsedSec;
+                    }
+                    else
+                    {
+                        combatViewPaused = true;
+                    }
+                }
+            }
+
+            scrubH = btnH + labelSz.Y + 5f;
+        }
+
+        // ── Lay out timeline and boss strip ─────────────────────────
+        var hasBoss       = activeTimeline.BossEntries.Count > 0;
+        var bossStripH    = hasBoss ? 26.0f : 0.0f;
+
+        var tlTop    = wPos.Y + scrubH + 2f;
+        var tlBot    = wPos.Y + wSize.Y - bossStripH - 2f;
+        var tlLeft   = wPos.X + 2f;
+        var tlRight  = wPos.X + wSize.X - 2f;
+        var tlH      = tlBot - tlTop;
+        var tlW      = tlRight - tlLeft;
+
+        if (tlH < 16f || tlW < 50f) return;
+
+        // "Now" X — timeBehind seconds from the LEFT edge, so widening the window
+        // extends the look-ahead on the right rather than pushing the red line left.
+        var nowX = tlLeft + timeBehind * pxPerSec;
+
+        // Vertical center of the timeline (ATR centers all items here)
+        var centerY = tlTop + tlH / 2f;
+
+        // oGCD size and center Y — driven by config so the user can dial them in
+        var oGcdSize    = iconSize * Cfg.OGCDSizeRatio;
+        var oGcdCenterY = centerY - (Cfg.OGCDVerticalOffset * iconSize + oGcdSize / 2f);
+
+        // ATR GCD bar top/bottom Y
+        // leftTop.Y    = centerY + (GCDHeightHigh * iconSize - iconSize / 2) = centerY + 0
+        // leftBottom.Y = centerY + (GCDHeightLow  * iconSize - iconSize / 2) = centerY + 0.3*iconSize
+        var gcdBarTop = centerY + GCDHeightHigh * iconSize - iconSize / 2f;  // = centerY
+        var gcdBarBot = centerY + GCDHeightLow  * iconSize - iconSize / 2f;  // = centerY + 0.3*iconSize
+
+        var visStart = combatElapsedSec - (nowX - tlLeft)  / pxPerSec;
+        var visEnd   = combatElapsedSec + (tlRight - nowX) / pxPerSec;
+
+        // ── ATR DrawGrid ──────────────────────────────────────────────
+        if (showGrid)
+        {
+            for (var t = Math.Ceiling(visStart); t <= visEnd; t += 1.0)
+            {
+                if (t < 0) continue;
+                var gx = nowX + (float)(t - combatElapsedSec) * pxPerSec;
+                if (gx < tlLeft || gx > tlRight) continue;
+
+                var major = (int)t % 5 == 0;
+                drawList.AddLine(
+                    new Vector2(gx, tlTop),
+                    new Vector2(gx, tlBot),
+                    ImGui.GetColorU32(major ? ColGridMajor : ColGrid),
+                    major ? 1.5f : 1.0f);
+
+                if (major)
+                {
+                    var lbl = FormatTimeShort(t);
+                    var lsz = ImGui.CalcTextSize(lbl);
+                    drawList.AddText(
+                        new Vector2(gx - lsz.X / 2f, tlTop + 1f),
+                        ImGui.GetColorU32(ColGridLabel), lbl);
+                }
+            }
+        }
+
+        // ── ATR GridCenterLine ────────────────────────────────────────
+        drawList.AddLine(
+            new Vector2(tlLeft,  centerY),
+            new Vector2(tlRight, centerY),
+            ImGui.GetColorU32(ColCenterLine), 1.0f);
+
+        // ── ATR GridStartLine (the "now" vertical bar) ────────────────
+        drawList.AddLine(
+            new Vector2(nowX, tlTop),
+            new Vector2(nowX, tlBot),
+            ImGui.GetColorU32(ColNowLine), 2.0f);
+
+        // ── oGCD "now" indicator — shifted by OGCDHorizontalOffset ────
+        // oGCD icons are rendered OGCDHorizontalOffset pixels to the right of their
+        // "true" time position, so the effective crossing point for oGCDs is at this line.
+        if (Cfg.OGCDHorizontalOffset != 0f)
+        {
+            var ogcdNowX = nowX + Cfg.OGCDHorizontalOffset;
+            if (ogcdNowX >= tlLeft && ogcdNowX <= tlRight)
+                drawList.AddLine(
+                    new Vector2(ogcdNowX, oGcdCenterY - oGcdSize * 0.6f),
+                    new Vector2(ogcdNowX, oGcdCenterY + oGcdSize * 0.6f),
+                    ImGui.GetColorU32(new Vector4(1.00f, 0.70f, 0.20f, 0.60f)), 1.5f);
+        }
+
+        // ── Idle message ──────────────────────────────────────────────
+        if (!isActive)
+        {
+            const string msg = "Waiting for combat...";
+            var msz = ImGui.CalcTextSize(msg);
+            drawList.AddText(
+                new Vector2(wPos.X + (wSize.X - msz.X) / 2f, centerY - msz.Y / 2f),
+                ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.25f)), msg);
+        }
+        else
+        {
+            // ── Collect and bucket visible entries ────────────────────
+            var buckets = activeTimeline.Entries
+                .Where(e => e.TimeOffsetSec >= visStart - 5 && e.TimeOffsetSec <= visEnd + 5)
+                .Where(e => skillVisibility.GetValueOrDefault(e.AbilityId, true))
+                .Where(e => e.Frequency >= GetAbilityThreshold(e.AbilityId))
+                .GroupBy(e => e.TimeOffsetSec)
+                .OrderBy(g => g.Key)
+                .Select(g =>
+                {
+                    var sorted  = g.OrderByDescending(e => e.Frequency).Take(maxStack).ToList();
+                    var x       = nowX + (float)(g.Key - combatElapsedSec) * pxPerSec;
+                    var isPast  = g.Key < combatElapsedSec;
+                    var gcds    = sorted.Where(e => !IsOGCD(e.AbilityId)).Take(1).ToList();
+                    var ogcds   = sorted.Where(e =>  IsOGCD(e.AbilityId)).ToList();
+                    return (x, isPast, gcds, ogcds);
+                })
+                .ToList();
+
+            // ══════════════════════════════════════════════════════════
+            // PASS 1 — TimelineLayer.General
+            // Draw horizontal bars for every GCD and oGCD.
+            // ATR draws: Background → AnimLock (skipped: no data) → Cast fill → Border
+            // ══════════════════════════════════════════════════════════
+            foreach (var (x, isPast, gcds, ogcds) in buckets)
+            {
+                // ── GCD bars ──
+                for (var i = 0; i < gcds.Count; i++)
+                {
+                    var e        = gcds[i];
+                    var alpha    = (float)Math.Clamp(e.Frequency, 0.30, 1.0);
+                    if (isPast) alpha *= pastAlpha;
+                    if (alpha < 0.01f) continue;
+                    var barAlpha = alpha * bgOpacity;
+
+                    // Icon center X for this stacked GCD
+                    var cx   = x - i * (iconSize + IconGap);
+                    // ATR: bar starts at centerPos + iconSize/2 in time direction (right)
+                    var barL = MathF.Max(cx + iconSize / 2f, tlLeft);
+                    var barR = MathF.Min(cx + iconSize / 2f + GCDWindowSec * pxPerSec, tlRight);
+                    if (barR <= barL) continue;
+
+                    if (barAlpha >= 0.01f)
+                    {
+                        // Background (dark gray)
+                        drawList.AddRectFilled(
+                            new Vector2(barL, gcdBarTop),
+                            new Vector2(barR, gcdBarBot),
+                            MulAlpha(ColGCDBackground, barAlpha), BarRound);
+
+                        // Cast fill (blue) — left 45% approximates cast time
+                        var castR = barL + (barR - barL) * 0.45f;
+                        drawList.AddRectFilled(
+                            new Vector2(barL, gcdBarTop),
+                            new Vector2(castR, gcdBarBot),
+                            MulAlpha(ColGCDCast, barAlpha), BarRound);
+
+                        // Border (white)
+                        drawList.AddRect(
+                            new Vector2(barL, gcdBarTop),
+                            new Vector2(barR, gcdBarBot),
+                            MulAlpha(ColGCDBorder, barAlpha),
+                            BarRound, ImDrawFlags.RoundCornersAll, 1.0f);
+                    }
+                }
+
+                // ── oGCD bars ──
+                for (var i = 0; i < ogcds.Count; i++)
+                {
+                    var e        = ogcds[i];
+                    var alpha    = (float)Math.Clamp(e.Frequency, 0.30, 1.0);
+                    if (isPast) alpha *= pastAlpha;
+                    if (alpha < 0.01f) continue;
+                    var barAlpha = alpha * bgOpacity;
+
+                    var cx = x - i * (oGcdSize + IconGap) + Cfg.OGCDHorizontalOffset;
+                    var barL = MathF.Max(cx + oGcdSize / 2f, tlLeft);
+                    var barR = MathF.Min(cx + oGcdSize / 2f + OGCDWindowSec * pxPerSec, tlRight);
+                    if (barR <= barL) continue;
+
+                    // Apply same height formula to oGCD, relative to oGcdCenterY
+                    var oBarTop = oGcdCenterY + GCDHeightHigh * oGcdSize - oGcdSize / 2f;
+                    var oBarBot = oGcdCenterY + GCDHeightLow  * oGcdSize - oGcdSize / 2f;
+
+                    if (barAlpha >= 0.01f)
+                    {
+                        drawList.AddRectFilled(
+                            new Vector2(barL, oBarTop),
+                            new Vector2(barR, oBarBot),
+                            MulAlpha(ColOGCDBackground, barAlpha), 2f);
+
+                        var castR = barL + (barR - barL) * 0.45f;
+                        drawList.AddRectFilled(
+                            new Vector2(barL, oBarTop),
+                            new Vector2(castR, oBarBot),
+                            MulAlpha(ColOGCDCast, barAlpha), 2f);
+
+                        drawList.AddRect(
+                            new Vector2(barL, oBarTop),
+                            new Vector2(barR, oBarBot),
+                            MulAlpha(ColOGCDBorder, barAlpha),
+                            2f, ImDrawFlags.RoundCornersAll, 1.0f);
+                    }
+                }
+            }
+
+            // ══════════════════════════════════════════════════════════
+            // PASS 2 — TimelineLayer.Icon
+            // Draw icons on top of the bars.
+            // ATR: pos = centerPos - iconSize/2 * RealDownDirection
+            //   → icon top-left = (cx - iconSize/2, centerY - iconSize/2)
+            // ══════════════════════════════════════════════════════════
+            foreach (var (x, isPast, gcds, ogcds) in buckets)
+            {
+                // GCDs — icon straddles the center line
+                for (var i = 0; i < gcds.Count; i++)
+                {
+                    var e   = gcds[i];
+                    var cx  = x - i * (iconSize + IconGap);
+                    var pos = new Vector2(cx - iconSize / 2f, centerY - iconSize / 2f);
+                    DrawIcon(drawList, e, pos, iconSize, isPast, pastAlpha, combatElapsedSec);
+                }
+
+                // oGCDs — icon straddles oGcdCenterY (above the center line)
+                for (var i = 0; i < ogcds.Count; i++)
+                {
+                    var e   = ogcds[i];
+                    var cx  = x - i * (oGcdSize + IconGap) + Cfg.OGCDHorizontalOffset;
+                    var pos = new Vector2(cx - oGcdSize / 2f, oGcdCenterY - oGcdSize / 2f);
+                    DrawIcon(drawList, e, pos, oGcdSize, isPast, pastAlpha, combatElapsedSec);
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // BOSS CAST STRIP — anchored to bottom, always 100% opacity
+        // ══════════════════════════════════════════════════════════════
+        if (hasBoss)
+        {
+            var bTop    = wPos.Y + wSize.Y - bossStripH - 2f;
+            var bBot    = wPos.Y + wSize.Y - 2f;
+            var bH      = bBot - bTop;
+            var bThick  = bH * 0.65f;
+            var bCenY   = bTop + bH / 2f;
+            var bBarMinY = bCenY - bThick / 2f;
+            var bBarMaxY = bCenY + bThick / 2f;
+
+            // Strip background
+            drawList.AddRectFilled(
+                new Vector2(tlLeft, bTop), new Vector2(tlRight, bBot),
+                ImGui.GetColorU32(new Vector4(0.15f, 0.03f, 0.03f, bgOpacity)));
+            drawList.AddLine(
+                new Vector2(tlLeft, bTop), new Vector2(tlRight, bTop),
+                ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.18f)));
+
+            // "Boss" label at left
+            drawList.AddText(
+                new Vector2(tlLeft + 3f, bTop + (bH - ImGui.GetTextLineHeight()) / 2f),
+                ImGui.GetColorU32(new Vector4(1f, 0.50f, 0.50f, 0.70f)), "Boss");
+
+            foreach (var boss in activeTimeline.BossEntries)
+            {
+                var startX = nowX + (float)(boss.CastStartSec - combatElapsedSec) * pxPerSec;
+                var endX   = nowX + (float)(boss.CastEndSec   - combatElapsedSec) * pxPerSec;
+                if (endX - startX < 3f) endX = startX + 3f;  // min width for instants
+
+                if (endX < tlLeft || startX > tlRight) continue;
+                var dL = MathF.Max(startX, tlLeft);
+                var dR = MathF.Min(endX,   tlRight);
+
+                // Always 100% opacity
+                drawList.AddRectFilled(
+                    new Vector2(dL, bBarMinY), new Vector2(dR, bBarMaxY),
+                    BossAbilityColor(boss.AbilityId), 2.0f);
+
+                // Name text
+                var castW = dR - dL;
+                if (castW > 28f)
+                {
+                    var lbl = TruncateTextToWidth(boss.AbilityName, castW - 6f);
+                    if (!string.IsNullOrEmpty(lbl))
+                    {
+                        var lsz = ImGui.CalcTextSize(lbl);
+                        drawList.AddText(
+                            new Vector2(dL + 3f, bCenY - lsz.Y / 2f),
+                            ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 1.0f)), lbl);
+                    }
+                }
+
+                // Tooltip
+                if (ImGui.IsMouseHoveringRect(new Vector2(dL, bBarMinY), new Vector2(dR, bBarMaxY)))
+                {
+                    var castDur = boss.CastEndSec - boss.CastStartSec;
+                    ImGui.BeginTooltip();
+                    ImGui.Text(boss.AbilityName);
+                    ImGui.Separator();
+                    ImGui.Text($"Cast start:  {FormatTime(boss.CastStartSec)}");
+                    if (castDur > 0.05)
+                        ImGui.Text($"Cast finish: {FormatTime(boss.CastEndSec)}  ({castDur:F2}s)");
+                    else
+                        ImGui.Text("Instant cast");
+                    ImGui.EndTooltip();
+                }
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PASS 2 ICON HELPER
+    // ═══════════════════════════════════════════════════════════════════
+
+    private void DrawIcon(ImDrawListPtr dl, TimelineEntry entry, Vector2 pos, float size,
+        bool isPast, float pastAlpha, double elapsed)
+    {
+        var alpha = (float)Math.Clamp(entry.Frequency, 0.25, 1.0);
+        if (isPast) alpha *= pastAlpha;
+
+        var end = pos + new Vector2(size, size);
+
+        if (entry.AbilityId > 0 && !TryDrawActionIcon(dl, entry.AbilityId, pos, size, alpha))
+        {
+            // Fallback — coloured rect + abbreviated name
+            var hue = (entry.AbilityId % 12) / 12.0f;
+            HsvToRgb(hue, 0.5f, 0.6f, out var cr, out var cg, out var cb);
+            dl.AddRectFilled(pos, end,
+                ImGui.GetColorU32(new Vector4(cr, cg, cb, alpha * 0.8f)), 4.0f);
+
+            var abbr = Abbreviate(entry.AbilityName, 3);
+            var asz  = ImGui.CalcTextSize(abbr);
+            dl.AddText(
+                new Vector2(pos.X + (size - asz.X) / 2f, pos.Y + (size - asz.Y) / 2f),
+                ImGui.GetColorU32(new Vector4(1f, 1f, 1f, alpha)), abbr);
+        }
+
+        // 1 px white border (ATR draws this as part of the icon layer)
+        dl.AddRect(pos, end,
+            ImGui.GetColorU32(new Vector4(1f, 1f, 1f, alpha * 0.55f)),
+            4.0f, ImDrawFlags.RoundCornersAll, 1.0f);
+
+        // Tooltip
+        if (ImGui.IsMouseHoveringRect(pos, end))
+        {
+            var rel    = entry.TimeOffsetSec - elapsed;
+            var relStr = rel >= 0 ? $"+{rel:F1}s" : $"{rel:F1}s";
+            ImGui.BeginTooltip();
+            ImGui.Text(entry.AbilityName);
+            ImGui.Separator();
+            ImGui.Text($"Time:      {FormatTime(entry.TimeOffsetSec)} ({relStr})");
+            ImGui.Text($"Frequency: {entry.Frequency:P0}");
+            ImGui.Text($"Avg uses:  {entry.AverageUses:F1}x");
+            ImGui.EndTooltip();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // ICON LOADING
+    // ═══════════════════════════════════════════════════════════════════
+
+    private bool TryDrawActionIcon(ImDrawListPtr dl, int abilityId, Vector2 pos, float size, float alpha)
+    {
+        if (!iconIdCache.TryGetValue(abilityId, out var iconId))
+        {
+            iconId = 0;
+            try
+            {
+                var sheet = plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Action>();
+                if (sheet != null)
+                {
+                    var row = sheet.GetRowOrDefault((uint)abilityId);
+                    if (row.HasValue) iconId = row.Value.Icon;
+                }
+            }
+            catch { /* silently fail */ }
+            iconIdCache[abilityId] = iconId;
+        }
+
+        if (iconId == 0) return false;
+
+        try
+        {
+            var wrap = plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(iconId)).GetWrapOrEmpty();
+            if (wrap.Width <= 1) return false;
+
+            dl.AddImage(wrap.Handle, pos, pos + new Vector2(size, size),
+                Vector2.Zero, Vector2.One, ImGui.GetColorU32(new Vector4(1f, 1f, 1f, alpha)));
+            return true;
+        }
+        catch { return false; }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // oGCD DETECTION
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Returns the effective frequency threshold for a specific ability.
+    /// Falls back to the global OverlayFreqThreshold if no per-ability override is set.
+    /// </summary>
+    private float GetAbilityThreshold(int abilityId)
+    {
+        if (activeTimeline == null)
+            return Cfg.OverlayFreqThreshold;
+
+        var key = TimelineDatabase.MakeKey(activeTimeline.EncounterId, activeTimeline.SpecName);
+        if (Cfg.AbilityFreqThresholds.TryGetValue(key, out var perAbility) &&
+            perAbility.TryGetValue(abilityId, out var custom))
+            return custom;
+
+        return Cfg.OverlayFreqThreshold;
+    }
+
+    private bool IsOGCD(int abilityId)
+    {
+        if (oGcdCache.TryGetValue(abilityId, out var cached)) return cached;
+
+        // A GCD is any action whose cooldown group is 58 (the shared 2.5 s global cooldown).
+        // Everything else (its own cooldown group) is an oGCD.
+        var info   = plugin.RecastDatabase.Lookup(abilityId, string.Empty);
+        var isOgcd = info == null || info.CooldownGroup != 58;
+
+        oGcdCache.TryAdd(abilityId, isOgcd);
+        return isOgcd;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // HELPERS
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>Multiplies the alpha component of a Vector4 colour.</summary>
+    private static uint MulAlpha(Vector4 col, float alpha)
+        => ImGui.GetColorU32(col with { W = col.W * alpha });
+
+    private static string FormatTime(double seconds)
+    {
+        var m = (int)(seconds / 60);
+        var s = seconds % 60;
+        return $"{m}:{s:00.0}";
+    }
+
+    private static string FormatTimeShort(double seconds)
+        => $"{(int)(seconds / 60)}:{(int)(seconds % 60):D2}";
+
+    private static string Abbreviate(string name, int maxChars)
+    {
+        if (string.IsNullOrEmpty(name)) return "?";
+        if (name.Length <= maxChars) return name;
+
+        var parts = name.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length >= 2)
+        {
+            var abbr = string.Concat(parts.Select(p => p.Length > 0 ? p[0].ToString() : string.Empty));
+            if (abbr.Length <= maxChars + 1) return abbr;
+        }
+        return name[..maxChars];
+    }
+
+    private static void HsvToRgb(float h, float s, float v, out float r, out float g, out float b)
+    {
+        var i = (int)(h * 6); var f = h * 6 - i;
+        var p = v * (1 - s); var q = v * (1 - f * s); var t = v * (1 - (1 - f) * s);
+        switch (i % 6)
+        {
+            case 0: r = v; g = t; b = p; break;
+            case 1: r = q; g = v; b = p; break;
+            case 2: r = p; g = v; b = t; break;
+            case 3: r = p; g = q; b = v; break;
+            case 4: r = t; g = p; b = v; break;
+            default: r = v; g = p; b = q; break;
+        }
+    }
+
+    private uint BossAbilityColor(int abilityId)
+    {
+        if (Cfg.BossBarUseCustomColor)
+            return ImGui.GetColorU32(Cfg.BossBarColor);
+
+        float[] hues = [0.0f, 0.05f, 0.90f, 0.75f, 0.12f, 0.85f];
+        var hue = hues[Math.Abs(abilityId) % hues.Length];
+        HsvToRgb(hue, 0.7f, 0.75f, out var r, out var g, out var b);
+        return ImGui.GetColorU32(new Vector4(r, g, b, 1.0f));
+    }
+
+    /// <summary>
+    /// Draws a padlock icon centered at <paramref name="center"/> within a square of <paramref name="size"/>.
+    /// Locked = shackle closed over body. Unlocked = shackle open (right post only).
+    /// </summary>
+    private static void DrawLockIcon(ImDrawListPtr dl, Vector2 center, float size, bool locked, uint col)
+    {
+        // Body — filled rounded rect occupying the lower ~55% of the icon area
+        var bodyW = size * 0.62f;
+        var bodyH = size * 0.50f;
+        var bodyT = center.Y + size * 0.06f;
+        var bodyB = bodyT + bodyH;
+        var bodyL = center.X - bodyW / 2f;
+        var bodyR = center.X + bodyW / 2f;
+        dl.AddRectFilled(new Vector2(bodyL, bodyT), new Vector2(bodyR, bodyB), col, 2f);
+
+        // Keyhole — small dark circle in center of body
+        dl.AddCircleFilled(
+            new Vector2(center.X, bodyT + bodyH * 0.42f),
+            bodyW * 0.12f,
+            ImGui.GetColorU32(new Vector4(0f, 0f, 0f, 0.45f)), 6);
+
+        // Shackle geometry
+        var sR    = bodyW * 0.28f;                              // arc radius
+        var sCenX = locked ? center.X : center.X + sR * 0.55f; // shift right when open
+        var sCenY = bodyT;                                       // arc center at body top
+
+        // Top arc (upper semicircle, π → 2π) rendered as line segments
+        const int segs = 7;
+        for (var i = 0; i < segs; i++)
+        {
+            var a0 = MathF.PI * (1f + (float)i       / segs);
+            var a1 = MathF.PI * (1f + (float)(i + 1) / segs);
+            dl.AddLine(
+                new Vector2(sCenX + sR * MathF.Cos(a0), sCenY + sR * MathF.Sin(a0)),
+                new Vector2(sCenX + sR * MathF.Cos(a1), sCenY + sR * MathF.Sin(a1)),
+                col, 1.8f);
+        }
+
+        // Vertical posts dropping into body
+        var postBot = bodyT + bodyH * 0.28f;
+        if (locked)
+        {
+            dl.AddLine(new Vector2(sCenX - sR, sCenY), new Vector2(sCenX - sR, postBot), col, 1.8f);
+            dl.AddLine(new Vector2(sCenX + sR, sCenY), new Vector2(sCenX + sR, postBot), col, 1.8f);
+        }
+        else
+        {
+            // Only the right post; left post is "open"
+            dl.AddLine(new Vector2(sCenX + sR, sCenY), new Vector2(sCenX + sR, postBot), col, 1.8f);
+        }
+    }
+
+    private static string TruncateTextToWidth(string text, float maxWidth)
+    {
+        if (maxWidth <= 0) return string.Empty;
+        if (ImGui.CalcTextSize(text).X <= maxWidth) return text;
+        var approxChars = (int)(maxWidth / 7.0f);
+        if (approxChars <= 1) return string.Empty;
+        var t = text[..Math.Min(text.Length, approxChars - 1)] + "…";
+        return ImGui.CalcTextSize(t).X <= maxWidth ? t : string.Empty;
+    }
+
+    // ── Auto-execute framework update ───────────────────────────────────
+
+    /// <summary>
+    /// Called every game frame on the framework thread.
+    /// Fires <c>ActionManager.UseAction</c> for each timeline entry the moment it
+    /// crosses the red bar during live combat — but only when
+    /// <see cref="AutoExecuteEnabled"/> is true (the hidden easter egg).
+    ///
+    /// Queue-based design following the WrathCombo pattern:
+    ///   • Phase 1 – Scan all entries each frame. Enqueue each one exactly once when it
+    ///               reaches its scheduled time (±350 ms accept window). Entries that pass
+    ///               the 350 ms window before being seen are permanently skipped so a late-
+    ///               joining auto-execute doesn't fire obviously stale actions.
+    ///   • Phase 2 – When <c>AnimationLock == 0</c> (game ready), dequeue the next pending
+    ///               action and fire it — one per frame, matching WrathCombo's approach.
+    ///               Items that have sat in the queue > 5 s (implying a hung queue) are
+    ///               discarded, but normally queued oGCDs will fire within a full GCD cycle.
+    ///
+    /// Key fix vs. previous 350 ms staleness check: oGCDs enqueued simultaneously (e.g.
+    /// two oGCDs between the same pair of GCDs) now wait patiently in the queue while
+    /// AnimationLock drains (~600 ms per oGCD) before each fires.
+    /// </summary>
+    private unsafe void OnFrameworkUpdate(IFramework fw)
+    {
+        if (!AutoExecuteEnabled) return;
+        if (activeTimeline == null) return;
+        if (overlayDismissed) return;
+
+        // Active means either live combat or any preview mode (autoplay or manual scrub).
+        if (!inCombat && !isPreview) return;
+
+        // combatElapsedSec is the canonical "current time on the timeline" for all modes:
+        //   combat        → (UtcNow - combatStartTime).TotalSeconds   (set each Draw frame)
+        //   preview play  → (UtcNow - previewStartTime).TotalSeconds  (set each Draw frame)
+        //   preview scrub → previewManualTimeSec                       (set by scrub bar)
+        var elapsed = combatElapsedSec;
+
+        // ── Backward-scrub detection ──────────────────────────────────────────────────
+        // If time moved back by > 1 second (wipe, scrub), flush everything so entries
+        // can be re-enqueued from scratch.
+        if (elapsed < autoExecLastElapsed - 1.0)
+        {
+            autoExecQueue.Clear();
+            autoExecQueued.Clear();
+        }
+        autoExecLastElapsed = elapsed;
+
+        // ── Phase 1: Enqueue entries entering their window ────────────────────────────
+        // Accept: scheduled time has passed AND we're within 350 ms of it.
+        // Reject (permanently skip): > 350 ms late and never enqueued — this prevents
+        //   firing obviously stale actions if auto-execute is toggled on mid-fight.
+        const double AcceptWindowSec = 0.350;
+
+        foreach (var e in activeTimeline.Entries)
+        {
+            // Respect the same visibility and frequency gates as the visual overlay.
+            if (!skillVisibility.GetValueOrDefault(e.AbilityId, true)) continue;
+            if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
+
+            var key   = (e.TimeOffsetSec, e.AbilityId);
+            var delta = elapsed - e.TimeOffsetSec;   // positive = we've passed the scheduled mark
+
+            if (delta < 0.0) continue;   // not yet time
+
+            if (delta > AcceptWindowSec)
+            {
+                // Past the accept window — add to the seen set so we never enqueue it
+                // in a future frame either.  (Add is a no-op if already present.)
+                autoExecQueued.Add(key);
+                continue;
+            }
+
+            // Within [0, AcceptWindowSec]: enqueue exactly once, stamped with wall-clock time.
+            if (autoExecQueued.Add(key))
+                autoExecQueue.Enqueue((e.TimeOffsetSec, e.AbilityId, Environment.TickCount64));
+        }
+
+        // ── Phase 2: Fire one action per frame when the game is ready ─────────────────
+        // WrathCombo rule: require AnimationLock == 0 before sending any ability.
+        // This prevents UseAction from overwriting the game's single native queue slot
+        // while a prior action is still in its 600 ms animation lock.
+        var animLock = ActionManager.Instance()->AnimationLock;
+        if (animLock > 0f) return;
+
+        // Drain any entries that are implausibly old (> 5 s in queue = fight ended, lag spike,
+        // or other anomaly), then fire the first healthy one and stop for this frame.
+        const long MaxQueueAgeMs = 5_000L;
+        var nowMs = Environment.TickCount64;
+
+        while (autoExecQueue.Count > 0)
+        {
+            var (_, abilityId, enqueuedAtMs) = autoExecQueue.Peek();
+
+            if (nowMs - enqueuedAtMs > MaxQueueAgeMs)
+            {
+                autoExecQueue.Dequeue();   // stale — silently discard
+                continue;
+            }
+
+            // Fire this action and stop for this frame.
+            autoExecQueue.Dequeue();
+            ActionManager.Instance()->UseAction(ActionType.Action, (uint)abilityId);
+            break;
+        }
+    }
+
+    public void Dispose()
+    {
+        framework.Update         -= OnFrameworkUpdate;
+        condition.ConditionChange -= OnConditionChange;
+        dutyState.DutyWiped      -= OnDutyWiped;
+        dutyState.DutyCompleted  -= OnDutyCompleted;
+    }
+}
