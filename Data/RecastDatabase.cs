@@ -17,12 +17,16 @@ public sealed class RecastDatabase
     {
         public double? RecastSec { get; init; }
         public int? MaxCharges { get; init; }
+        public byte? ActionCategory { get; init; }
     }
 
     private static readonly IReadOnlyDictionary<string, ActionOverride> KnownOverrides =
         new Dictionary<string, ActionOverride>(StringComparer.OrdinalIgnoreCase)
         {
             ["Life Surge"] = new() { MaxCharges = 2 },
+            ["Macrocosmos"] = new() { ActionCategory = 4 },
+            ["Forbidden Meditation"] = new() { ActionCategory = 3 },
+            ["Enlightened Meditation"] = new() { ActionCategory = 3 },
             ["Shield Samba"] = new() { RecastSec = 90.0 },
         };
 
@@ -205,14 +209,49 @@ public sealed class RecastDatabase
             ? null
             : byName.GetValueOrDefault(name);
 
+        if (byIdResult == null && byNameResult == null && IsLikelyPotionName(name))
+        {
+            return new RecastInfo
+            {
+                AbilityId = (uint)Math.Max(0, id),
+                Name = name,
+                RecastSec = 270.0,
+                CastTimeSec = 0.0,
+                CooldownGroup = 0,
+                MaxCharges = 1,
+                IsPlayerAction = true,
+                ActionCategory = 4,
+            };
+        }
+
         if (byIdResult == null)
             return byNameResult;
         if (byNameResult == null)
             return byIdResult;
 
+        // When we have a concrete player-action ID, trust it over the shared-name
+        // fallback. This avoids cross-job collisions such as Scholar Energy Drain
+        // inheriting Summoner's recast data.
+        if (byIdResult.IsPlayerAction)
+            return byIdResult;
+        if (byNameResult.IsPlayerAction)
+            return byNameResult;
+
         return IsBetter(byNameResult, byIdResult)
             ? byNameResult
             : byIdResult;
+    }
+
+    private static bool IsLikelyPotionName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return false;
+
+        if (name.Contains("Gemdraught", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return name.StartsWith("Grade ", StringComparison.OrdinalIgnoreCase) &&
+               name.Contains(" of ", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -253,7 +292,7 @@ public sealed class RecastDatabase
             CooldownGroup = info.CooldownGroup,
             MaxCharges = actionOverride.MaxCharges ?? info.MaxCharges,
             IsPlayerAction = info.IsPlayerAction,
-            ActionCategory = info.ActionCategory,
+            ActionCategory = actionOverride.ActionCategory ?? info.ActionCategory,
             ComboActionId = info.ComboActionId,
         };
     }

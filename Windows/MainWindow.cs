@@ -24,7 +24,14 @@ public sealed class MainWindow : Window
         {
             ["Astrologian"] = new(StringComparer.OrdinalIgnoreCase)
             {
-                "Card Play Ready",
+                "The Balance Ready",
+                "The Arrow Ready",
+                "The Spire Ready",
+                "Lord of Crowns Ready",
+                "The Spear Ready",
+                "The Ewer Ready",
+                "The Bole Ready",
+                "Lady of Crowns Ready",
                 "Horoscope Ready",
             },
             ["Bard"] = new(StringComparer.OrdinalIgnoreCase)
@@ -106,8 +113,6 @@ public sealed class MainWindow : Window
             ["White Mage"] = new(StringComparer.OrdinalIgnoreCase)
             {
                 "Divine Grace",
-                "Lily",
-                "BloodLily",
             },
         };
     private static readonly IReadOnlyDictionary<string, HashSet<string>> ConflictIgnoredCooldownNamesBySpec =
@@ -218,6 +223,7 @@ public sealed class MainWindow : Window
     // Current timeline
     private AggregatedTimeline? currentTimeline;
     private Dictionary<int, bool> skillVisibility = [];
+    private bool showEmbeddedTimelinePreview;
     private readonly Dictionary<int, uint> iconIdCache = [];
 
     // Update state
@@ -238,12 +244,6 @@ public sealed class MainWindow : Window
     private int    editEncounterIdx  = 0;
     private int    editSpecIdx       = 0;
     private float editDurationSec;
-    private int editParseCount;
-    private int editDeltaMs;
-    private float editCustomGcdRecastSec = 2.5f;
-    private bool editEnableCustomGcdRecastSpacing;
-    private bool editEnableCustomOgcdSpacing;
-    private int editCustomOgcdSlots = 2;
     private int editingEntryIndex = -1;   // index into player Entries; -1 = none
     private bool editingEntryIsBoss;      // true when the popup is editing a boss entry
     private float editEntryTime;
@@ -276,6 +276,9 @@ public sealed class MainWindow : Window
     private Dictionary<int, (string name, string icon)> riAbilityLookup = [];
     private int     riSelectedFight   = -1;   // index into riFlights
     private int     riSelectedPlayer  = -1;   // index into riPlayers
+    private int     riAutoSelectedZone = -1;
+    private int     riAutoSelectedEncounter = -1;
+    private int     riAutoSelectedSpec = -1;
     private bool    riFetching;
     private bool    riImporting;
     private CancellationTokenSource? riCts;
@@ -292,6 +295,9 @@ public sealed class MainWindow : Window
     private string            secretBanner       = string.Empty;
     private DateTime          secretBannerUntil  = DateTime.MinValue;
     private IDtrBarEntry?     autoExecDtrEntry;
+    private bool              pendingDeferredConfigSave;
+    private DateTime          pendingDeferredConfigSaveAt = DateTime.MinValue;
+    private static readonly TimeSpan DeferredConfigSaveDelay = TimeSpan.FromMilliseconds(350);
 
     /// <summary>Opens the main window and auto-selects the Config tab on the next frame.</summary>
     public void FocusConfigTab() { IsOpen = true; focusConfigTab = true; }
@@ -302,7 +308,7 @@ public sealed class MainWindow : Window
         if (enabled)
         {
             autoExecDtrEntry ??= plugin.DtrBar.Get("ATKTip");
-            autoExecDtrEntry.Text  = new SeString(new TextPayload("ATK ▶ AUTO"));
+            autoExecDtrEntry.Text  = new SeString(new TextPayload("ATK AUTO"));
             autoExecDtrEntry.Shown = true;
         }
         else
@@ -345,6 +351,8 @@ public sealed class MainWindow : Window
 
     public override void Draw()
     {
+        ProcessDeferredConfigSave();
+
         if (!ImGui.BeginTabBar("##MainTabs"))
             return;
 
@@ -405,6 +413,38 @@ public sealed class MainWindow : Window
         }
     }
 
+    public override void PreDraw()
+    {
+        if (plugin.OverlayWindow.IsEmbeddedPreviewScrubbing)
+            Flags |= ImGuiWindowFlags.NoMove;
+        else
+            Flags &= ~ImGuiWindowFlags.NoMove;
+    }
+
+    private void RequestDeferredConfigSave()
+    {
+        pendingDeferredConfigSave = true;
+        pendingDeferredConfigSaveAt = DateTime.UtcNow + DeferredConfigSaveDelay;
+    }
+
+    private void ProcessDeferredConfigSave()
+    {
+        if (!pendingDeferredConfigSave || DateTime.UtcNow < pendingDeferredConfigSaveAt)
+            return;
+
+        if (ImGui.IsAnyItemActive() ||
+            ImGui.IsMouseDown(ImGuiMouseButton.Left) ||
+            ImGui.IsMouseDown(ImGuiMouseButton.Right) ||
+            ImGui.IsMouseDown(ImGuiMouseButton.Middle))
+        {
+            pendingDeferredConfigSaveAt = DateTime.UtcNow + DeferredConfigSaveDelay;
+            return;
+        }
+
+        plugin.SaveConfig();
+        pendingDeferredConfigSave = false;
+    }
+
     private void DrawTimelineTab()
     {
         DrawSelectors();
@@ -458,6 +498,12 @@ public sealed class MainWindow : Window
         DrawSkillFilters();
         ImGui.Separator();
         DrawTimeline();
+    }
+
+    private void HideEmbeddedTimelinePreview()
+    {
+        showEmbeddedTimelinePreview = false;
+        plugin.OverlayWindow.ResetEmbeddedPreview();
     }
 
     // ── Custom timeline export / import ──
@@ -755,15 +801,35 @@ public sealed class MainWindow : Window
         }
         else
         {
-            var cfg  = plugin.Configuration;
+            var cfg = plugin.Configuration;
             var keys = customs.Keys.ToList();
+            var globalIndexByKey = new Dictionary<string, int>(keys.Count, StringComparer.OrdinalIgnoreCase);
+            for (var index = 0; index < keys.Count; index++)
+                globalIndexByKey[keys[index]] = index;
 
-            void DrawTimelineRow(string key, List<string> scopedKeys)
+            var groupedKeysByGroup = new Dictionary<string, List<string>>(cfg.TimelineGroups.Count, StringComparer.OrdinalIgnoreCase);
+            foreach (var groupName in cfg.TimelineGroups)
+                groupedKeysByGroup[groupName] = new List<string>();
+
+            var ungroupedKeys = new List<string>();
+            foreach (var key in keys)
+            {
+                if (cfg.TimelineGroupAssignments.TryGetValue(key, out var groupName) &&
+                    groupedKeysByGroup.TryGetValue(groupName, out var groupedKeys))
+                {
+                    groupedKeys.Add(key);
+                }
+                else
+                {
+                    ungroupedKeys.Add(key);
+                }
+            }
+
+            void DrawTimelineRow(string key, List<string> scopedKeys, int scopedIdx)
             {
                 var tl         = customs[key];
                 var isSelected = key == selectedCustomKey;
-                var globalIdx  = keys.IndexOf(key);
-                var scopedIdx  = scopedKeys.IndexOf(key);
+                var globalIdx  = globalIndexByKey[key];
 
                 ImGui.PushID(key);
 
@@ -782,12 +848,12 @@ public sealed class MainWindow : Window
                 {
                     ImGui.BeginDisabled(scopedIdx == 0);
                     if (ImGui.MenuItem("Move Up"))
-                        ReorderCustomTimeline(keys, globalIdx, keys.IndexOf(scopedKeys[scopedIdx - 1]));
+                        ReorderCustomTimeline(keys, globalIdx, globalIndexByKey[scopedKeys[scopedIdx - 1]]);
                     ImGui.EndDisabled();
 
                     ImGui.BeginDisabled(scopedIdx == scopedKeys.Count - 1);
                     if (ImGui.MenuItem("Move Down"))
-                        ReorderCustomTimeline(keys, globalIdx, keys.IndexOf(scopedKeys[scopedIdx + 1]));
+                        ReorderCustomTimeline(keys, globalIdx, globalIndexByKey[scopedKeys[scopedIdx + 1]]);
                     ImGui.EndDisabled();
 
                     ImGui.Separator();
@@ -825,9 +891,7 @@ public sealed class MainWindow : Window
             for (var gi = 0; gi < cfg.TimelineGroups.Count; gi++)
             {
                 var group     = cfg.TimelineGroups[gi];
-                var groupKeys = keys
-                    .Where(k => cfg.TimelineGroupAssignments.TryGetValue(k, out var g) && g == group)
-                    .ToList();
+                var groupKeys = groupedKeysByGroup.GetValueOrDefault(group) ?? [];
 
                 var nodeOpen = ImGui.TreeNodeEx($"{group}##grpnode{gi}",
                     ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.SpanAvailWidth);
@@ -861,8 +925,8 @@ public sealed class MainWindow : Window
                     if (groupKeys.Count == 0)
                         ImGui.TextDisabled("  (empty)");
                     else
-                        foreach (var k in groupKeys)
-                            DrawTimelineRow(k, groupKeys);
+                        for (var groupKeyIndex = 0; groupKeyIndex < groupKeys.Count; groupKeyIndex++)
+                            DrawTimelineRow(groupKeys[groupKeyIndex], groupKeys, groupKeyIndex);
 
                     ImGui.TreePop();
                 }
@@ -871,8 +935,7 @@ public sealed class MainWindow : Window
             // Apply deferred group mutations
             if (groupToDelete != null)
             {
-                foreach (var k in keys.Where(k =>
-                    cfg.TimelineGroupAssignments.TryGetValue(k, out var g) && g == groupToDelete).ToList())
+                foreach (var k in groupedKeysByGroup.GetValueOrDefault(groupToDelete) ?? [])
                     cfg.TimelineGroupAssignments.Remove(k);
                 cfg.TimelineGroups.Remove(groupToDelete);
                 plugin.SaveConfig();
@@ -885,11 +948,6 @@ public sealed class MainWindow : Window
                 plugin.SaveConfig();
             }
 
-            // Ungrouped
-            var ungroupedKeys = keys
-                .Where(k => !cfg.TimelineGroupAssignments.ContainsKey(k))
-                .ToList();
-
             if (ungroupedKeys.Count > 0)
             {
                 if (cfg.TimelineGroups.Count > 0)
@@ -897,8 +955,8 @@ public sealed class MainWindow : Window
                     ImGui.Spacing();
                     ImGui.TextDisabled("Ungrouped");
                 }
-                foreach (var k in ungroupedKeys)
-                    DrawTimelineRow(k, ungroupedKeys);
+                for (var ungroupedIndex = 0; ungroupedIndex < ungroupedKeys.Count; ungroupedIndex++)
+                    DrawTimelineRow(ungroupedKeys[ungroupedIndex], ungroupedKeys, ungroupedIndex);
             }
 
         }
@@ -941,7 +999,9 @@ public sealed class MainWindow : Window
         ImGui.BeginChild("##CustomEditor", new Vector2(0, 0), false);
 
         DrawReportImporter();
+        DrawAutoTimelineFromFetchedLogsSection();
 
+        // Guard: if Delete was just pressed editingTimeline is now null, bail out cleanly.
         if (editingTimeline == null)
         {
             ImGui.Separator();
@@ -986,7 +1046,7 @@ public sealed class MainWindow : Window
         if (ImGui.IsItemHovered())
         {
             ImGui.BeginTooltip();
-            ImGui.Text("Build the best legal action order, then apply any enabled GCD/oGCD spacing settings.");
+            ImGui.Text("Build the best legal action order from the current source timeline.");
             ImGui.EndTooltip();
         }
 
@@ -1048,84 +1108,6 @@ public sealed class MainWindow : Window
             editingTimeline.AverageDurationMs = editDurationSec * 1000.0;
             customEditorDirty = true;
         }
-        ImGui.SetNextItemWidth(100);
-        if (ImGui.InputInt("Parse Count", ref editParseCount, 1, 10))
-        {
-            editParseCount = Math.Max(0, editParseCount);
-            editingTimeline.ParseCount = editParseCount;
-            customEditorDirty = true;
-        }
-        ImGui.SetNextItemWidth(120);
-        var prevDelta = editDeltaMs;
-        if (ImGui.InputInt("Delta (ms)", ref editDeltaMs, 50, 200))
-        {
-            var shift = (editDeltaMs - prevDelta) / 1000.0;
-            foreach (var entry in editingTimeline.Entries)
-                entry.TimeOffsetSec -= shift;
-            editingTimeline.DeltaMs = editDeltaMs;
-            customEditorDirty = true;
-        }
-        if (ImGui.Checkbox("Enable GCD Recast Time", ref editEnableCustomGcdRecastSpacing))
-        {
-            editingTimeline.EnableCustomGcdRecastSpacing = editEnableCustomGcdRecastSpacing;
-            customEditorDirty = true;
-        }
-        ImGui.SetNextItemWidth(120);
-        if (ImGui.InputFloat("GCD Recast (s)", ref editCustomGcdRecastSec, 0.01f, 0.1f, "%.2f"))
-        {
-            editCustomGcdRecastSec = Math.Max(0.5f, editCustomGcdRecastSec);
-            editingTimeline.CustomGcdRecastSec = editCustomGcdRecastSec;
-            customEditorDirty = true;
-        }
-        ImGui.SameLine();
-        if (!editEnableCustomGcdRecastSpacing)
-            ImGui.BeginDisabled();
-        if (ImGui.SmallButton("Apply GCD Spacing"))
-        {
-            ApplyCustomGcdSpacing(editingTimeline!, editingTimeline!.CustomGcdRecastSec);
-            customEditorDirty = true;
-        }
-        if (!editEnableCustomGcdRecastSpacing)
-            ImGui.EndDisabled();
-        ImGui.SameLine();
-        ImGui.TextDisabled("(?)");
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.BeginTooltip();
-            ImGui.TextUnformatted("Manually apply your configured GCD spacing to the current timeline.\nLarge downtime gaps are preserved.\n\nAuto Timeline also applies this when the checkbox is enabled.");
-            ImGui.EndTooltip();
-        }
-        if (ImGui.Checkbox("Enable oGCD Spacing", ref editEnableCustomOgcdSpacing))
-        {
-            editingTimeline.EnableCustomOgcdSpacing = editEnableCustomOgcdSpacing;
-            customEditorDirty = true;
-        }
-        ImGui.SetNextItemWidth(140);
-        if (ImGui.SliderInt("oGCDs Between GCDs", ref editCustomOgcdSlots, 1, 3))
-        {
-            editCustomOgcdSlots = Math.Clamp(editCustomOgcdSlots, 1, 3);
-            editingTimeline.CustomOgcdSlots = editCustomOgcdSlots;
-            customEditorDirty = true;
-        }
-        ImGui.SameLine();
-        if (!editEnableCustomOgcdSpacing)
-            ImGui.BeginDisabled();
-        if (ImGui.SmallButton("Apply oGCD Spacing"))
-        {
-            ApplyCustomOgcdSpacing(editingTimeline!, editingTimeline!.CustomOgcdSlots);
-            customEditorDirty = true;
-        }
-        if (!editEnableCustomOgcdSpacing)
-            ImGui.EndDisabled();
-        ImGui.SameLine();
-        ImGui.TextDisabled("(?)##ogcdspacing");
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.BeginTooltip();
-            ImGui.TextUnformatted("Manually equalize oGCD timing between adjacent GCD anchors.\nThe slider controls how many oGCD slots are assumed to fit between those GCDs.\nLarge downtime gaps are preserved.\n\nAuto Timeline also applies this when the checkbox is enabled.");
-            ImGui.EndTooltip();
-        }
-
         ImGui.Separator();
 
         // Rebuild conflict data each frame so it stays current as entries are edited
@@ -1438,6 +1420,8 @@ public sealed class MainWindow : Window
         // ── AST card draw state ─────────────────────────────────────────────
         // null = no draw active yet, "Astral" = after Astral Draw, "Umbral" = after Umbral Draw
         string? cardDrawState = null;
+        var timedWindowEndByAbility = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        var timedLockoutEndByAbility = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
         double castLockUntil = 0.0;
 
         double lastEntryTime = 0.0;
@@ -1492,6 +1476,31 @@ public sealed class MainWindow : Window
                 now + ConflictCastLockToleranceSec < castLockUntil)
                 AddReason(idx,
                     $"Cast lock conflict: {entry.AbilityName} lands during a prior cast window (free at {FormatCsvTime(castLockUntil)})");
+
+            var timedWindowReason = GetTimedUsageWindowReason(
+                tl.SpecName,
+                timedWindowEndByAbility,
+                entry.AbilityName,
+                now);
+            if (timedWindowReason != null)
+                AddReason(idx, timedWindowReason);
+
+            var timedLockoutReason = GetTimedUsageLockoutReason(
+                tl.SpecName,
+                timedLockoutEndByAbility,
+                entry.AbilityName,
+                now);
+            if (timedLockoutReason != null)
+                AddReason(idx, timedLockoutReason);
+
+            var scholarBurstReservationReason = GetScholarBurstAetherflowReservationReason(
+                tl.SpecName,
+                timedWindowEndByAbility,
+                gaugeState,
+                entry.AbilityName,
+                now);
+            if (scholarBurstReservationReason != null)
+                AddReason(idx, scholarBurstReservationReason);
 
             // ── Cooldown conflict (oGCDs / long-recast abilities, recast ≥ 5 s) ──
             if (ShouldTrackPersonalCooldown(info) &&
@@ -1572,6 +1581,17 @@ public sealed class MainWindow : Window
                             $"Not enough gauge: {effect.GaugeName} = {gaugeState.GetValueOrDefault(effect.GaugeName)}" +
                             $" (need \u2265 {effect.MinRequired})");
                     }
+
+                    if (effect.MaxAllowedBeforeUse < int.MaxValue)
+                    {
+                        var have = gaugeState.GetValueOrDefault(effect.GaugeName);
+                        if (have > effect.MaxAllowedBeforeUse)
+                        {
+                            AddReason(idx,
+                                $"Gauge refresh conflict: {entry.AbilityName} requires {effect.GaugeName} \u2264 {effect.MaxAllowedBeforeUse}" +
+                                $" before use, but {have} remains");
+                        }
+                    }
                 }
 
                 // Apply all deltas regardless of conflict so later entries see correct state
@@ -1580,12 +1600,7 @@ public sealed class MainWindow : Window
                     if (bypassGaugeSpendChecks && effect.Delta < 0)
                         continue;
 
-                    if (effect.Delta == 0) continue;
-                    var res = gaugeRules.Resources.FirstOrDefault(r =>
-                        string.Equals(r.Name, effect.GaugeName, StringComparison.OrdinalIgnoreCase));
-                    gaugeState[effect.GaugeName] = Math.Clamp(
-                        gaugeState.GetValueOrDefault(effect.GaugeName) + effect.Delta,
-                        0, res?.MaxValue ?? int.MaxValue);
+                    ApplyGaugeEffectToState(gaugeState, gaugeRules, effect);
                 }
             }
 
@@ -1677,6 +1692,9 @@ public sealed class MainWindow : Window
             }
 
             // ── Advance combo state ───────────────────────────────────────────
+            ApplyTimedUsageWindowState(tl.SpecName, timedWindowEndByAbility, entry.AbilityName, now);
+            ApplyTimedUsageLockoutState(tl.SpecName, timedLockoutEndByAbility, entry.AbilityName, now);
+
             ApplyCastStateTransitions(
                 grantedState, grantedRules, info, entry.AbilityName, effectiveCastTimeSec, instantCastRule);
 
@@ -1725,12 +1743,6 @@ public sealed class MainWindow : Window
         editEncounterName  = tl.EncounterName;
         editSpecName       = tl.SpecName;
         editDurationSec    = (float)(tl.AverageDurationMs / 1000.0);
-        editParseCount     = tl.ParseCount;
-        editDeltaMs        = tl.DeltaMs;
-        editEnableCustomGcdRecastSpacing = tl.EnableCustomGcdRecastSpacing;
-        editCustomGcdRecastSec = (float)Math.Max(0.5, tl.CustomGcdRecastSec);
-        editEnableCustomOgcdSpacing = tl.EnableCustomOgcdSpacing;
-        editCustomOgcdSlots = Math.Clamp(tl.CustomOgcdSlots, 1, 3);
         editingEntryIndex  = -1;
         customEditorDirty  = false;
 
@@ -1768,17 +1780,11 @@ public sealed class MainWindow : Window
     private const double AutoBurstLateWindowSec = 15.0;
     private const double AutoStructuredLookaheadSec = 1.75;
     private const double AutoSafeFallbackLookaheadSec = 4.5;
-    private const double AutoFutureLegalLookaheadSec = 6.0;
-    private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
-    private const double AutoStateDrivenOgcdMinFrequency = 0.10;
-    private const double AutoGcdMinFrequency = 0.10;
-    private const double CustomGcdDowntimeMultiplier = 2.4;
-    private const double CustomSpacingRepairCycleSec = 120.0;
-    private const double CustomSpacingRepairWindowStartOffsetSec = 30.0;
-    private const double CustomSpacingRepairWindowDurationSec = 60.0;
-    private const double CustomSpacingProtectedFightEndSec = 30.0;
-    private const double CustomSpacingGapRepairThresholdSec = 3.5;
-    private const int CustomSpacingGapRepairNeighborCount = 2;
+private const double AutoFutureLegalLookaheadSec = 6.0;
+private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
+private const double AutoStateDrivenOgcdMinFrequency = 0.10;
+private const double AutoGcdMinFrequency = 0.10;
+private const double AutoGcdSlotMatchToleranceSec = 0.01;
 
     private sealed class AutoTimelineState
     {
@@ -1788,7 +1794,10 @@ public sealed class MainWindow : Window
         public Dictionary<string, int> GrantedState { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, int> ActionState { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, double> PassiveGaugeProgress { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, double> TimedWindowEndByAbility { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, double> TimedLockoutEndByAbility { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> AvailableAbilityNames { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public string SpecName { get; set; } = string.Empty;
         public string? CardDrawState { get; set; }
         public uint LastGcdId { get; set; }
         public string? LastComboAbilityName { get; set; }
@@ -1814,7 +1823,10 @@ public sealed class MainWindow : Window
                 GrantedState = new Dictionary<string, int>(GrantedState, StringComparer.OrdinalIgnoreCase),
                 ActionState = new Dictionary<string, int>(ActionState, StringComparer.OrdinalIgnoreCase),
                 PassiveGaugeProgress = new Dictionary<string, double>(PassiveGaugeProgress, StringComparer.OrdinalIgnoreCase),
+                TimedWindowEndByAbility = new Dictionary<string, double>(TimedWindowEndByAbility, StringComparer.OrdinalIgnoreCase),
+                TimedLockoutEndByAbility = new Dictionary<string, double>(TimedLockoutEndByAbility, StringComparer.OrdinalIgnoreCase),
                 AvailableAbilityNames = new HashSet<string>(AvailableAbilityNames, StringComparer.OrdinalIgnoreCase),
+                SpecName = SpecName,
                 CardDrawState = CardDrawState,
                 LastGcdId = LastGcdId,
                 LastComboAbilityName = LastComboAbilityName,
@@ -1835,12 +1847,36 @@ public sealed class MainWindow : Window
         public string DebugReport { get; init; } = string.Empty;
     }
 
+    private sealed class AutoGaugeLegalitySegmentDecision
+    {
+        public required TimelineEntry Entry { get; init; }
+        public required bool Keep { get; init; }
+        public required string Summary { get; init; }
+        public string? BeforeGaugeState { get; init; }
+        public string? AfterGaugeState { get; init; }
+        public bool UsedOpenerBorrow { get; init; }
+    }
+
+    private sealed class AutoGaugeLegalityBranch
+    {
+        public required AutoTimelineState State { get; init; }
+        public required List<AutoGaugeLegalitySegmentDecision> Decisions { get; init; }
+        public required double Score { get; init; }
+    }
+
     private sealed class AutoGrantedChildRule
     {
         public string ChildAbilityName { get; init; } = string.Empty;
         public HashSet<string> ParentAbilityNames { get; init; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> ConsumerAbilityNames { get; init; } = new(StringComparer.OrdinalIgnoreCase);
         public int AllowedUsesPerParentWindow { get; init; } = 1;
+        public AutoGrantedWindowSelectionMode WindowSelectionMode { get; init; } = AutoGrantedWindowSelectionMode.FirstChronological;
+    }
+
+    private enum AutoGrantedWindowSelectionMode
+    {
+        FirstChronological,
+        HighestFrequencyPerParentWindow,
     }
 
     private sealed class AutoComboBranchContext
@@ -1863,6 +1899,7 @@ public sealed class MainWindow : Window
         public int GcdSlotCount { get; init; }
         public double EndTimeSec { get; init; }
         public IReadOnlyList<string> GcdSequence { get; init; } = [];
+        public IReadOnlyList<BalanceOpenerDatabase.OpenerStep> Steps { get; init; } = [];
     }
 
     private sealed class AutoTimelineDebugRecorder
@@ -1897,6 +1934,10 @@ public sealed class MainWindow : Window
         public bool IsTracked { get; init; }
         public bool IsAllowed { get; init; }
         public string Summary { get; init; } = string.Empty;
+        public AutoGrantedChildRule? ChildRule { get; init; }
+        public TimelineEntry? ParentEntry { get; init; }
+        public TimelineEntry? ExistingWindowConsumerEntry { get; init; }
+        public bool UsesVirtualParentWindow { get; init; }
     }
 
     private static readonly Dictionary<string, string[]> StateAliases = new(StringComparer.OrdinalIgnoreCase)
@@ -1970,13 +2011,17 @@ public sealed class MainWindow : Window
 
     private void ApplyAutoTimeline(AggregatedTimeline tl)
     {
+        var timelineKey = TimelineDatabase.MakeKey(tl.EncounterId, tl.SpecName);
+        var isCustomTimeline = plugin.Configuration.CustomTimelines.ContainsKey(timelineKey);
+        var allowedOutputAbilityIds = tl.Entries
+            .Select(entry => entry.AbilityId)
+            .ToHashSet();
         var sourceTimeline = PrepareAutoTimelineSourceClone(tl);
         var result = BuildAutoTimelineResult(sourceTimeline, captureDebug: false);
-        tl.Entries = result.Entries;
-        if (tl.EnableCustomGcdRecastSpacing)
-            ApplyCustomGcdSpacing(tl, tl.CustomGcdRecastSec);
-        if (tl.EnableCustomOgcdSpacing)
-            ApplyCustomOgcdSpacing(tl, tl.CustomOgcdSlots);
+        var finalEntries = isCustomTimeline
+            ? FilterAutoTimelineResultEntries(result.Entries, allowedOutputAbilityIds)
+            : result.Entries;
+        tl.Entries = finalEntries;
     }
 
     private AutoTimelineBuildResult BuildAutoTimelineResult(AggregatedTimeline tl, bool captureDebug)
@@ -2055,7 +2100,8 @@ public sealed class MainWindow : Window
     {
         debug?.Add("GCD Selection");
         var comboHints = JobComboDatabase.GetHints(specName);
-        var grantedChildRules = BuildGrantedChildRules(gcdEntries.Concat(selectedOgcdEntries));
+        var grantedRules = GrantedActionDatabase.GetRules(specName);
+        var grantedChildRules = BuildGrantedChildRules(gcdEntries.Concat(selectedOgcdEntries), grantedRules);
         var keptEntries = new List<TimelineEntry>();
         var usedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var blockedUntilByAbility = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
@@ -2200,7 +2246,7 @@ public sealed class MainWindow : Window
                     activeComboBranch,
                     openerBuffer,
                     openerRequirement);
-                KeepAutoGcdSelection(
+                var scheduledChosenEntry = KeepAutoGcdSelection(
                     chosenEntry,
                     nextSlotTimeSec,
                     keptEntries,
@@ -2231,7 +2277,7 @@ public sealed class MainWindow : Window
                         comboHints,
                         chosenEntry.AbilityName,
                         slotIndex,
-                        chosenEntry.TimeOffsetSec,
+                        scheduledChosenEntry.TimeOffsetSec,
                         sortedGcdEntries,
                         usedKeys,
                         debug);
@@ -2240,7 +2286,7 @@ public sealed class MainWindow : Window
                 {
                     activeComboBranch = AdvanceAutoComboBranchContext(
                         activeComboBranch,
-                        chosenEntry);
+                        scheduledChosenEntry);
                 }
             }
             else
@@ -2282,7 +2328,8 @@ public sealed class MainWindow : Window
         AutoTimelineDebugRecorder? debug = null)
     {
         debug?.Add("Granted Actions");
-        var grantedChildRules = BuildGrantedChildRules(baseSelectedGcdEntries.Concat(baseSelectedOgcdEntries));
+        var grantedRules = GrantedActionDatabase.GetRules(specName);
+        var grantedChildRules = BuildGrantedChildRules(baseSelectedGcdEntries.Concat(baseSelectedOgcdEntries), grantedRules);
         if (grantedChildRules.Count == 0)
         {
             debug?.Add("  none configured");
@@ -2353,50 +2400,414 @@ public sealed class MainWindow : Window
     {
         debug?.Add("Gauge Legality");
         var gaugeRules = GaugeSimulator.GetRules(specName);
-        var state = CreateAutoTimelineState(gaugeRules, grantedRules: null, rawAbilityNames);
+        var state = CreateAutoTimelineState(specName, gaugeRules, grantedRules: null, rawAbilityNames);
         var finalEntries = new List<TimelineEntry>();
+        var orderedEntries = gcdEntries
+            .Concat(selectedOgcdEntries)
+            .OrderBy(item => item.TimeOffsetSec)
+            .ThenByDescending(item => item.Frequency)
+            .ToList();
         if (openerBuffer.Enabled)
             debug?.Add($"  opener buffer | numeric gauge minimums before {FormatTime(openerBuffer.EndTimeSec)} may borrow pre-pull resources");
 
-        foreach (var entry in gcdEntries
-                     .Concat(selectedOgcdEntries)
-                     .OrderBy(item => item.TimeOffsetSec)
-                     .ThenByDescending(item => item.Frequency))
+        if (gaugeRules != null && orderedEntries.Any(entry => IsAutoTimelineTrueGaugeAbility(entry.AbilityName, gaugeRules)))
         {
-            AdvancePassiveResources(state, gaugeRules, entry.TimeOffsetSec);
-            var relevantGaugeNames = GetRelevantGaugeNames(gaugeRules, entry.AbilityName);
-            var beforeGaugeState = FormatGaugeStateForDebug(state, relevantGaugeNames);
-            var insufficiencyReason = GetNumericGaugeInsufficiencyReason(state, gaugeRules, entry.AbilityName);
-            var canBorrowPrepullGauge = insufficiencyReason != null && IsWithinAutoOpenerBuffer(openerBuffer, entry.TimeOffsetSec);
-            if (insufficiencyReason != null)
+            for (var index = 0; index < orderedEntries.Count; index++)
             {
-                if (canBorrowPrepullGauge)
+                var entry = orderedEntries[index];
+                var decision = EvaluateAutoGaugeLegalityDecision(state, gaugeRules, specName, openerBuffer, entry);
+                if (decision.Keep)
                 {
                     finalEntries.Add(entry);
-                    ApplyNumericGaugeEffects(state, gaugeRules, entry.AbilityName, allowPrepullSeed: true);
-                    var borrowedAfterGaugeState = FormatGaugeStateForDebug(state, relevantGaugeNames);
-                    debug?.Add($"  keep | {FormatAutoDebugEntry(entry)} | opener buffer borrowed pre-pull gauge because {insufficiencyReason} | before {beforeGaugeState} -> after {borrowedAfterGaugeState}");
+                    if (decision.BeforeGaugeState == null)
+                        debug?.Add($"  keep | {FormatAutoDebugEntry(entry)} | {decision.Summary}");
+                    else
+                        debug?.Add($"  keep | {FormatAutoDebugEntry(entry)} | {decision.Summary} | before {decision.BeforeGaugeState} -> after {decision.AfterGaugeState}");
+                }
+                else
+                {
+                    var stateText = decision.BeforeGaugeState == null
+                        ? string.Empty
+                        : $" | state {decision.BeforeGaugeState}";
+                    debug?.Add($"  prune | {FormatAutoDebugEntry(entry)} | {decision.Summary}{stateText}");
+                }
+
+                if (!decision.Keep ||
+                    !TryGetAutoGaugeRefillResourceNames(entry.AbilityName, gaugeRules, out var refillGaugeNames))
+                    continue;
+
+                var nextRefillIndex = FindNextAutoGaugeRefillIndex(orderedEntries, index + 1, gaugeRules, refillGaugeNames);
+                if (nextRefillIndex <= index + 1)
+                    continue;
+
+                var (segmentEntries, updatedState) = OptimizeAutoGaugeSegment(
+                    orderedEntries,
+                    index + 1,
+                    nextRefillIndex,
+                    state,
+                    gaugeRules,
+                    openerBuffer,
+                    refillGaugeNames);
+                foreach (var segmentDecision in segmentEntries)
+                {
+                    if (segmentDecision.Keep)
+                    {
+                        finalEntries.Add(segmentDecision.Entry);
+                        if (segmentDecision.BeforeGaugeState == null)
+                            debug?.Add($"  keep | {FormatAutoDebugEntry(segmentDecision.Entry)} | {segmentDecision.Summary}");
+                        else
+                            debug?.Add($"  keep | {FormatAutoDebugEntry(segmentDecision.Entry)} | {segmentDecision.Summary} | before {segmentDecision.BeforeGaugeState} -> after {segmentDecision.AfterGaugeState}");
+                    }
+                    else
+                    {
+                        var stateText = segmentDecision.BeforeGaugeState == null
+                            ? string.Empty
+                            : $" | state {segmentDecision.BeforeGaugeState}";
+                        debug?.Add($"  prune | {FormatAutoDebugEntry(segmentDecision.Entry)} | {segmentDecision.Summary}{stateText}");
+                    }
+                }
+
+                state = updatedState;
+                index = nextRefillIndex - 1;
+            }
+        }
+        else
+        {
+            foreach (var entry in orderedEntries)
+            {
+                var decision = EvaluateAutoGaugeLegalityDecision(state, gaugeRules, specName, openerBuffer, entry);
+                if (!decision.Keep)
+                {
+                    var stateText = decision.BeforeGaugeState == null
+                        ? string.Empty
+                        : $" | state {decision.BeforeGaugeState}";
+                    debug?.Add($"  prune | {FormatAutoDebugEntry(entry)} | {decision.Summary}{stateText}");
                     continue;
                 }
 
-                debug?.Add($"  prune | {FormatAutoDebugEntry(entry)} | {insufficiencyReason} | state {beforeGaugeState}");
-                continue;
+                finalEntries.Add(entry);
+                if (decision.BeforeGaugeState == null)
+                    debug?.Add($"  keep | {FormatAutoDebugEntry(entry)} | {decision.Summary}");
+                else
+                    debug?.Add($"  keep | {FormatAutoDebugEntry(entry)} | {decision.Summary} | before {decision.BeforeGaugeState} -> after {decision.AfterGaugeState}");
             }
-
-            finalEntries.Add(entry);
-            ApplyNumericGaugeEffects(state, gaugeRules, entry.AbilityName);
-            var afterGaugeState = FormatGaugeStateForDebug(state, relevantGaugeNames);
-            if (relevantGaugeNames.Count == 0)
-                debug?.Add($"  keep | {FormatAutoDebugEntry(entry)} | no numeric gauge rule");
-            else
-                debug?.Add($"  keep | {FormatAutoDebugEntry(entry)} | gauge ok | before {beforeGaugeState} -> after {afterGaugeState}");
         }
 
         debug?.Add();
-        return finalEntries
+        List<string>? postSelectionDebugNotes = debug == null ? null : new List<string>();
+        var postSelectionEntries = TimelineJobRules.ApplyPostSelectionRules(
+            specName,
+            finalEntries,
+            promoteMacrocosmosToVisualGcd: false,
+            debugNotes: postSelectionDebugNotes);
+        if (postSelectionDebugNotes is { Count: > 0 })
+        {
+            debug.Add("Post-Selection Job Rules");
+            foreach (var note in postSelectionDebugNotes)
+                debug.Add(note);
+            debug.Add();
+        }
+
+        return postSelectionEntries
             .OrderBy(entry => entry.TimeOffsetSec)
             .ThenByDescending(entry => entry.Frequency)
             .ToList();
+    }
+
+    private AutoGaugeLegalitySegmentDecision EvaluateAutoGaugeLegalityDecision(
+        AutoTimelineState state,
+        GaugeSimulator.JobGaugeRules? gaugeRules,
+        string specName,
+        AutoOpenerBufferInfo openerBuffer,
+        TimelineEntry entry)
+    {
+        AdvancePassiveResources(state, gaugeRules, entry.TimeOffsetSec);
+        var relevantGaugeNames = GetRelevantGaugeNames(gaugeRules, entry.AbilityName);
+        var beforeGaugeState = relevantGaugeNames.Count == 0
+            ? null
+            : FormatGaugeStateForDebug(state, relevantGaugeNames);
+        var insufficiencyReason = GetNumericGaugeInsufficiencyReason(state, gaugeRules, entry.AbilityName);
+        var timedWindowReason = GetTimedUsageWindowReason(
+            specName,
+            state.TimedWindowEndByAbility,
+            entry.AbilityName,
+            entry.TimeOffsetSec);
+        var timedLockoutReason = GetTimedUsageLockoutReason(
+            specName,
+            state.TimedLockoutEndByAbility,
+            entry.AbilityName,
+            entry.TimeOffsetSec);
+        var scholarBurstReservationReason = GetScholarBurstAetherflowReservationReason(
+            specName,
+            state.TimedWindowEndByAbility,
+            state.GaugeState,
+            entry.AbilityName,
+            entry.TimeOffsetSec);
+        var rejectionReason = insufficiencyReason ?? timedWindowReason ?? timedLockoutReason ?? scholarBurstReservationReason;
+        var canBorrowPrepullGauge = insufficiencyReason != null &&
+                                    IsWithinAutoOpenerBuffer(openerBuffer, entry.TimeOffsetSec) &&
+                                    !IsAutoTimelineTrueGaugeSpender(entry.AbilityName, gaugeRules) &&
+                                    CanBorrowAutoOpenerPrepullGauge(state, gaugeRules, entry.AbilityName);
+        if (rejectionReason != null)
+        {
+            if (canBorrowPrepullGauge)
+            {
+                ApplyNumericGaugeEffects(state, gaugeRules, entry.AbilityName, allowPrepullSeed: true);
+                ApplyTimedUsageWindowState(specName, state.TimedWindowEndByAbility, entry.AbilityName, entry.TimeOffsetSec);
+                ApplyTimedUsageLockoutState(specName, state.TimedLockoutEndByAbility, entry.AbilityName, entry.TimeOffsetSec);
+                return new AutoGaugeLegalitySegmentDecision
+                {
+                    Entry = entry,
+                    Keep = true,
+                    Summary = $"opener buffer borrowed pre-pull gauge because {insufficiencyReason}",
+                    BeforeGaugeState = beforeGaugeState,
+                    AfterGaugeState = relevantGaugeNames.Count == 0 ? null : FormatGaugeStateForDebug(state, relevantGaugeNames),
+                    UsedOpenerBorrow = true,
+                };
+            }
+
+            return new AutoGaugeLegalitySegmentDecision
+            {
+                Entry = entry,
+                Keep = false,
+                Summary = rejectionReason,
+                BeforeGaugeState = beforeGaugeState,
+            };
+        }
+
+        ApplyNumericGaugeEffects(state, gaugeRules, entry.AbilityName);
+        ApplyTimedUsageWindowState(specName, state.TimedWindowEndByAbility, entry.AbilityName, entry.TimeOffsetSec);
+        ApplyTimedUsageLockoutState(specName, state.TimedLockoutEndByAbility, entry.AbilityName, entry.TimeOffsetSec);
+        return new AutoGaugeLegalitySegmentDecision
+        {
+            Entry = entry,
+            Keep = true,
+            Summary = relevantGaugeNames.Count == 0 ? "no numeric gauge rule" : "gauge ok",
+            BeforeGaugeState = beforeGaugeState,
+            AfterGaugeState = relevantGaugeNames.Count == 0 ? null : FormatGaugeStateForDebug(state, relevantGaugeNames),
+        };
+    }
+
+    private static bool TryGetAutoGaugeRefillResourceNames(
+        string abilityName,
+        GaugeSimulator.JobGaugeRules gaugeRules,
+        out IReadOnlyList<string> gaugeNames)
+    {
+        gaugeNames = [];
+        if (!gaugeRules.EffectByName.TryGetValue(abilityName, out var effects))
+            return false;
+
+        var refillGaugeNames = effects
+            .Where(effect =>
+                GaugeSimulator.IsTrueGaugeResource(effect.GaugeName) &&
+                (effect.SetValue is int || effect.Delta > 0))
+            .Select(effect => effect.GaugeName)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (refillGaugeNames.Count == 0)
+            return false;
+
+        gaugeNames = refillGaugeNames;
+        return true;
+    }
+
+    private static bool IsAutoGaugeSegmentSpender(
+        string abilityName,
+        GaugeSimulator.JobGaugeRules gaugeRules,
+        IReadOnlyCollection<string> gaugeNames)
+    {
+        if (!gaugeRules.EffectByName.TryGetValue(abilityName, out var effects))
+            return false;
+
+        return effects.Any(effect =>
+            gaugeNames.Contains(effect.GaugeName) &&
+            GaugeSimulator.IsTrueGaugeResource(effect.GaugeName) &&
+            (effect.MinRequired > 0 || effect.Delta < 0));
+    }
+
+    private static int FindNextAutoGaugeRefillIndex(
+        IReadOnlyList<TimelineEntry> orderedEntries,
+        int startIndex,
+        GaugeSimulator.JobGaugeRules gaugeRules,
+        IReadOnlyCollection<string> gaugeNames)
+    {
+        for (var index = startIndex; index < orderedEntries.Count; index++)
+        {
+            if (!TryGetAutoGaugeRefillResourceNames(orderedEntries[index].AbilityName, gaugeRules, out var refillGaugeNames))
+                continue;
+
+            if (refillGaugeNames.Any(gaugeNames.Contains))
+                return index;
+        }
+
+        return orderedEntries.Count;
+    }
+
+    private (List<AutoGaugeLegalitySegmentDecision> Decisions, AutoTimelineState UpdatedState) OptimizeAutoGaugeSegment(
+        IReadOnlyList<TimelineEntry> orderedEntries,
+        int startIndexInclusive,
+        int endIndexExclusive,
+        AutoTimelineState startingState,
+        GaugeSimulator.JobGaugeRules gaugeRules,
+        AutoOpenerBufferInfo openerBuffer,
+        IReadOnlyCollection<string> gaugeNames)
+    {
+        var branches = new List<AutoGaugeLegalityBranch>
+        {
+            new()
+            {
+                State = startingState.Clone(),
+                Decisions = [],
+                Score = 0.0,
+            },
+        };
+
+        for (var index = startIndexInclusive; index < endIndexExclusive; index++)
+        {
+            var entry = orderedEntries[index];
+            var nextBranches = new List<AutoGaugeLegalityBranch>();
+            foreach (var branch in branches)
+            {
+                var evaluationState = branch.State.Clone();
+                var decision = EvaluateAutoGaugeLegalityDecision(
+                    evaluationState,
+                    gaugeRules,
+                    startingState.SpecName,
+                    openerBuffer,
+                    entry);
+
+                if (!IsAutoGaugeSegmentSpender(entry.AbilityName, gaugeRules, gaugeNames))
+                {
+                    var decisions = new List<AutoGaugeLegalitySegmentDecision>(branch.Decisions.Count + 1);
+                    decisions.AddRange(branch.Decisions);
+                    decisions.Add(decision);
+                    nextBranches.Add(new AutoGaugeLegalityBranch
+                    {
+                        State = evaluationState,
+                        Decisions = decisions,
+                        Score = branch.Score,
+                    });
+                    continue;
+                }
+
+                var prunedDecisions = new List<AutoGaugeLegalitySegmentDecision>(branch.Decisions.Count + 1);
+                prunedDecisions.AddRange(branch.Decisions);
+                prunedDecisions.Add(new AutoGaugeLegalitySegmentDecision
+                {
+                    Entry = entry,
+                    Keep = false,
+                    Summary = "stronger gauge spenders won this refill window",
+                    BeforeGaugeState = decision.BeforeGaugeState,
+                });
+                nextBranches.Add(new AutoGaugeLegalityBranch
+                {
+                    State = branch.State.Clone(),
+                    Decisions = prunedDecisions,
+                    Score = branch.Score,
+                });
+
+                if (!decision.Keep)
+                {
+                    var illegalDecisions = new List<AutoGaugeLegalitySegmentDecision>(branch.Decisions.Count + 1);
+                    illegalDecisions.AddRange(branch.Decisions);
+                    illegalDecisions.Add(decision);
+                    nextBranches.Add(new AutoGaugeLegalityBranch
+                    {
+                        State = branch.State.Clone(),
+                        Decisions = illegalDecisions,
+                        Score = branch.Score - 5000.0,
+                    });
+                    continue;
+                }
+
+                var keptDecisions = new List<AutoGaugeLegalitySegmentDecision>(branch.Decisions.Count + 1);
+                keptDecisions.AddRange(branch.Decisions);
+                keptDecisions.Add(decision);
+                nextBranches.Add(new AutoGaugeLegalityBranch
+                {
+                    State = evaluationState,
+                    Decisions = keptDecisions,
+                    Score = branch.Score + ScoreAutoGaugeSegmentEntry(branch.State, entry, gaugeRules),
+                });
+            }
+
+            branches = CollapseAutoGaugeSegmentBranches(nextBranches);
+        }
+
+        var bestBranch = branches
+            .OrderByDescending(branch => branch.Score)
+            .ThenByDescending(branch => branch.Decisions.Count(decision => decision.Keep))
+            .First();
+        return (bestBranch.Decisions, bestBranch.State);
+    }
+
+    private List<AutoGaugeLegalityBranch> CollapseAutoGaugeSegmentBranches(
+        IReadOnlyList<AutoGaugeLegalityBranch> branches)
+    {
+        var bestByKey = new Dictionary<string, AutoGaugeLegalityBranch>(StringComparer.OrdinalIgnoreCase);
+        foreach (var branch in branches)
+        {
+            var key = BuildAutoGaugeSegmentBranchKey(branch.State);
+            if (!bestByKey.TryGetValue(key, out var existing) || branch.Score > existing.Score)
+                bestByKey[key] = branch;
+        }
+
+        return bestByKey.Values
+            .OrderByDescending(branch => branch.Score)
+            .Take(24)
+            .ToList();
+    }
+
+    private string BuildAutoGaugeSegmentBranchKey(AutoTimelineState state)
+    {
+        var gaugeSnapshot = string.Join(
+            ";",
+            state.GaugeState
+                .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(pair => $"{pair.Key}={pair.Value}"));
+        var timedWindowSnapshot = string.Join(
+            ";",
+            state.TimedWindowEndByAbility
+                .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(pair => $"{pair.Key}={pair.Value:F3}"));
+        var timedLockoutSnapshot = string.Join(
+            ";",
+            state.TimedLockoutEndByAbility
+                .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(pair => $"{pair.Key}={pair.Value:F3}"));
+        return string.Create(
+            System.Globalization.CultureInfo.InvariantCulture,
+            $"{state.LastTimeSec:F3}|{gaugeSnapshot}|{timedWindowSnapshot}|{timedLockoutSnapshot}");
+    }
+
+    private double ScoreAutoGaugeSegmentEntry(
+        AutoTimelineState state,
+        TimelineEntry entry,
+        GaugeSimulator.JobGaugeRules gaugeRules)
+    {
+        var score = entry.Frequency * 1000.0;
+        score += entry.AverageUses * 10.0;
+
+        if (TryGetTimedUsageWindowRule(state.SpecName, entry.AbilityName, out _, out _) &&
+            state.TimedWindowEndByAbility.TryGetValue(entry.AbilityName, out var timedWindowEndSec) &&
+            entry.TimeOffsetSec <= timedWindowEndSec + AutoCooldownToleranceSec)
+        {
+            score += 250.0;
+        }
+
+        if (GetScholarBurstAetherflowReservationReason(
+                state.SpecName,
+                state.TimedWindowEndByAbility,
+                state.GaugeState,
+                entry.AbilityName,
+                entry.TimeOffsetSec) != null)
+            score -= 250.0;
+
+        if (IsAutoTimelineTrueGaugeSpender(entry.AbilityName, gaugeRules))
+            score += 40.0;
+
+        return score;
     }
 
     private IEnumerable<TimelineEntry> OrderReplayEntriesForEvaluation(
@@ -2556,36 +2967,91 @@ public sealed class MainWindow : Window
             var sample = group.First();
             var info = plugin.RecastDatabase.Lookup(sample.AbilityId, sample.AbilityName);
             var recastSec = Math.Max(0.1, info?.RecastSec ?? 0.0);
-            var aboveThresholdCandidates = group
-                .Where(entry => entry.Frequency >= AutoStateDrivenOgcdMinFrequency)
+            var orderedCandidates = group
                 .OrderBy(entry => entry.TimeOffsetSec)
                 .ThenByDescending(entry => entry.Frequency)
                 .ToList();
+            var aboveThresholdCandidates = orderedCandidates
+                .Where(entry => entry.Frequency >= AutoStateDrivenOgcdMinFrequency)
+                .ToList();
             var belowThresholdCount = group.Count() - aboveThresholdCandidates.Count;
             debug?.Add($"  ability | {group.Key} | recast {recastSec:F1}s | above threshold {aboveThresholdCandidates.Count} | below threshold {belowThresholdCount}");
-            double? nextReadyTimeSec = null;
-            TimelineEntry? previousKeptCandidate = null;
+            if (orderedCandidates.Count == 0)
+                continue;
 
-            foreach (var candidate in aboveThresholdCandidates)
+            var currentWindowStartSec = orderedCandidates[0].TimeOffsetSec;
+            var finalCandidateTimeSec = orderedCandidates[^1].TimeOffsetSec;
+            TimelineEntry? previousKeptCandidate = null;
+            var nextReadyTimeSec = currentWindowStartSec;
+            var thresholdText = $"{AutoStateDrivenOgcdMinFrequency * 100.0:F1}%";
+
+            while (currentWindowStartSec <= finalCandidateTimeSec + AutoCooldownToleranceSec)
             {
-                if (nextReadyTimeSec != null &&
-                    candidate.TimeOffsetSec < nextReadyTimeSec.Value - AutoCooldownToleranceSec)
+                var currentWindowEndSec = currentWindowStartSec + recastSec;
+                var windowCandidates = orderedCandidates
+                    .Where(candidate =>
+                        candidate.TimeOffsetSec >= currentWindowStartSec - 0.001 &&
+                        candidate.TimeOffsetSec < currentWindowEndSec - AutoCooldownToleranceSec)
+                    .ToList();
+
+                if (windowCandidates.Count == 0)
                 {
-                    debug?.Add($"    prune | {FormatAutoDebugEntry(candidate)} | cooldown window still closed until {FormatTime(nextReadyTimeSec.Value)} from prior keep {FormatAutoDebugEntry(previousKeptCandidate!)}");
+                    currentWindowStartSec += recastSec;
                     continue;
                 }
 
-                cooldownKeptEntries.Add(candidate);
-                var keepReason = previousKeptCandidate == null
-                    ? "first instance above threshold; establishes cooldown baseline"
-                    : $"cooldown reopened after {FormatTime(nextReadyTimeSec ?? candidate.TimeOffsetSec)} from prior keep {FormatAutoDebugEntry(previousKeptCandidate)}";
-                nextReadyTimeSec = candidate.TimeOffsetSec + recastSec;
-                previousKeptCandidate = candidate;
-                debug?.Add($"    keep | {FormatAutoDebugEntry(candidate)} | {keepReason} | next ready {FormatTime(nextReadyTimeSec.Value)}");
+                var windowAboveThresholdCandidates = windowCandidates
+                    .Where(candidate => candidate.Frequency >= AutoStateDrivenOgcdMinFrequency)
+                    .ToList();
+                var selectedWindowPool = windowAboveThresholdCandidates.Count > 0
+                    ? windowAboveThresholdCandidates
+                    : windowCandidates;
+                var chosenCandidate = selectedWindowPool
+                    .OrderByDescending(candidate => candidate.Frequency)
+                    .ThenBy(candidate => candidate.TimeOffsetSec)
+                    .First();
+                var chosenKey = GetAutoEntryIdentityKey(chosenCandidate);
+                var windowText = $"{FormatTime(currentWindowStartSec)}-{FormatTime(currentWindowEndSec)}";
+                var usedFallback = windowAboveThresholdCandidates.Count == 0;
+
+                cooldownKeptEntries.Add(chosenCandidate);
+
+                if (previousKeptCandidate == null)
+                {
+                    var initialReason = usedFallback
+                        ? $"fallback highest instance within initial cooldown window {windowText}; no candidate met {thresholdText} in this window; establishes cooldown baseline"
+                        : $"strongest instance within initial cooldown window {windowText}; establishes cooldown baseline";
+                    nextReadyTimeSec = chosenCandidate.TimeOffsetSec + recastSec;
+                    debug?.Add($"    keep | {FormatAutoDebugEntry(chosenCandidate)} | {initialReason} | next ready {FormatTime(nextReadyTimeSec)}");
+                }
+                else
+                {
+                    var keepReasonPrefix = $"cooldown reopened after {FormatTime(nextReadyTimeSec)} from prior keep {FormatAutoDebugEntry(previousKeptCandidate)}";
+                    var keepReason = usedFallback
+                        ? $"{keepReasonPrefix} | fallback highest instance within cooldown window {windowText}; no candidate met {thresholdText} in this window"
+                        : $"{keepReasonPrefix} | strongest instance within cooldown window {windowText}";
+                    nextReadyTimeSec = chosenCandidate.TimeOffsetSec + recastSec;
+                    debug?.Add($"    keep | {FormatAutoDebugEntry(chosenCandidate)} | {keepReason} | next ready {FormatTime(nextReadyTimeSec)}");
+                }
+
+                foreach (var candidate in windowCandidates)
+                {
+                    if (string.Equals(GetAutoEntryIdentityKey(candidate), chosenKey, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var pruneReason = usedFallback
+                        ? $"cooldown window {windowText} fell back to stronger keep {FormatAutoDebugEntry(chosenCandidate)} because no candidate met {thresholdText}"
+                        : $"cooldown window {windowText} already committed to stronger keep {FormatAutoDebugEntry(chosenCandidate)}";
+                    debug?.Add($"    prune | {FormatAutoDebugEntry(candidate)} | {pruneReason}");
+                }
+
+                previousKeptCandidate = chosenCandidate;
+                currentWindowStartSec = nextReadyTimeSec - AutoCooldownToleranceSec;
             }
         }
 
-        var grantedChildRules = BuildGrantedChildRules(ogcdEntries);
+        var grantedRules = GrantedActionDatabase.GetRules(specName);
+        var grantedChildRules = BuildGrantedChildRules(ogcdEntries, grantedRules);
         if (grantedChildRules.Count == 0)
         {
             debug?.Add();
@@ -2613,6 +3079,9 @@ public sealed class MainWindow : Window
 
             if (!grantedDecision.IsAllowed)
             {
+                if (TryReplaceGrantedWindowAlternative(entry, grantedDecision, grantedKeptEntries, debug))
+                    continue;
+
                 debug?.Add($"    prune | {FormatAutoDebugEntry(entry)} | {grantedDecision.Summary}");
                 continue;
             }
@@ -2622,10 +3091,225 @@ public sealed class MainWindow : Window
         }
 
         debug?.Add();
-        return grantedKeptEntries
+        var finalOgcdEntries = ApplyAutoOpenerOgcdGuideline(
+            ogcdEntries,
+            grantedKeptEntries,
+            specName,
+            openerBuffer,
+            debug);
+        return finalOgcdEntries
             .OrderBy(entry => entry.TimeOffsetSec)
             .ThenByDescending(entry => entry.Frequency)
             .ToList();
+    }
+
+    private List<TimelineEntry> ApplyAutoOpenerOgcdGuideline(
+        List<TimelineEntry> sourceOgcdEntries,
+        List<TimelineEntry> selectedOgcdEntries,
+        string specName,
+        AutoOpenerBufferInfo openerBuffer,
+        AutoTimelineDebugRecorder? debug)
+    {
+        if (!openerBuffer.Enabled || openerBuffer.Steps.Count == 0)
+            return selectedOgcdEntries;
+
+        var openerOgcdSteps = openerBuffer.Steps
+            .Where(step => step.IsOgcd && !string.IsNullOrWhiteSpace(step.AbilityName))
+            .Select(step => step.AbilityName)
+            .ToList();
+        if (openerOgcdSteps.Count == 0)
+            return selectedOgcdEntries;
+
+        var gaugeRules = GaugeSimulator.GetRules(specName);
+        var keptKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<TimelineEntry>(selectedOgcdEntries.Count);
+        var chosenEntriesByKey = new Dictionary<string, TimelineEntry>(StringComparer.OrdinalIgnoreCase);
+        var lastChosenTimeSec = double.NegativeInfinity;
+        var openerCandidatePool = sourceOgcdEntries
+            .Where(entry =>
+                entry.TimeOffsetSec <= openerBuffer.EndTimeSec + AutoCooldownToleranceSec &&
+                entry.Frequency >= AutoStateDrivenOgcdMinFrequency)
+            .ToList();
+        var availableAbilityNames = openerCandidatePool
+            .Select(entry => entry.AbilityName)
+            .Where(static abilityName => !string.IsNullOrWhiteSpace(abilityName))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        string? GetPriorChosenLegalityRejectionReason(TimelineEntry candidate)
+        {
+            var state = CreateAutoTimelineState(specName, gaugeRules, grantedRules: null, availableAbilityNames);
+            foreach (var priorEntry in chosenEntriesByKey.Values
+                         .Where(entry => entry.TimeOffsetSec <= candidate.TimeOffsetSec + AutoCooldownToleranceSec)
+                         .OrderBy(entry => entry.TimeOffsetSec)
+                         .ThenByDescending(entry => entry.Frequency))
+            {
+                AdvancePassiveResources(state, gaugeRules, priorEntry.TimeOffsetSec);
+                var priorInfo = plugin.RecastDatabase.Lookup(priorEntry.AbilityId, priorEntry.AbilityName);
+                ApplyAutoEntry(state, priorEntry, priorInfo, gaugeRules, grantedRules: null, priorEntry.TimeOffsetSec, isGcd: false);
+            }
+
+            var candidateInfo = plugin.RecastDatabase.Lookup(candidate.AbilityId, candidate.AbilityName);
+            AdvancePassiveResources(state, gaugeRules, candidate.TimeOffsetSec);
+            return GetAutoEntryRejectionReason(state, candidate, candidateInfo, gaugeRules, grantedRules: null, candidate.TimeOffsetSec);
+        }
+
+        bool CanCompleteOrderedOpenerOgcdSequence(
+            int stepIndex,
+            double minimumTimeSec,
+            HashSet<string> usedKeys)
+        {
+            if (stepIndex >= openerOgcdSteps.Count)
+                return true;
+
+            var remainingAbilityName = openerOgcdSteps[stepIndex];
+            var candidates = openerCandidatePool
+                .Where(entry =>
+                {
+                    var key = GetAutoEntryIdentityKey(entry);
+                    return !usedKeys.Contains(key) &&
+                           DoesOpenerAbilityMatch(entry.AbilityName, remainingAbilityName) &&
+                           entry.TimeOffsetSec + AutoCooldownToleranceSec >= minimumTimeSec;
+                })
+                .OrderByDescending(entry => entry.Frequency)
+                .ThenBy(entry => entry.TimeOffsetSec)
+                .ToList();
+            if (candidates.Count == 0)
+                return false;
+
+            foreach (var candidate in candidates)
+            {
+                var key = GetAutoEntryIdentityKey(candidate);
+                usedKeys.Add(key);
+                if (CanCompleteOrderedOpenerOgcdSequence(stepIndex + 1, candidate.TimeOffsetSec, usedKeys))
+                    return true;
+
+                usedKeys.Remove(key);
+            }
+
+            return false;
+        }
+
+        debug?.Add("  opener oGCD guideline");
+        for (var stepIndex = 0; stepIndex < openerOgcdSteps.Count; stepIndex++)
+        {
+            var abilityName = openerOgcdSteps[stepIndex];
+            var priorChosenTimeSec = lastChosenTimeSec;
+            var candidates = openerCandidatePool
+                .Where(entry =>
+                    !keptKeys.Contains(GetAutoEntryIdentityKey(entry)) &&
+                    DoesOpenerAbilityMatch(entry.AbilityName, abilityName))
+                .OrderByDescending(entry => entry.Frequency)
+                .ThenBy(entry => entry.TimeOffsetSec)
+                .ToList();
+            if (candidates.Count == 0)
+            {
+                debug?.Add($"    miss | slot {stepIndex + 1} | {abilityName} | no raw opener-buffer candidate survived for this ordered opener step");
+                continue;
+            }
+
+            TimelineEntry? keptEntry = null;
+            var legalityRejectionByKey = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var candidate in candidates)
+            {
+                var candidateKey = GetAutoEntryIdentityKey(candidate);
+                if (candidate.TimeOffsetSec + AutoCooldownToleranceSec < priorChosenTimeSec)
+                    continue;
+
+                var legalityRejectionReason = GetPriorChosenLegalityRejectionReason(candidate);
+                legalityRejectionByKey[candidateKey] = legalityRejectionReason;
+                if (legalityRejectionReason != null)
+                    continue;
+
+                var simulatedUsedKeys = new HashSet<string>(keptKeys, StringComparer.OrdinalIgnoreCase)
+                {
+                    candidateKey
+                };
+                if (!CanCompleteOrderedOpenerOgcdSequence(stepIndex + 1, candidate.TimeOffsetSec, simulatedUsedKeys))
+                    continue;
+
+                keptEntry = candidate;
+                break;
+            }
+
+            keptEntry ??= candidates
+                .FirstOrDefault(entry =>
+                {
+                    var candidateKey = GetAutoEntryIdentityKey(entry);
+                    legalityRejectionByKey.TryAdd(candidateKey, GetPriorChosenLegalityRejectionReason(entry));
+                    return entry.TimeOffsetSec + AutoCooldownToleranceSec >= priorChosenTimeSec &&
+                           legalityRejectionByKey[candidateKey] == null;
+                })
+                ?? candidates.First();
+            var keptKey = GetAutoEntryIdentityKey(keptEntry);
+            keptKeys.Add(keptKey);
+            chosenEntriesByKey[keptKey] = keptEntry;
+            var preservedSequence = keptEntry.TimeOffsetSec + AutoCooldownToleranceSec >= priorChosenTimeSec;
+            lastChosenTimeSec = keptEntry.TimeOffsetSec;
+            var keepReason = preservedSequence
+                ? "strongest unique raw opener-buffer candidate kept in ordered opener sequence"
+                : "strongest unique raw opener-buffer candidate kept after ordered sequence ran out; earlier fallback preserved this opener step";
+            debug?.Add($"    keep | {FormatAutoDebugEntry(keptEntry)} | opener slot {stepIndex + 1} requires {abilityName}; {keepReason}");
+
+            foreach (var prunedEntry in candidates
+                         .Where(entry => !string.Equals(GetAutoEntryIdentityKey(entry), keptKey, StringComparison.OrdinalIgnoreCase))
+                         .OrderByDescending(entry => entry.Frequency)
+                         .ThenBy(entry => entry.TimeOffsetSec))
+            {
+                var prunedKey = GetAutoEntryIdentityKey(prunedEntry);
+                legalityRejectionByKey.TryAdd(prunedKey, GetPriorChosenLegalityRejectionReason(prunedEntry));
+                var legalityReason = legalityRejectionByKey[prunedKey];
+                var pruneReason = legalityReason != null
+                    ? $"opener slot {stepIndex + 1} would be pruned later by legality checks: {legalityReason}"
+                    : prunedEntry.TimeOffsetSec + AutoCooldownToleranceSec >= priorChosenTimeSec
+                    ? $"opener slot {stepIndex + 1} already committed to a stronger {abilityName} candidate in the ordered opener sequence"
+                    : $"opener slot {stepIndex + 1} already committed to a stronger {abilityName} fallback candidate after in-order options ran out";
+                debug?.Add($"    prune | {FormatAutoDebugEntry(prunedEntry)} | {pruneReason}");
+            }
+        }
+
+        foreach (var entry in chosenEntriesByKey.Values
+                     .OrderBy(item => item.TimeOffsetSec)
+                     .ThenByDescending(item => item.Frequency))
+        {
+            var key = GetAutoEntryIdentityKey(entry);
+            if (keptKeys.Contains(key))
+                result.Add(entry);
+        }
+
+        foreach (var entry in selectedOgcdEntries
+                     .OrderBy(item => item.TimeOffsetSec)
+                     .ThenByDescending(item => item.Frequency))
+        {
+            if (entry.TimeOffsetSec > openerBuffer.EndTimeSec + AutoCooldownToleranceSec)
+            {
+                result.Add(entry);
+                continue;
+            }
+
+            var key = GetAutoEntryIdentityKey(entry);
+            if (result.Any(existing => GetAutoEntryIdentityKey(existing) == key))
+                continue;
+
+            if (keptKeys.Contains(key))
+            {
+                result.Add(entry);
+                continue;
+            }
+
+            if (openerOgcdSteps.Any(openerAbilityName => DoesOpenerAbilityMatch(entry.AbilityName, openerAbilityName)))
+                continue;
+
+            if (IsAutoTimelineTrueGaugeAbility(entry.AbilityName, gaugeRules))
+            {
+                debug?.Add($"    prune | {FormatAutoDebugEntry(entry)} | opener-buffer true-gauge action is not part of the configured opener oGCD roster");
+                continue;
+            }
+
+            result.Add(entry);
+        }
+
+        debug?.Add();
+        return result;
     }
 
     private List<TimelineEntry> RepairAutoGcdEntries(
@@ -2782,8 +3466,8 @@ public sealed class MainWindow : Window
             .Where(entry =>
                 !usedKeys.Contains(GetAutoEntryIdentityKey(entry)) &&
                 entry.Frequency >= AutoGcdMinFrequency &&
-                entry.TimeOffsetSec >= windowStartSec - 0.001 &&
-                entry.TimeOffsetSec < windowEndSec - 0.001)
+                entry.TimeOffsetSec >= windowStartSec - AutoGcdSlotMatchToleranceSec &&
+                entry.TimeOffsetSec < windowEndSec + AutoGcdSlotMatchToleranceSec)
             .OrderByDescending(entry => IsWithinAutoSlotWindow(entry.TimeOffsetSec, slotTimeSec))
             .ThenBy(entry => Math.Abs(entry.TimeOffsetSec - slotTimeSec))
             .ThenByDescending(entry => entry.Frequency)
@@ -2792,8 +3476,8 @@ public sealed class MainWindow : Window
     }
 
     private static bool IsWithinAutoSlotWindow(double entryTimeSec, double slotTimeSec)
-        => entryTimeSec >= slotTimeSec - 0.001 &&
-           entryTimeSec < slotTimeSec + AutoTargetGcdSec - 0.001;
+        => entryTimeSec >= slotTimeSec - AutoGcdSlotMatchToleranceSec &&
+           entryTimeSec < slotTimeSec + AutoTargetGcdSec + AutoGcdSlotMatchToleranceSec;
 
     private static string BuildOpenerRequirementSummary(
         TimelineEntry entry,
@@ -3185,7 +3869,8 @@ public sealed class MainWindow : Window
            slotTimeSec < blockedUntilSec - AutoCooldownToleranceSec;
 
     private Dictionary<string, AutoGrantedChildRule> BuildGrantedChildRules(
-        IEnumerable<TimelineEntry> entries)
+        IEnumerable<TimelineEntry> entries,
+        GrantedActionDatabase.JobGrantedActionRules? grantedRules)
     {
         var result = new Dictionary<string, AutoGrantedChildRule>(StringComparer.OrdinalIgnoreCase);
         var trackedAbilityNames = entries
@@ -3203,6 +3888,12 @@ public sealed class MainWindow : Window
 
         foreach (var abilityName in trackedAbilityNames)
         {
+            if (TryBuildCardDrawGrantedRule(abilityName, grantedRules, out var cardDrawRule))
+            {
+                result[abilityName] = cardDrawRule;
+                continue;
+            }
+
             var actionRule = actionRulesByAbility[abilityName];
             if (actionRule == null)
                 continue;
@@ -3240,6 +3931,42 @@ public sealed class MainWindow : Window
         }
 
         return result;
+    }
+
+    private static bool TryBuildCardDrawGrantedRule(
+        string abilityName,
+        GrantedActionDatabase.JobGrantedActionRules? grantedRules,
+        out AutoGrantedChildRule rule)
+    {
+        rule = null!;
+        if (grantedRules?.CardDraw is not { } cardDraw)
+            return false;
+
+        if (cardDraw.AstralCards.Contains(abilityName))
+        {
+            rule = new AutoGrantedChildRule
+            {
+                ChildAbilityName = abilityName,
+                ParentAbilityNames = [cardDraw.AstralDrawName],
+                ConsumerAbilityNames = [abilityName],
+                AllowedUsesPerParentWindow = 1,
+            };
+            return true;
+        }
+
+        if (cardDraw.UmbralCards.Contains(abilityName))
+        {
+            rule = new AutoGrantedChildRule
+            {
+                ChildAbilityName = abilityName,
+                ParentAbilityNames = [cardDraw.UmbralDrawName],
+                ConsumerAbilityNames = [abilityName],
+                AllowedUsesPerParentWindow = 1,
+            };
+            return true;
+        }
+
+        return false;
     }
 
     private bool ActionConsumesAnyGrantedState(
@@ -3331,6 +4058,9 @@ public sealed class MainWindow : Window
                         IsTracked = true,
                         IsAllowed = false,
                         Summary = $"opener buffer already spent its virtual pre-pull parent [{parentNamesText}] on {virtualWindowUses}/{childRule.AllowedUsesPerParentWindow} tracked use(s) from [{consumerNamesText}]",
+                        ChildRule = childRule,
+                        ExistingWindowConsumerEntry = FindLatestGrantedWindowConsumerEntry(childRule, earlierSelectedEntries, windowStartTimeSec: null),
+                        UsesVirtualParentWindow = true,
                     };
                 }
 
@@ -3339,6 +4069,8 @@ public sealed class MainWindow : Window
                     IsTracked = true,
                     IsAllowed = true,
                     Summary = $"opener buffer assumed a pre-pull parent from [{parentNamesText}] before pull; tracked use {virtualWindowUses + 1}/{childRule.AllowedUsesPerParentWindow} from [{consumerNamesText}] may borrow that missing parent window",
+                    ChildRule = childRule,
+                    UsesVirtualParentWindow = true,
                 };
             }
 
@@ -3347,6 +4079,7 @@ public sealed class MainWindow : Window
                 IsTracked = true,
                 IsAllowed = false,
                 Summary = $"requires a parent before this child; expected one of [{parentNamesText}] before {FormatTime(entry.TimeOffsetSec)}, but none was selected",
+                ChildRule = childRule,
             };
         }
 
@@ -3361,6 +4094,9 @@ public sealed class MainWindow : Window
                 IsTracked = true,
                 IsAllowed = false,
                 Summary = $"latest parent window is {FormatAutoDebugEntry(lastParentEntry)}; [{consumerNamesText}] already spent {priorWindowUses}/{childRule.AllowedUsesPerParentWindow} allowed use(s) in that window",
+                ChildRule = childRule,
+                ParentEntry = lastParentEntry,
+                ExistingWindowConsumerEntry = FindLatestGrantedWindowConsumerEntry(childRule, earlierSelectedEntries, lastParentEntry.TimeOffsetSec),
             };
         }
 
@@ -3372,6 +4108,8 @@ public sealed class MainWindow : Window
             IsTracked = true,
             IsAllowed = true,
             Summary = keepSummary,
+            ChildRule = childRule,
+            ParentEntry = lastParentEntry,
         };
     }
 
@@ -3394,6 +4132,60 @@ public sealed class MainWindow : Window
         }
 
         return count;
+    }
+
+    private static TimelineEntry? FindLatestGrantedWindowConsumerEntry(
+        AutoGrantedChildRule childRule,
+        IReadOnlyList<TimelineEntry> selectedEntries,
+        double? windowStartTimeSec)
+    {
+        TimelineEntry? best = null;
+        foreach (var selectedEntry in selectedEntries)
+        {
+            if (windowStartTimeSec.HasValue &&
+                selectedEntry.TimeOffsetSec < windowStartTimeSec.Value - AutoCooldownToleranceSec)
+            {
+                continue;
+            }
+
+            if (childRule.ConsumerAbilityNames.Contains(selectedEntry.AbilityName))
+                best = selectedEntry;
+        }
+
+        return best;
+    }
+
+    private bool TryReplaceGrantedWindowAlternative(
+        TimelineEntry candidate,
+        AutoGrantedCandidateDecision decision,
+        List<TimelineEntry> grantedKeptEntries,
+        AutoTimelineDebugRecorder? debug)
+    {
+        if (decision.ChildRule is not { } childRule ||
+            childRule.WindowSelectionMode != AutoGrantedWindowSelectionMode.HighestFrequencyPerParentWindow ||
+            childRule.AllowedUsesPerParentWindow != 1 ||
+            decision.ExistingWindowConsumerEntry is not { } existingEntry)
+        {
+            return false;
+        }
+
+        var candidateIsStronger = candidate.Frequency > existingEntry.Frequency + 0.001 ||
+                                  (Math.Abs(candidate.Frequency - existingEntry.Frequency) <= 0.001 &&
+                                   candidate.TimeOffsetSec < existingEntry.TimeOffsetSec - 0.001);
+        if (!candidateIsStronger)
+            return false;
+
+        grantedKeptEntries.Remove(existingEntry);
+        grantedKeptEntries.Add(candidate);
+
+        var parentSummary = decision.UsesVirtualParentWindow
+            ? "the opener buffer's virtual pre-pull parent window"
+            : decision.ParentEntry == null
+                ? "the active parent window"
+                : $"parent window {FormatAutoDebugEntry(decision.ParentEntry)}";
+        debug?.Add($"    lose | {FormatAutoDebugEntry(existingEntry)} | replaced within {parentSummary} by stronger alternative {FormatAutoDebugEntry(candidate)}");
+        debug?.Add($"    keep | {FormatAutoDebugEntry(candidate)} | strongest tracked alternative kept for {parentSummary}; replaced {FormatAutoDebugEntry(existingEntry)}");
+        return true;
     }
 
     private static TimelineEntry? GetLastGrantedParentEntry(
@@ -3657,6 +4449,7 @@ public sealed class MainWindow : Window
             GcdSlotCount = remainingSequence.Length,
             EndTimeSec = remainingSequence.Length * AutoTargetGcdSec,
             GcdSequence = variant.GcdSequence.ToArray(),
+            Steps = variant.Steps.ToArray(),
         };
 
         debug?.Add($"  active | variant {variant.Name} | start slot {startSlotOffset:00} ({variant.GcdSequence[startSlotOffset]}) | matched concrete GCDs {matchedEntries.Count}/{Math.Max(1, concreteGcdCount)} | buffer 0:00.0-{FormatTime(openerBuffer.EndTimeSec)}");
@@ -3889,8 +4682,8 @@ public sealed class MainWindow : Window
                 .Where(entry =>
                     !usedKeys.Contains(GetAutoEntryIdentityKey(entry)) &&
                     string.Equals(entry.AbilityName, branchAbilityName, StringComparison.OrdinalIgnoreCase) &&
-                    entry.TimeOffsetSec >= branchSlotTimeSec - 0.001 &&
-                    entry.TimeOffsetSec < branchSlotTimeSec + AutoTargetGcdSec - 0.001)
+                    entry.TimeOffsetSec >= branchSlotTimeSec - AutoGcdSlotMatchToleranceSec &&
+                    entry.TimeOffsetSec < branchSlotTimeSec + AutoTargetGcdSec + AutoGcdSlotMatchToleranceSec)
                 .Select(entry => entry.Frequency)
                 .DefaultIfEmpty(0.0)
                 .Max();
@@ -4090,8 +4883,8 @@ public sealed class MainWindow : Window
                 .Where(entry =>
                     !usedKeys.Contains(GetAutoEntryIdentityKey(entry)) &&
                     string.Equals(entry.AbilityName, line[stepIndex], StringComparison.OrdinalIgnoreCase) &&
-                    entry.TimeOffsetSec >= slotTimeSec - 0.001 &&
-                    entry.TimeOffsetSec < slotTimeSec + AutoTargetGcdSec - 0.001)
+                    entry.TimeOffsetSec >= slotTimeSec - AutoGcdSlotMatchToleranceSec &&
+                    entry.TimeOffsetSec < slotTimeSec + AutoTargetGcdSec + AutoGcdSlotMatchToleranceSec)
                 .OrderByDescending(entry => entry.Frequency)
                 .ThenBy(entry => entry.TimeOffsetSec)
                 .FirstOrDefault();
@@ -4105,7 +4898,7 @@ public sealed class MainWindow : Window
         return (matchedSteps, totalScore);
     }
 
-    private void KeepAutoGcdSelection(
+    private TimelineEntry KeepAutoGcdSelection(
         TimelineEntry chosenEntry,
         double slotTimeSec,
         List<TimelineEntry> keptEntries,
@@ -4118,19 +4911,21 @@ public sealed class MainWindow : Window
     {
         var chosenKey = GetAutoEntryIdentityKey(chosenEntry);
         if (!usedKeys.Add(chosenKey))
-            return;
+            return chosenEntry;
 
-        keptEntries.Add(chosenEntry);
+        var scheduledEntry = CreateScheduledEntry(chosenEntry, slotTimeSec);
+        keptEntries.Add(scheduledEntry);
         var comboDurationSec = GetComboPseudoCooldownSec(comboHints, chosenEntry.AbilityName);
         if (comboDurationSec > 0.0)
         {
             blockedUntilByAbility[chosenEntry.AbilityName] = Math.Max(
                 blockedUntilByAbility.GetValueOrDefault(chosenEntry.AbilityName),
-                chosenEntry.TimeOffsetSec + comboDurationSec);
+                scheduledEntry.TimeOffsetSec + comboDurationSec);
         }
 
         debug?.Add($"  slot-choice | {reason} | {chosenEntry.AbilityName}");
-        debug?.Add($"  slot-keep | {FormatAutoDebugEntry(chosenEntry)} | slot {FormatAutoDebugSlotWindow(slotTimeSec)} | {detail}");
+        debug?.Add($"  slot-keep | {FormatAutoDebugEntry(scheduledEntry)} | slot {FormatAutoDebugSlotWindow(slotTimeSec)} | {detail}");
+        return scheduledEntry;
     }
 
     private static string FormatAutoDebugEntry(TimelineEntry entry)
@@ -4144,12 +4939,8 @@ public sealed class MainWindow : Window
         TimelineEntry? chosenEntry,
         double slotIntervalSec)
     {
-        if (chosenEntry == null)
-            return currentSlotTimeSec + slotIntervalSec;
-
-        return Math.Max(
-            currentSlotTimeSec + 0.001,
-            chosenEntry.TimeOffsetSec + slotIntervalSec);
+        _ = chosenEntry;
+        return currentSlotTimeSec + slotIntervalSec;
     }
 
     private static IReadOnlyList<string> GetRelevantGaugeNames(
@@ -4326,15 +5117,6 @@ public sealed class MainWindow : Window
         var info = plugin.RecastDatabase.Lookup(entry.AbilityId, entry.AbilityName);
         return IsAutoTimelineGcd(info);
     }
-
-    private bool IsCustomSpacingGcdEntry(TimelineEntry entry)
-    {
-        var info = plugin.RecastDatabase.Lookup(entry.AbilityId, entry.AbilityName);
-        return IsAutoTimelineGcd(info);
-    }
-
-    private bool IsCustomSpacingOgcdEntry(TimelineEntry entry)
-        => !IsCustomSpacingGcdEntry(entry);
 
     private static bool IsAutoTimelineGcd(Data.RecastDatabase.RecastInfo? info)
         => info?.IsGcdAction == true;
@@ -4527,512 +5309,6 @@ public sealed class MainWindow : Window
             entry.Frequency,
             entry.AverageUses);
 
-    private void ApplyCustomGcdSpacing(AggregatedTimeline tl, double requestedGcdRecastSec)
-    {
-        if (tl.Entries.Count == 0)
-            return;
-
-        var gcdRecastSec = Math.Max(0.5, requestedGcdRecastSec);
-        tl.CustomGcdRecastSec = gcdRecastSec;
-
-        var orderedEntries = tl.Entries
-            .OrderBy(entry => entry.TimeOffsetSec)
-            .ThenByDescending(entry => entry.Frequency)
-            .ToList();
-        var gcdEntries = orderedEntries
-            .Where(IsCustomSpacingGcdEntry)
-            .ToList();
-        if (gcdEntries.Count <= 1)
-            return;
-
-        var fightEndSec = orderedEntries[^1].TimeOffsetSec;
-        var downtimeGapSec = Math.Max(AutoGcdDowntimeGapSec, gcdRecastSec * CustomGcdDowntimeMultiplier);
-        for (var passIndex = 0; passIndex < 3; passIndex++)
-        {
-            var repairedAnyGap = false;
-            for (var gapIndex = 0; gapIndex < gcdEntries.Count - 1; gapIndex++)
-            {
-                var currentGapSec = gcdEntries[gapIndex + 1].TimeOffsetSec - gcdEntries[gapIndex].TimeOffsetSec;
-                if (currentGapSec <= 0.0 || currentGapSec >= downtimeGapSec)
-                    continue;
-
-                var repairThresholdSec = GetCustomGcdRepairThresholdSec(gcdEntries[gapIndex + 1], gcdRecastSec);
-                if (currentGapSec <= repairThresholdSec)
-                    continue;
-
-                var gapMidpointSec = gcdEntries[gapIndex].TimeOffsetSec + (currentGapSec * 0.5);
-                if (!TryGetCustomSpacingRepairWindow(gapMidpointSec, fightEndSec, out var repairWindowStartSec, out var repairWindowEndSec))
-                    continue;
-
-                if (!TryGetCustomGcdRepairCluster(
-                        gcdEntries,
-                        gapIndex,
-                        repairWindowStartSec,
-                        repairWindowEndSec,
-                        downtimeGapSec,
-                        out var clusterStartIndex,
-                        out var clusterEndIndex))
-                {
-                    continue;
-                }
-
-                if (!TryRepairCustomGcdGapCluster(gcdEntries, clusterStartIndex, clusterEndIndex, gapIndex, gcdRecastSec))
-                    continue;
-
-                repairedAnyGap = true;
-                gapIndex = Math.Max(clusterStartIndex - 1, -1);
-            }
-
-            if (!repairedAnyGap)
-                break;
-        }
-
-        tl.Entries = tl.Entries
-            .OrderBy(entry => entry.TimeOffsetSec)
-            .ThenByDescending(entry => entry.Frequency)
-            .ToList();
-    }
-
-    private double GetCustomGcdSpacingGapSec(TimelineEntry entry, double requestedGcdRecastSec)
-    {
-        var info = plugin.RecastDatabase.Lookup(entry.AbilityId, entry.AbilityName);
-        var castSec = Math.Max(0.0, info?.CastTimeSec ?? 0.0);
-        return Math.Max(requestedGcdRecastSec, castSec);
-    }
-
-    private double GetCustomGcdRepairThresholdSec(TimelineEntry nextEntry, double requestedGcdRecastSec)
-        => Math.Max(
-            CustomSpacingGapRepairThresholdSec,
-            GetCustomGcdSpacingGapSec(nextEntry, requestedGcdRecastSec) + 1.0);
-
-    private bool TryGetCustomSpacingRepairWindow(
-        double timeSec,
-        double fightEndSec,
-        out double windowStartSec,
-        out double windowEndSec)
-    {
-        windowStartSec = 0.0;
-        windowEndSec = 0.0;
-
-        if (timeSec < CustomSpacingRepairWindowStartOffsetSec)
-            return false;
-
-        if (fightEndSec - timeSec < CustomSpacingProtectedFightEndSec)
-            return false;
-
-        var cycleIndex = Math.Floor(timeSec / CustomSpacingRepairCycleSec);
-        var candidateStartSec = (cycleIndex * CustomSpacingRepairCycleSec) + CustomSpacingRepairWindowStartOffsetSec;
-        var candidateEndSec = candidateStartSec + CustomSpacingRepairWindowDurationSec;
-        if (timeSec < candidateStartSec || timeSec > candidateEndSec)
-            return false;
-
-        var clampedWindowEndSec = Math.Min(candidateEndSec, fightEndSec - CustomSpacingProtectedFightEndSec);
-        if (clampedWindowEndSec <= candidateStartSec)
-            return false;
-
-        windowStartSec = candidateStartSec;
-        windowEndSec = clampedWindowEndSec;
-        return true;
-    }
-
-    private bool TryGetCustomGcdRepairCluster(
-        IReadOnlyList<TimelineEntry> gcdEntries,
-        int gapIndex,
-        double repairWindowStartSec,
-        double repairWindowEndSec,
-        double downtimeGapSec,
-        out int clusterStartIndex,
-        out int clusterEndIndex)
-    {
-        clusterStartIndex = gapIndex;
-        clusterEndIndex = gapIndex + 1;
-
-        var leftExpansions = 0;
-        while (leftExpansions < CustomSpacingGapRepairNeighborCount &&
-               clusterStartIndex > 0)
-        {
-            var candidateEntry = gcdEntries[clusterStartIndex - 1];
-            var currentEntry = gcdEntries[clusterStartIndex];
-            if (candidateEntry.TimeOffsetSec < repairWindowStartSec ||
-                currentEntry.TimeOffsetSec - candidateEntry.TimeOffsetSec >= downtimeGapSec)
-            {
-                break;
-            }
-
-            clusterStartIndex--;
-            leftExpansions++;
-        }
-
-        var rightExpansions = 0;
-        while (rightExpansions < CustomSpacingGapRepairNeighborCount &&
-               clusterEndIndex < gcdEntries.Count - 1)
-        {
-            var currentEntry = gcdEntries[clusterEndIndex];
-            var candidateEntry = gcdEntries[clusterEndIndex + 1];
-            if (candidateEntry.TimeOffsetSec > repairWindowEndSec ||
-                candidateEntry.TimeOffsetSec - currentEntry.TimeOffsetSec >= downtimeGapSec)
-            {
-                break;
-            }
-
-            clusterEndIndex++;
-            rightExpansions++;
-        }
-
-        while (clusterEndIndex - clusterStartIndex + 1 < 3)
-        {
-            var expanded = false;
-            if (clusterStartIndex > 0)
-            {
-                var candidateEntry = gcdEntries[clusterStartIndex - 1];
-                var currentEntry = gcdEntries[clusterStartIndex];
-                if (candidateEntry.TimeOffsetSec >= repairWindowStartSec &&
-                    currentEntry.TimeOffsetSec - candidateEntry.TimeOffsetSec < downtimeGapSec)
-                {
-                    clusterStartIndex--;
-                    expanded = true;
-                }
-            }
-
-            if (clusterEndIndex - clusterStartIndex + 1 < 3 &&
-                clusterEndIndex < gcdEntries.Count - 1)
-            {
-                var currentEntry = gcdEntries[clusterEndIndex];
-                var candidateEntry = gcdEntries[clusterEndIndex + 1];
-                if (candidateEntry.TimeOffsetSec <= repairWindowEndSec &&
-                    candidateEntry.TimeOffsetSec - currentEntry.TimeOffsetSec < downtimeGapSec)
-                {
-                    clusterEndIndex++;
-                    expanded = true;
-                }
-            }
-
-            if (!expanded)
-                break;
-        }
-
-        return clusterEndIndex - clusterStartIndex + 1 >= 3;
-    }
-
-    private bool TryRepairCustomGcdGapCluster(
-        IReadOnlyList<TimelineEntry> gcdEntries,
-        int clusterStartIndex,
-        int clusterEndIndex,
-        int targetGapIndex,
-        double requestedGcdRecastSec)
-    {
-        var clusterCount = clusterEndIndex - clusterStartIndex + 1;
-        if (clusterCount < 3)
-            return false;
-
-        var currentGaps = new double[clusterCount - 1];
-        var targetGaps = new double[clusterCount - 1];
-        var softCaps = new double[clusterCount - 1];
-        var currentSpanSec = 0.0;
-        var currentWorstGapSec = 0.0;
-        for (var offset = 0; offset < clusterCount - 1; offset++)
-        {
-            var previousEntry = gcdEntries[clusterStartIndex + offset];
-            var nextEntry = gcdEntries[clusterStartIndex + offset + 1];
-            var currentGapSec = nextEntry.TimeOffsetSec - previousEntry.TimeOffsetSec;
-            if (currentGapSec <= 0.0)
-                return false;
-
-            currentGaps[offset] = currentGapSec;
-            currentSpanSec += currentGapSec;
-            currentWorstGapSec = Math.Max(currentWorstGapSec, currentGapSec);
-
-            var desiredGapSec = GetCustomGcdSpacingGapSec(nextEntry, requestedGcdRecastSec);
-            targetGaps[offset] = desiredGapSec;
-            softCaps[offset] = GetCustomGcdRepairThresholdSec(nextEntry, requestedGcdRecastSec);
-        }
-
-        var targetSpanSec = targetGaps.Sum();
-        if (currentSpanSec <= targetSpanSec + 0.05)
-            return false;
-
-        var repairedGaps = BuildCustomGcdRepairedGapSequence(targetGaps, softCaps, currentSpanSec);
-        var repairedWorstGapSec = repairedGaps.Max();
-        var targetClusterGapIndex = targetGapIndex - clusterStartIndex;
-        if (targetClusterGapIndex < 0 || targetClusterGapIndex >= repairedGaps.Length)
-            return false;
-
-        if (repairedWorstGapSec >= currentWorstGapSec - 0.05 &&
-            repairedGaps[targetClusterGapIndex] >= currentGaps[targetClusterGapIndex] - 0.05)
-        {
-            return false;
-        }
-
-        var proposedTimeSec = gcdEntries[clusterStartIndex].TimeOffsetSec;
-        for (var offset = 1; offset < clusterCount - 1; offset++)
-        {
-            proposedTimeSec += repairedGaps[offset - 1];
-            gcdEntries[clusterStartIndex + offset].TimeOffsetSec = proposedTimeSec;
-        }
-
-        return true;
-    }
-
-    private double[] BuildCustomGcdRepairedGapSequence(
-        IReadOnlyList<double> targetGaps,
-        IReadOnlyList<double> softCaps,
-        double totalSpanSec)
-    {
-        var repairedGaps = targetGaps.ToArray();
-        var remainingSlackSec = Math.Max(0.0, totalSpanSec - repairedGaps.Sum());
-        const double epsilon = 0.0001;
-
-        var expandableGapIndices = Enumerable.Range(0, repairedGaps.Length)
-            .Where(index => softCaps[index] > repairedGaps[index] + epsilon)
-            .ToList();
-        while (remainingSlackSec > epsilon && expandableGapIndices.Count > 0)
-        {
-            var shareSec = remainingSlackSec / expandableGapIndices.Count;
-            var nextExpandableGapIndices = new List<int>(expandableGapIndices.Count);
-            foreach (var gapIndex in expandableGapIndices)
-            {
-                var capacitySec = Math.Max(0.0, softCaps[gapIndex] - repairedGaps[gapIndex]);
-                if (capacitySec <= epsilon)
-                    continue;
-
-                var addedSec = Math.Min(capacitySec, shareSec);
-                repairedGaps[gapIndex] += addedSec;
-                remainingSlackSec -= addedSec;
-
-                if (softCaps[gapIndex] - repairedGaps[gapIndex] > epsilon)
-                    nextExpandableGapIndices.Add(gapIndex);
-            }
-
-            expandableGapIndices = nextExpandableGapIndices;
-        }
-
-        if (remainingSlackSec > epsilon)
-        {
-            var spilloverSec = remainingSlackSec / repairedGaps.Length;
-            for (var gapIndex = 0; gapIndex < repairedGaps.Length; gapIndex++)
-                repairedGaps[gapIndex] += spilloverSec;
-        }
-
-        return repairedGaps;
-    }
-
-    private void ApplyCustomOgcdSpacing(AggregatedTimeline tl, int maxOgcdSlots)
-    {
-        if (tl.Entries.Count == 0)
-            return;
-
-        var slotCount = Math.Clamp(maxOgcdSlots, 1, 3);
-        tl.CustomOgcdSlots = slotCount;
-
-        var orderedEntries = tl.Entries
-            .OrderBy(entry => entry.TimeOffsetSec)
-            .ThenByDescending(entry => entry.Frequency)
-            .ToList();
-        var gcdEntries = orderedEntries
-            .Where(IsCustomSpacingGcdEntry)
-            .ToList();
-        if (gcdEntries.Count <= 1)
-            return;
-
-        var gcdRecastSec = Math.Max(0.5, tl.CustomGcdRecastSec);
-        var downtimeGapSec = Math.Max(AutoGcdDowntimeGapSec, gcdRecastSec * CustomGcdDowntimeMultiplier);
-        var chargeReadyTimesByAbility = new Dictionary<string, List<double>>(StringComparer.OrdinalIgnoreCase);
-
-        for (var i = 0; i < gcdEntries.Count - 1; i++)
-        {
-            var previousGcd = gcdEntries[i];
-            var nextGcd = gcdEntries[i + 1];
-            var gapSec = nextGcd.TimeOffsetSec - previousGcd.TimeOffsetSec;
-            if (gapSec <= 0.0 || gapSec >= downtimeGapSec)
-                continue;
-
-            var ogcdEntries = orderedEntries
-                .Where(entry =>
-                    IsCustomSpacingOgcdEntry(entry) &&
-                    entry.TimeOffsetSec > previousGcd.TimeOffsetSec &&
-                    entry.TimeOffsetSec < nextGcd.TimeOffsetSec)
-                .OrderBy(entry => entry.TimeOffsetSec)
-                .ThenByDescending(entry => entry.Frequency)
-                .ToList();
-            if (ogcdEntries.Count == 0)
-                continue;
-
-            var windowStart = previousGcd.TimeOffsetSec + GetCustomOgcdWindowStartOffsetSec(previousGcd);
-            var windowEnd = nextGcd.TimeOffsetSec - AutoOgcdLockSec;
-            if (windowEnd <= windowStart)
-                continue;
-
-            var slotTimes = BuildCustomOgcdSlotTimes(windowStart, windowEnd, slotCount);
-            if (slotTimes.Count == 0)
-                continue;
-
-            var desiredTimes = BuildCustomOgcdDesiredTimes(ogcdEntries, slotTimes, windowStart, windowEnd);
-            for (var entryIndex = 0; entryIndex < ogcdEntries.Count; entryIndex++)
-            {
-                var scheduledTimeSec = GetCustomOgcdScheduledTime(
-                    ogcdEntries[entryIndex],
-                    desiredTimes[entryIndex],
-                    windowEnd,
-                    chargeReadyTimesByAbility);
-                if (scheduledTimeSec.HasValue)
-                    ogcdEntries[entryIndex].TimeOffsetSec = scheduledTimeSec.Value;
-            }
-        }
-
-        tl.Entries = tl.Entries
-            .OrderBy(entry => entry.TimeOffsetSec)
-            .ThenByDescending(entry => entry.Frequency)
-            .ToList();
-    }
-
-    private List<double> BuildCustomOgcdSlotTimes(double windowStart, double windowEnd, int slotCount)
-    {
-        if (slotCount <= 0 || windowEnd <= windowStart)
-            return [];
-
-        var usableSpan = windowEnd - windowStart;
-        var interval = usableSpan / (slotCount + 1);
-        if (interval <= 0.0)
-            return [];
-
-        var slots = new List<double>(slotCount);
-        for (var i = 1; i <= slotCount; i++)
-            slots.Add(windowStart + (interval * i));
-
-        return slots;
-    }
-
-    private List<double> BuildCustomOgcdDesiredTimes(
-        IReadOnlyList<TimelineEntry> ogcdEntries,
-        IReadOnlyList<double> slotTimes,
-        double windowStartSec,
-        double windowEndSec)
-    {
-        if (ogcdEntries.Count == 0 || slotTimes.Count == 0)
-            return [];
-
-        if (ogcdEntries.Count <= slotTimes.Count)
-            return BuildCustomOgcdUniqueSlotAssignments(ogcdEntries, slotTimes);
-
-        return BuildCustomOgcdGroupedSlotAssignments(ogcdEntries, slotTimes, windowStartSec, windowEndSec);
-    }
-
-    private List<double> BuildCustomOgcdUniqueSlotAssignments(
-        IReadOnlyList<TimelineEntry> ogcdEntries,
-        IReadOnlyList<double> slotTimes)
-    {
-        var entryCount = ogcdEntries.Count;
-        var slotCount = slotTimes.Count;
-        if (entryCount == 0 || slotCount == 0 || entryCount > slotCount)
-            return [];
-
-        if (entryCount == 1)
-        {
-            var nearestSlotTime = slotTimes
-                .OrderBy(slotTime => Math.Abs(slotTime - ogcdEntries[0].TimeOffsetSec))
-                .First();
-            return [nearestSlotTime];
-        }
-
-        var assignedTimes = new List<double>(entryCount);
-        for (var entryIndex = 0; entryIndex < entryCount; entryIndex++)
-        {
-            var ratio = (double)entryIndex / (entryCount - 1);
-            var slotIndex = (int)Math.Round(ratio * (slotCount - 1), MidpointRounding.AwayFromZero);
-            assignedTimes.Add(slotTimes[Math.Clamp(slotIndex, 0, slotCount - 1)]);
-        }
-
-        return assignedTimes;
-    }
-
-    private List<double> BuildCustomOgcdGroupedSlotAssignments(
-        IReadOnlyList<TimelineEntry> ogcdEntries,
-        IReadOnlyList<double> slotTimes,
-        double windowStartSec,
-        double windowEndSec)
-    {
-        var entryCount = ogcdEntries.Count;
-        var slotCount = slotTimes.Count;
-        if (entryCount == 0 || slotCount == 0)
-            return [];
-
-        var assignedSlotIndices = new int[entryCount];
-        var minimumSlotIndex = 0;
-        for (var entryIndex = 0; entryIndex < entryCount; entryIndex++)
-        {
-            var bestSlotIndex = minimumSlotIndex;
-            var bestDistanceSec = double.MaxValue;
-            for (var slotIndex = minimumSlotIndex; slotIndex < slotCount; slotIndex++)
-            {
-                var distanceSec = Math.Abs(ogcdEntries[entryIndex].TimeOffsetSec - slotTimes[slotIndex]);
-                if (distanceSec < bestDistanceSec - 0.0001)
-                {
-                    bestDistanceSec = distanceSec;
-                    bestSlotIndex = slotIndex;
-                }
-            }
-
-            assignedSlotIndices[entryIndex] = bestSlotIndex;
-            minimumSlotIndex = bestSlotIndex;
-        }
-
-        var desiredTimes = new List<double>(entryCount);
-        for (var entryIndex = 0; entryIndex < entryCount; entryIndex++)
-        {
-            var slotIndex = Math.Clamp(assignedSlotIndices[entryIndex], 0, slotCount - 1);
-            desiredTimes.Add(slotTimes[slotIndex]);
-        }
-
-        return desiredTimes;
-    }
-
-    private double GetCustomOgcdWindowStartOffsetSec(TimelineEntry previousGcd)
-    {
-        var info = plugin.RecastDatabase.Lookup(previousGcd.AbilityId, previousGcd.AbilityName);
-        var castSec = Math.Max(0.0, info?.CastTimeSec ?? 0.0);
-        return castSec + AutoOgcdLockSec;
-    }
-
-    private double? GetCustomOgcdScheduledTime(
-        TimelineEntry entry,
-        double desiredTimeSec,
-        double windowEndSec,
-        Dictionary<string, List<double>> chargeReadyTimesByAbility)
-    {
-        var info = plugin.RecastDatabase.Lookup(entry.AbilityId, entry.AbilityName);
-        if (info == null || info.RecastSec <= 0.0)
-            return desiredTimeSec <= windowEndSec ? desiredTimeSec : null;
-
-        var abilityKey = $"{entry.AbilityId}:{entry.AbilityName}";
-        var chargeCount = Math.Max(1, info.MaxCharges);
-        if (!chargeReadyTimesByAbility.TryGetValue(abilityKey, out var readyTimes))
-        {
-            readyTimes = Enumerable.Repeat(double.NegativeInfinity, chargeCount).ToList();
-            chargeReadyTimesByAbility[abilityKey] = readyTimes;
-        }
-
-        var chargeIndex = readyTimes.FindIndex(readyTime => readyTime <= desiredTimeSec + AutoCooldownToleranceSec);
-        double scheduledTimeSec;
-        if (chargeIndex >= 0)
-        {
-            scheduledTimeSec = desiredTimeSec;
-        }
-        else
-        {
-            chargeIndex = readyTimes
-                .Select((readyTime, index) => new { readyTime, index })
-                .OrderBy(pair => pair.readyTime)
-                .First()
-                .index;
-            scheduledTimeSec = readyTimes[chargeIndex];
-            if (scheduledTimeSec > windowEndSec)
-                return null;
-        }
-
-        readyTimes[chargeIndex] = scheduledTimeSec + info.RecastSec;
-        return scheduledTimeSec <= windowEndSec ? scheduledTimeSec : null;
-    }
-
     private static bool MatchesCastRule(
         GrantedActionDatabase.InstantCastRule rule,
         string abilityName,
@@ -5171,11 +5447,15 @@ public sealed class MainWindow : Window
     }
 
     private AutoTimelineState CreateAutoTimelineState(
+        string specName,
         GaugeSimulator.JobGaugeRules? gaugeRules,
         GrantedActionDatabase.JobGrantedActionRules? grantedRules,
         ISet<string>? availableAbilityNames = null)
     {
-        var state = new AutoTimelineState();
+        var state = new AutoTimelineState
+        {
+            SpecName = specName,
+        };
         if (availableAbilityNames != null)
             state.AvailableAbilityNames = new HashSet<string>(availableAbilityNames, StringComparer.OrdinalIgnoreCase);
         if (gaugeRules == null)
@@ -5194,6 +5474,137 @@ public sealed class MainWindow : Window
         }
 
         return state;
+    }
+
+    private static bool TryGetTimedUsageWindowRule(
+        string specName,
+        string abilityName,
+        out string parentAbilityName,
+        out double durationSec)
+    {
+        if (string.Equals(specName, "Scholar", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(abilityName, "Energy Drain", StringComparison.OrdinalIgnoreCase))
+        {
+            parentAbilityName = "Chain Stratagem";
+            durationSec = 20.0;
+            return true;
+        }
+
+        parentAbilityName = string.Empty;
+        durationSec = 0.0;
+        return false;
+    }
+
+    private static bool TryGetTimedUsageLockoutRule(
+        string specName,
+        string abilityName,
+        out string sourceAbilityName,
+        out double durationSec)
+    {
+        if (string.Equals(specName, "Scholar", StringComparison.OrdinalIgnoreCase) &&
+            abilityName is "Fey Blessing" or "Whispering Dawn" or "Fey Illumination" or "Summon Seraph" or "Seraphism")
+        {
+            sourceAbilityName = "Dissipation";
+            durationSec = 30.0;
+            return true;
+        }
+
+        sourceAbilityName = string.Empty;
+        durationSec = 0.0;
+        return false;
+    }
+
+    private static bool IsScholarAetherflowSpender(string abilityName)
+        => abilityName is "Energy Drain" or "Energy Siphon" or "Lustrate" or "Indomitability" or "Excogitation" or "Sacred Soil";
+
+    private static bool IsScholarBurstReservedAetherflowSpender(string abilityName)
+        => IsScholarAetherflowSpender(abilityName) &&
+           !string.Equals(abilityName, "Energy Drain", StringComparison.OrdinalIgnoreCase);
+
+    private static string? GetScholarBurstAetherflowReservationReason(
+        string specName,
+        IReadOnlyDictionary<string, double> timedWindowEndByAbility,
+        IReadOnlyDictionary<string, int> gaugeState,
+        string abilityName,
+        double timeSec)
+    {
+        if (!string.Equals(specName, "Scholar", StringComparison.OrdinalIgnoreCase) ||
+            !IsScholarBurstReservedAetherflowSpender(abilityName))
+            return null;
+
+        if (!timedWindowEndByAbility.TryGetValue("Energy Drain", out var energyDrainWindowEndSec) ||
+            timeSec > energyDrainWindowEndSec + AutoCooldownToleranceSec)
+            return null;
+
+        var aetherflow = gaugeState.GetValueOrDefault("Aetherflow");
+        if (aetherflow <= 0)
+            return null;
+
+        return $"Aetherflow is reserved for Energy Drain during the active Chain Stratagem window through {FormatCsvTime(energyDrainWindowEndSec)}";
+    }
+
+    private static string? GetTimedUsageLockoutReason(
+        string specName,
+        IReadOnlyDictionary<string, double> timedLockoutEndByAbility,
+        string abilityName,
+        double timeSec)
+    {
+        if (!TryGetTimedUsageLockoutRule(specName, abilityName, out var sourceAbilityName, out _))
+            return null;
+
+        if (!timedLockoutEndByAbility.TryGetValue(abilityName, out var lockoutEndSec))
+            return null;
+
+        if (timeSec > lockoutEndSec + AutoCooldownToleranceSec)
+            return null;
+
+        return $"blocked by {sourceAbilityName} through {FormatCsvTime(lockoutEndSec)}";
+    }
+
+    private static string? GetTimedUsageWindowReason(
+        string specName,
+        IReadOnlyDictionary<string, double> timedWindowEndByAbility,
+        string abilityName,
+        double timeSec)
+    {
+        if (!TryGetTimedUsageWindowRule(specName, abilityName, out var parentAbilityName, out var durationSec))
+            return null;
+
+        if (!timedWindowEndByAbility.TryGetValue(abilityName, out var windowEndSec))
+            return $"requires {parentAbilityName} window (within {durationSec:F0}s after use), but no active window exists";
+
+        if (timeSec <= windowEndSec + AutoCooldownToleranceSec)
+            return null;
+
+        return $"requires {parentAbilityName} window through {FormatCsvTime(windowEndSec)}, but it expired before {FormatCsvTime(timeSec)}";
+    }
+
+    private static void ApplyTimedUsageWindowState(
+        string specName,
+        IDictionary<string, double> timedWindowEndByAbility,
+        string abilityName,
+        double timeSec)
+    {
+        if (string.Equals(specName, "Scholar", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(abilityName, "Chain Stratagem", StringComparison.OrdinalIgnoreCase))
+        {
+            timedWindowEndByAbility["Energy Drain"] = timeSec + 20.0;
+        }
+    }
+
+    private static void ApplyTimedUsageLockoutState(
+        string specName,
+        IDictionary<string, double> timedLockoutEndByAbility,
+        string abilityName,
+        double timeSec)
+    {
+        if (!string.Equals(specName, "Scholar", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(abilityName, "Dissipation", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var lockoutEndSec = timeSec + 30.0;
+        foreach (var lockedAbilityName in new[] { "Fey Blessing", "Whispering Dawn", "Fey Illumination", "Summon Seraph", "Seraphism" })
+            timedLockoutEndByAbility[lockedAbilityName] = lockoutEndSec;
     }
 
     private void AdvanceAutoTimelineState(
@@ -5472,6 +5883,7 @@ public sealed class MainWindow : Window
         string abilityName)
     {
         var penalty = 0;
+        var ignoreRefreshMaximum = ShouldKeepAutoGaugeGeneratorOnCooldown(abilityName, gaugeRules);
         if (gaugeRules != null && gaugeRules.EffectByName.TryGetValue(abilityName, out var effects))
         {
             var bypassGaugeSpendChecks = HasRepeatableGrantedActionCharge(state.GrantedState, grantedRules, abilityName);
@@ -5485,6 +5897,13 @@ public sealed class MainWindow : Window
                     var have = state.GaugeState.GetValueOrDefault(effect.GaugeName);
                     if (have < effect.MinRequired)
                         penalty += 180 + (effect.MinRequired - have) * 50;
+                }
+
+                if (!ignoreRefreshMaximum && effect.MaxAllowedBeforeUse < int.MaxValue)
+                {
+                    var have = state.GaugeState.GetValueOrDefault(effect.GaugeName);
+                    if (have > effect.MaxAllowedBeforeUse)
+                        penalty += 420 + ((have - effect.MaxAllowedBeforeUse) * 220);
                 }
 
                 if (effect.Delta > 0)
@@ -5520,6 +5939,7 @@ public sealed class MainWindow : Window
         string abilityName)
     {
         var penalty = 0;
+        var ignoreRefreshMaximum = ShouldKeepAutoGaugeGeneratorOnCooldown(abilityName, gaugeRules);
         if (gaugeRules != null && gaugeRules.EffectByName.TryGetValue(abilityName, out var effects))
         {
             var bypassGaugeSpendChecks = HasRepeatableGrantedActionCharge(state.GrantedState, grantedRules, abilityName);
@@ -5528,12 +5948,14 @@ public sealed class MainWindow : Window
                 if (bypassGaugeSpendChecks && (effect.MinRequired > 0 || effect.Delta < 0))
                     continue;
 
-                if (effect.MinRequired <= 0)
-                    continue;
-
                 var have = state.GaugeState.GetValueOrDefault(effect.GaugeName);
-                if (have < effect.MinRequired)
+                if (effect.MinRequired > 0 && have < effect.MinRequired)
                     penalty += 180 + (effect.MinRequired - have) * 50;
+
+                if (!ignoreRefreshMaximum &&
+                    effect.MaxAllowedBeforeUse < int.MaxValue &&
+                    have > effect.MaxAllowedBeforeUse)
+                    penalty += 420 + ((have - effect.MaxAllowedBeforeUse) * 220);
             }
         }
 
@@ -5558,17 +5980,121 @@ public sealed class MainWindow : Window
 
         foreach (var effect in effects)
         {
-            if (effect.MinRequired <= 0)
-                continue;
-
             var have = state.GaugeState.GetValueOrDefault(effect.GaugeName);
-            if (have >= effect.MinRequired)
-                continue;
-
-            return $"requires {effect.GaugeName} >= {effect.MinRequired}, but only {have} is available";
+            if (effect.MinRequired > 0 && have < effect.MinRequired)
+                return $"requires {effect.GaugeName} >= {effect.MinRequired}, but only {have} is available";
         }
 
         return null;
+    }
+
+    private static bool ShouldKeepAutoGaugeGeneratorOnCooldown(
+        string abilityName,
+        GaugeSimulator.JobGaugeRules? gaugeRules)
+    {
+        if (gaugeRules == null || !gaugeRules.EffectByName.TryGetValue(abilityName, out var effects))
+            return false;
+
+        var hasTrueGaugeGain = false;
+        foreach (var effect in effects)
+        {
+            if (!GaugeSimulator.IsTrueGaugeResource(effect.GaugeName))
+                continue;
+
+            if (effect.MaxAllowedBeforeUse < int.MaxValue)
+                return false;
+
+            if (effect.Delta < 0 || effect.MinRequired > 0)
+                return false;
+
+            if (effect.Delta > 0 || effect.SetValue is int)
+                hasTrueGaugeGain = true;
+        }
+
+        return hasTrueGaugeGain;
+    }
+
+    private static bool IsAutoTimelineTrueGaugeAbility(
+        string abilityName,
+        GaugeSimulator.JobGaugeRules? gaugeRules)
+    {
+        if (gaugeRules == null || !gaugeRules.EffectByName.TryGetValue(abilityName, out var effects))
+            return false;
+
+        return effects.Any(effect => GaugeSimulator.IsTrueGaugeResource(effect.GaugeName));
+    }
+
+    private static bool IsAutoTimelineTrueGaugeSpender(
+        string abilityName,
+        GaugeSimulator.JobGaugeRules? gaugeRules)
+    {
+        if (gaugeRules == null || !gaugeRules.EffectByName.TryGetValue(abilityName, out var effects))
+            return false;
+
+        return effects.Any(effect =>
+            GaugeSimulator.IsTrueGaugeResource(effect.GaugeName) &&
+            (effect.MinRequired > 0 || effect.Delta < 0));
+    }
+
+    private static bool CanBorrowAutoOpenerPrepullGauge(
+        AutoTimelineState state,
+        GaugeSimulator.JobGaugeRules? gaugeRules,
+        string abilityName)
+    {
+        if (gaugeRules == null || !gaugeRules.EffectByName.TryGetValue(abilityName, out var effects))
+            return false;
+
+        var canBorrowForShortage = false;
+        foreach (var effect in effects)
+        {
+            var have = state.GaugeState.GetValueOrDefault(effect.GaugeName);
+            if (effect.MaxAllowedBeforeUse < int.MaxValue && have > effect.MaxAllowedBeforeUse)
+                return false;
+
+            if (effect.MinRequired > 0 && have < effect.MinRequired)
+                canBorrowForShortage = true;
+        }
+
+        return canBorrowForShortage;
+    }
+
+    private static void ApplyGaugeEffectToState(
+        IDictionary<string, int> gaugeState,
+        GaugeSimulator.JobGaugeRules gaugeRules,
+        GaugeSimulator.GaugeEffect effect,
+        bool allowPrepullSeed = false)
+    {
+        var resource = gaugeRules.Resources.FirstOrDefault(r =>
+            string.Equals(r.Name, effect.GaugeName, StringComparison.OrdinalIgnoreCase));
+
+        if (allowPrepullSeed && effect.MinRequired > 0)
+        {
+            var preSeedValue = Math.Clamp(
+                effect.MinRequired,
+                0,
+                resource?.MaxValue ?? int.MaxValue);
+            var currentGaugeValue = gaugeState.TryGetValue(effect.GaugeName, out var existingValue)
+                ? existingValue
+                : 0;
+            if (currentGaugeValue < preSeedValue)
+                gaugeState[effect.GaugeName] = preSeedValue;
+        }
+
+        if (effect.SetValue is int setValue)
+        {
+            gaugeState[effect.GaugeName] = Math.Clamp(
+                setValue,
+                0,
+                resource?.MaxValue ?? int.MaxValue);
+        }
+
+        if (effect.Delta == 0)
+            return;
+
+        gaugeState[effect.GaugeName] = Math.Clamp(
+            (gaugeState.TryGetValue(effect.GaugeName, out var currentValue) ? currentValue : 0) + effect.Delta,
+            0,
+            resource?.MaxValue ?? int.MaxValue);
     }
 
     private void ApplyNumericGaugeEffects(
@@ -5581,27 +6107,7 @@ public sealed class MainWindow : Window
             return;
 
         foreach (var effect in effects)
-        {
-            var resource = gaugeRules.Resources.FirstOrDefault(r =>
-                string.Equals(r.Name, effect.GaugeName, StringComparison.OrdinalIgnoreCase));
-            if (allowPrepullSeed && effect.MinRequired > 0)
-            {
-                var preSeedValue = Math.Clamp(
-                    effect.MinRequired,
-                    0,
-                    resource?.MaxValue ?? int.MaxValue);
-                if (state.GaugeState.GetValueOrDefault(effect.GaugeName) < preSeedValue)
-                    state.GaugeState[effect.GaugeName] = preSeedValue;
-            }
-
-            if (effect.Delta == 0)
-                continue;
-
-            state.GaugeState[effect.GaugeName] = Math.Clamp(
-                state.GaugeState.GetValueOrDefault(effect.GaugeName) + effect.Delta,
-                0,
-                resource?.MaxValue ?? int.MaxValue);
-        }
+            ApplyGaugeEffectToState(state.GaugeState, gaugeRules, effect, allowPrepullSeed);
     }
 
     private void ApplyGaugeEffects(
@@ -5618,16 +6124,7 @@ public sealed class MainWindow : Window
                 if (bypassGaugeSpendChecks && effect.Delta < 0)
                     continue;
 
-                if (effect.Delta == 0)
-                    continue;
-
-                var resource = gaugeRules.Resources.FirstOrDefault(r =>
-                    string.Equals(r.Name, effect.GaugeName, StringComparison.OrdinalIgnoreCase));
-
-                state.GaugeState[effect.GaugeName] = Math.Clamp(
-                state.GaugeState.GetValueOrDefault(effect.GaugeName) + effect.Delta,
-                    0,
-                    resource?.MaxValue ?? int.MaxValue);
+                ApplyGaugeEffectToState(state.GaugeState, gaugeRules, effect);
             }
         }
 
@@ -5700,8 +6197,6 @@ public sealed class MainWindow : Window
             state.CardDrawState = "Astral";
         else if (string.Equals(abilityName, cardDraw.UmbralDrawName, StringComparison.OrdinalIgnoreCase))
             state.CardDrawState = "Umbral";
-        else if (cardDraw.AstralCards.Contains(abilityName) || cardDraw.UmbralCards.Contains(abilityName))
-            state.CardDrawState = null;
     }
 
     private string? GetAutoEntryRejectionReason(
@@ -5722,6 +6217,31 @@ public sealed class MainWindow : Window
         var actionPenalty = GetActionStatePenalty(state, info, entry.AbilityName, gaugeRules, grantedRules);
         if (actionPenalty > 0)
             return $"action-state penalty {actionPenalty}";
+
+        var timedWindowReason = GetTimedUsageWindowReason(
+            state.SpecName,
+            state.TimedWindowEndByAbility,
+            entry.AbilityName,
+            scheduledTimeSec);
+        if (timedWindowReason != null)
+            return timedWindowReason;
+
+        var timedLockoutReason = GetTimedUsageLockoutReason(
+            state.SpecName,
+            state.TimedLockoutEndByAbility,
+            entry.AbilityName,
+            scheduledTimeSec);
+        if (timedLockoutReason != null)
+            return timedLockoutReason;
+
+        var scholarBurstReservationReason = GetScholarBurstAetherflowReservationReason(
+            state.SpecName,
+            state.TimedWindowEndByAbility,
+            state.GaugeState,
+            entry.AbilityName,
+            scheduledTimeSec);
+        if (scholarBurstReservationReason != null)
+            return scholarBurstReservationReason;
 
         var cardPenalty = GetCardDrawPenalty(state, grantedRules, entry.AbilityName);
         return cardPenalty == 0 ? null : $"card-state penalty {cardPenalty}";
@@ -5758,6 +6278,8 @@ public sealed class MainWindow : Window
         if (actionRule != null)
             ApplyActionStateEffects(state.ActionState, actionRule);
         ApplyCardDrawState(state, grantedRules, entry.AbilityName);
+        ApplyTimedUsageWindowState(state.SpecName, state.TimedWindowEndByAbility, entry.AbilityName, timeSec);
+        ApplyTimedUsageLockoutState(state.SpecName, state.TimedLockoutEndByAbility, entry.AbilityName, timeSec);
 
         if (isGcd && info != null)
         {
@@ -5876,6 +6398,87 @@ public sealed class MainWindow : Window
         }
     }
 
+    private void DrawAutoTimelineFromFetchedLogsSection()
+    {
+        if (!ImGui.CollapsingHeader("Auto Timeline from Fetched FFLogs##riAutoHeader"))
+            return;
+
+        ImGui.TextDisabled("Create a custom Auto Timeline directly from cached raw FFLogs parse data.");
+
+        if (zones.Count == 0 || allSpecNames.Count == 0)
+        {
+            ImGui.TextDisabled("Load fight and job lists first, then fetch logs for the encounter you want.");
+            return;
+        }
+
+        if (riAutoSelectedZone < 0 || riAutoSelectedZone >= zones.Count)
+            riAutoSelectedZone = Math.Clamp(selectedZone, 0, Math.Max(0, zones.Count - 1));
+        if (riAutoSelectedSpec < 0 || riAutoSelectedSpec >= allSpecNames.Count)
+            riAutoSelectedSpec = Math.Clamp(selectedSpec, 0, Math.Max(0, allSpecNames.Count - 1));
+
+        var autoZones = zones.Select(zone => zone.Name).ToList();
+        ImGui.SetNextItemWidth(220);
+        if (ImGui.Combo("Zone##riAutoZone", ref riAutoSelectedZone, autoZones, -1))
+            riAutoSelectedEncounter = 0;
+
+        var autoEncounters = riAutoSelectedZone >= 0 && riAutoSelectedZone < zones.Count
+            ? zones[riAutoSelectedZone].Encounters
+            : [];
+        var autoEncounterNames = autoEncounters.Select(encounter => encounter.Name).ToList();
+        if (riAutoSelectedEncounter < 0 || riAutoSelectedEncounter >= autoEncounterNames.Count)
+            riAutoSelectedEncounter = autoEncounterNames.Count > 0 ? 0 : -1;
+
+        ImGui.SetNextItemWidth(220);
+        if (autoEncounterNames.Count > 0)
+        {
+            ImGui.Combo("Fight##riAutoFight", ref riAutoSelectedEncounter, autoEncounterNames, -1);
+        }
+        else
+        {
+            var noEncounter = 0;
+            ImGui.Combo("Fight##riAutoFight", ref noEncounter, new List<string> { "(none)" }, -1);
+        }
+
+        ImGui.SetNextItemWidth(220);
+        ImGui.Combo("Job##riAutoJob", ref riAutoSelectedSpec, allSpecNames, -1);
+
+        var hasAutoSelection =
+            riAutoSelectedZone >= 0 && riAutoSelectedZone < zones.Count &&
+            riAutoSelectedEncounter >= 0 && riAutoSelectedEncounter < autoEncounters.Count &&
+            riAutoSelectedSpec >= 0 && riAutoSelectedSpec < allSpecNames.Count;
+        var autoEncounterId = hasAutoSelection ? autoEncounters[riAutoSelectedEncounter].Id : 0;
+        var autoSpecName = hasAutoSelection ? allSpecNames[riAutoSelectedSpec] : string.Empty;
+        var canCreateAutoTimeline = hasAutoSelection &&
+                                    !riFetching &&
+                                    !riImporting &&
+                                    plugin.TimelineStore.GetTimeline(autoEncounterId, autoSpecName) != null;
+
+        if (!canCreateAutoTimeline)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Create Auto Timeline##riAutoCreate"))
+            CreateAutoTimelineFromFetchedLogs(autoEncounters[riAutoSelectedEncounter], autoSpecName);
+        if (!canCreateAutoTimeline)
+            ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.BeginTooltip();
+            if (!hasAutoSelection)
+            {
+                ImGui.TextDisabled("Choose a valid fight and job first.");
+            }
+            else if (plugin.TimelineStore.GetTimeline(autoEncounterId, autoSpecName) == null)
+            {
+                ImGui.TextDisabled("No fetched logs are cached for this fight/job yet.");
+                ImGui.TextDisabled("Use \"Update from FFLogs\" on the Encounter Timeline tab first.");
+            }
+            else
+            {
+                ImGui.Text("Build a custom Auto Timeline straight from cached raw FFLogs parse data.");
+            }
+            ImGui.EndTooltip();
+        }
+    }
+
     private void StartReportFetch()
     {
         var m = Regex.Match(riUrl, @"fflogs\.com/reports/([A-Za-z0-9]+)");
@@ -5963,23 +6566,7 @@ public sealed class MainWindow : Window
                 // that system is designed for multi-parse averaging and would
                 // merge two casts within the same 5s window into one averaged entry,
                 // producing timestamps that don't match the actual log.
-                var entries = events
-                    .OrderBy(e => e.Timestamp)
-                    .Select(e =>
-                    {
-                        var info = plugin.RecastDatabase.Lookup(e.AbilityGameID, e.AbilityName);
-                        return new TimelineEntry
-                        {
-                            TimeOffsetSec = e.Timestamp / 1000.0,
-                            AbilityId     = info != null ? (int)info.AbilityId : e.AbilityGameID,
-                            AbilityName   = !string.IsNullOrWhiteSpace(info?.Name) ? info.Name : e.AbilityName,
-                            AbilityIcon   = e.AbilityIcon,
-                            Frequency     = 1.0,
-                            AverageUses   = 1.0,
-                            IsGcd         = info?.IsGcdAction ?? false,
-                        };
-                    })
-                    .ToList();
+                var entries = BuildExactTimelineEntries(events);
 
                 var timeline = new AggregatedTimeline
                 {
@@ -5989,6 +6576,23 @@ public sealed class MainWindow : Window
                     AverageDurationMs = fight.DurationMs,
                     ParseCount        = 1,
                     Entries           = entries,
+                    AutoTimelineSourceEntries = entries
+                        .Select(CloneTimelineEntry)
+                        .ToList(),
+                    CachedFflogsParses =
+                    [
+                        new CachedFflogsParseTimeline
+                        {
+                            ParseIndex = 1,
+                            ReportCode = code,
+                            FightId = fight.Id,
+                            RankingAmount = 0.0,
+                            DurationSec = fight.DurationMs / 1000.0,
+                            Entries = entries
+                                .Select(CloneTimelineEntry)
+                                .ToList(),
+                        }
+                    ],
                     BossEntries       = [],
                 };
 
@@ -6016,6 +6620,150 @@ public sealed class MainWindow : Window
         var hidden = plugin.Configuration.HiddenAbilities.GetValueOrDefault(key);
         foreach (var (id, _) in tl.Entries.Select(e => (e.AbilityId, e.AbilityName)).Distinct())
             skillVisibility[id] = hidden == null || !hidden.Contains(id);
+    }
+
+    private void CreateAutoTimelineFromFetchedLogs(Encounter encounter, string specName)
+    {
+        var sourceTimeline = plugin.TimelineStore.GetTimeline(encounter.Id, specName);
+        RefreshTimelineRuntimeMetadata(sourceTimeline);
+        RefreshEncounterTimelineAggregationFromCachedParses(sourceTimeline);
+        if (sourceTimeline == null)
+        {
+            riStatus = $"No fetched logs are cached for {encounter.Name} / {specName}.";
+            riStatusIsError = true;
+            return;
+        }
+
+        var key = TimelineDatabase.MakeKey(encounter.Id, specName);
+        var rawSourceEntries = BuildAutoTimelineSourceFromCachedParses(sourceTimeline);
+        if (rawSourceEntries.Count == 0)
+        {
+            riStatus = $"No raw cached FFLogs parse data is available for {encounter.Name} / {specName}. Fetch it again from FFLogs first.";
+            riStatusIsError = true;
+            return;
+        }
+
+        var customTimeline = CloneTimeline(sourceTimeline);
+        customTimeline.Entries = [];
+        customTimeline.AutoTimelineSourceEntries = rawSourceEntries;
+        ApplyAutoTimeline(customTimeline);
+
+        plugin.Configuration.CustomTimelines[key] = customTimeline;
+        plugin.SaveConfig();
+
+        SelectCustomTimeline(key, customTimeline);
+        customEditorDirty = false;
+        riStatus = $"Created Auto Timeline for {encounter.Name} / {specName} from cached raw FFLogs data.";
+        riStatusIsError = false;
+    }
+
+    private List<TimelineEntry> BuildExactTimelineEntries(IEnumerable<CastEvent> events)
+    {
+        return events
+            .OrderBy(e => e.Timestamp)
+            .Select(e =>
+            {
+                var info = plugin.RecastDatabase.Lookup(e.AbilityGameID, e.AbilityName);
+                return new TimelineEntry
+                {
+                    TimeOffsetSec = e.Timestamp / 1000.0,
+                    AbilityId = info != null ? (int)info.AbilityId : e.AbilityGameID,
+                    AbilityName = !string.IsNullOrWhiteSpace(info?.Name) ? info.Name : e.AbilityName,
+                    AbilityIcon = e.AbilityIcon,
+                    Frequency = 1.0,
+                    AverageUses = 1.0,
+                    IsGcd = info?.IsGcdAction ?? false,
+                };
+            })
+            .ToList();
+    }
+
+    private List<TimelineEntry> BuildAutoTimelineSourceFromCachedParses(AggregatedTimeline tl)
+    {
+        if (tl.CachedFflogsParses.Count == 0)
+            return [];
+        var exactParses = new List<IReadOnlyList<TimelineEntry>>();
+
+        foreach (var parse in tl.CachedFflogsParses
+                     .Where(parse => parse.Entries.Count > 0)
+                     .OrderBy(parse => parse.ParseIndex))
+        {
+            var orderedEntries = parse.Entries
+                .OrderBy(entry => entry.TimeOffsetSec)
+                .ThenByDescending(entry => entry.Frequency)
+                .ToList();
+            if (orderedEntries.Count == 0)
+                continue;
+
+            var parseEntries = new List<TimelineEntry>(orderedEntries.Count);
+
+            foreach (var entry in orderedEntries)
+            {
+                if (entry.AbilityId <= 7)
+                    continue;
+
+                var (abilityId, abilityName, abilityIcon, isGcdAction) = NormalizeAutoTimelineSourceEntry(entry);
+                parseEntries.Add(new TimelineEntry
+                {
+                    TimeOffsetSec = entry.TimeOffsetSec,
+                    AbilityId = abilityId,
+                    AbilityName = abilityName,
+                    AbilityIcon = abilityIcon,
+                    Frequency = 1.0,
+                    AverageUses = 1.0,
+                    IsGcd = isGcdAction,
+                });
+            }
+
+            exactParses.Add(parseEntries);
+        }
+
+        return AutoTimelineSourceBuilder.BuildFromExactParses(exactParses, tl.CachedFflogsParses.Count);
+    }
+
+    private (int abilityId, string abilityName, string abilityIcon, bool isGcdAction)
+        NormalizeAutoTimelineSourceEntry(TimelineEntry entry)
+    {
+        var info = plugin.RecastDatabase.Lookup(entry.AbilityId, entry.AbilityName);
+        return (
+            info != null ? (int)info.AbilityId : entry.AbilityId,
+            !string.IsNullOrWhiteSpace(info?.Name) ? info.Name : entry.AbilityName,
+            !string.IsNullOrWhiteSpace(entry.AbilityIcon) ? entry.AbilityIcon : string.Empty,
+            info?.IsGcdAction ?? entry.IsGcd);
+    }
+
+    private void RefreshEncounterTimelineAggregationFromCachedParses(AggregatedTimeline? tl)
+    {
+        if (tl == null || !NeedsEncounterTimelineAggregationRefresh(tl))
+            return;
+
+        var rebuiltSourceEntries = BuildAutoTimelineSourceFromCachedParses(tl);
+        if (rebuiltSourceEntries.Count == 0)
+            return;
+
+        tl.AutoTimelineSourceEntries = rebuiltSourceEntries
+            .Select(CloneTimelineEntry)
+            .ToList();
+        tl.Entries = TimelineEntryCondenser.Condense(
+            rebuiltSourceEntries,
+            Math.Max(tl.ParseCount, tl.CachedFflogsParses.Count),
+            plugin.RecastDatabase);
+        RefreshTimelineRuntimeMetadata(tl);
+        plugin.TimelineStore.SaveTimeline(tl);
+    }
+
+    private static bool NeedsEncounterTimelineAggregationRefresh(AggregatedTimeline tl)
+    {
+        if (tl.CachedFflogsParses.Count == 0)
+            return false;
+
+        if (tl.AutoTimelineSourceEntries.Count == 0)
+            return true;
+
+        if (tl.AutoTimelineSourceEntries.Any(entry => entry.AverageUses > 1.001))
+            return true;
+
+        return !AutoTimelineSourceBuilder.UsesFixedSlotAggregation(tl.AutoTimelineSourceEntries);
     }
 
     private float GetAbilityThreshold(int abilityId)
@@ -6085,7 +6833,7 @@ public sealed class MainWindow : Window
             selectedEncounter = 0;
             currentTimeline = null;
             skillVisibility.Clear();
-            plugin.OverlayWindow.StopPreview();
+            HideEmbeddedTimelinePreview();
         }
 
         ImGui.SameLine();
@@ -6100,7 +6848,7 @@ public sealed class MainWindow : Window
             {
                 currentTimeline = null;
                 skillVisibility.Clear();
-                plugin.OverlayWindow.StopPreview();
+                HideEmbeddedTimelinePreview();
             }
         }
         else
@@ -6117,7 +6865,7 @@ public sealed class MainWindow : Window
         {
             currentTimeline = null;
             skillVisibility.Clear();
-            plugin.OverlayWindow.StopPreview();
+            HideEmbeddedTimelinePreview();
         }
 
         // Load button — loads from local cache only (no API call)
@@ -6189,16 +6937,30 @@ public sealed class MainWindow : Window
         var hasTimeline = currentTimeline != null;
         if (ImGui.Button("Preview Timeline", default) && hasTimeline)
         {
-            plugin.OverlayWindow.StartPreview(currentTimeline!);
+            showEmbeddedTimelinePreview = !showEmbeddedTimelinePreview;
+            if (!showEmbeddedTimelinePreview)
+                plugin.OverlayWindow.ResetEmbeddedPreview();
         }
         if (ImGui.IsItemHovered())
         {
             ImGui.BeginTooltip();
             if (hasTimeline)
-                ImGui.Text("Preview the timeline overlay (starts paused).");
+                ImGui.Text("Preview the timeline in-tab (starts paused).");
             else
                 ImGui.Text("Load a timeline first to preview the overlay.");
             ImGui.EndTooltip();
+        }
+
+        if (showEmbeddedTimelinePreview && hasTimeline)
+        {
+            var previewHeight = MathF.Max(164f, plugin.Configuration.OverlayIconSize * 2.6f + 42f);
+            if (ImGui.GetContentRegionAvail().X >= 320f)
+                ImGui.SameLine();
+
+            showEmbeddedTimelinePreview = plugin.OverlayWindow.DrawEmbeddedPreview(
+                currentTimeline!,
+                new Vector2(0f, previewHeight),
+                "##EncounterTimelineEmbeddedPreview");
         }
     }
 
@@ -6225,7 +6987,7 @@ public sealed class MainWindow : Window
 
         currentTimeline = null;
         skillVisibility.Clear();
-        plugin.OverlayWindow.StopPreview();
+        HideEmbeddedTimelinePreview();
     }
 
     private void RebuildSelectorsFromDb(TimelineDatabase db)
@@ -6266,7 +7028,10 @@ public sealed class MainWindow : Window
         var encounterId = encounters[selectedEncounter].Id;
         var specName = allSpecNames[selectedSpec];
 
+        HideEmbeddedTimelinePreview();
         currentTimeline = plugin.TimelineStore.GetTimeline(encounterId, specName);
+        RefreshTimelineRuntimeMetadata(currentTimeline);
+        RefreshEncounterTimelineAggregationFromCachedParses(currentTimeline);
 
         // Build skill visibility map — includes all abilities; threshold filtering is handled at draw time
         skillVisibility.Clear();
@@ -6460,21 +7225,16 @@ public sealed class MainWindow : Window
         var iconSize = cfg.MainIconSize * cfg.MainIconScale;
         var rowHeight = iconSize + 4f;
 
-        if (ImGui.SmallButton("Copy"))
-            CopyCurrentTimeline();
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.BeginTooltip();
-            ImGui.Text("Copy this timeline to Custom Timelines for manual editing.");
-            ImGui.EndTooltip();
-        }
-        ImGui.SameLine();
         ImGui.Text($"{currentTimeline.EncounterName} - {currentTimeline.SpecName}");
         ImGui.SameLine();
         ImGui.TextDisabled($"({currentTimeline.ParseCount} parses, avg {currentTimeline.AverageDurationMs / 1000.0:F1}s)");
 
         // Gather visible abilities — per-ability threshold takes priority over global
-        var visibleEntries = currentTimeline.Entries
+        var displayEntries = TimelineJobRules.ApplyPostSelectionRules(
+            currentTimeline.SpecName,
+            currentTimeline.Entries,
+            promoteMacrocosmosToVisualGcd: true);
+        var visibleEntries = displayEntries
             .Where(e => e.Frequency >= GetAbilityThreshold(e.AbilityId))
             .Where(e => skillVisibility.GetValueOrDefault(e.AbilityId, true))
             .ToList();
@@ -6680,14 +7440,22 @@ public sealed class MainWindow : Window
             }
         }
 
-        // Right-click context menu for custom timeline icons
+        // Right-click removal for custom timeline icons
         if (iconCtxEntry != null)
         {
-            currentTimeline.Entries.Remove(iconCtxEntry);
-            // If no entries remain for that ability, drop it from the visibility map
-            if (!currentTimeline.Entries.Any(e => e.AbilityId == iconCtxEntry.AbilityId))
+            var removedAny = RemoveDisplayedEntryFromTimeline(currentTimeline, iconCtxEntry);
+            if (selectedCustomKey != null &&
+                plugin.Configuration.CustomTimelines.TryGetValue(selectedCustomKey, out var selectedCustomTimeline) &&
+                !ReferenceEquals(selectedCustomTimeline, currentTimeline))
+            {
+                removedAny |= RemoveDisplayedEntryFromTimeline(selectedCustomTimeline, iconCtxEntry);
+            }
+
+            if (removedAny && !currentTimeline.Entries.Any(e => e.AbilityId == iconCtxEntry.AbilityId))
                 skillVisibility.Remove(iconCtxEntry.AbilityId);
-            plugin.SaveConfig();
+
+            if (removedAny)
+                RequestDeferredConfigSave();
         }
 
         ImGui.EndChild();
@@ -6703,6 +7471,39 @@ public sealed class MainWindow : Window
         var hue = hues[Math.Abs(abilityId) % hues.Length];
         HsvToRgb(hue, 0.75f, 0.9f, out var br, out var bg, out var bb);
         return ImGui.GetColorU32(new Vector4(br, bg, bb, 0.85f));
+    }
+
+    private static bool RemoveDisplayedEntryFromTimeline(AggregatedTimeline timeline, TimelineEntry displayedEntry)
+    {
+        var sourceEntry = ResolveDisplayedTimelineEntry(timeline.Entries, displayedEntry);
+        if (sourceEntry == null)
+            return false;
+
+        return timeline.Entries.Remove(sourceEntry);
+    }
+
+    private static TimelineEntry? ResolveDisplayedTimelineEntry(
+        IEnumerable<TimelineEntry> sourceEntries,
+        TimelineEntry displayedEntry)
+    {
+        const double exactTimeToleranceSec = 0.01;
+
+        var exactMatch = sourceEntries.FirstOrDefault(sourceEntry =>
+            sourceEntry.AbilityId == displayedEntry.AbilityId &&
+            string.Equals(sourceEntry.AbilityName, displayedEntry.AbilityName, StringComparison.OrdinalIgnoreCase) &&
+            Math.Abs(sourceEntry.TimeOffsetSec - displayedEntry.TimeOffsetSec) <= exactTimeToleranceSec &&
+            Math.Abs(sourceEntry.Frequency - displayedEntry.Frequency) <= 0.0001 &&
+            Math.Abs(sourceEntry.AverageUses - displayedEntry.AverageUses) <= 0.0001);
+        if (exactMatch != null)
+            return exactMatch;
+
+        return sourceEntries
+            .Where(sourceEntry =>
+                sourceEntry.AbilityId == displayedEntry.AbilityId &&
+                string.Equals(sourceEntry.AbilityName, displayedEntry.AbilityName, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(sourceEntry => Math.Abs(sourceEntry.TimeOffsetSec - displayedEntry.TimeOffsetSec))
+            .ThenByDescending(sourceEntry => sourceEntry.Frequency)
+            .FirstOrDefault();
     }
 
     private bool TryDrawActionIcon(ImDrawListPtr dl, int abilityId, Vector2 pos, float size, float alpha)
@@ -6870,6 +7671,7 @@ public sealed class MainWindow : Window
 
             var semaphore = new SemaphoreSlim(MaxConcurrency);
             var parseData = new List<(List<CastEvent> casts, long fightStartMs, long fightEndMs)>();
+            var cachedParseTimelines = new List<CachedFflogsParseTimeline>();
             var successfulRankings = new List<RankingEntry>();
             var parseLock = new object();
             var completedParses = 0;
@@ -6895,6 +7697,15 @@ public sealed class MainWindow : Window
                         lock (parseLock)
                         {
                             parseData.Add((events, 0, fightEnd));
+                            cachedParseTimelines.Add(new CachedFflogsParseTimeline
+                            {
+                                ParseIndex = successfulRankings.Count + 1,
+                                ReportCode = ranking.ReportCode,
+                                FightId = ranking.FightId,
+                                RankingAmount = ranking.Amount,
+                                DurationSec = fightEnd / 1000.0,
+                                Entries = BuildExactTimelineEntries(events),
+                            });
                             successfulRankings.Add(ranking);
                         }
                     }
@@ -6945,6 +7756,10 @@ public sealed class MainWindow : Window
                 var timeline = aggregator.Aggregate(
                     encounter.Id, encounter.Name, specName, parseData);
                 timeline.BossEntries = bossEntries;
+                timeline.CachedFflogsParses = cachedParseTimelines
+                    .OrderBy(parse => parse.ParseIndex)
+                    .ToList();
+                RefreshTimelineRuntimeMetadata(timeline);
                 store.SaveTimeline(timeline);
 
                 // Rebuild zone → encounter mappings so the EncounterTracker picks up new timelines
@@ -7011,22 +7826,99 @@ public sealed class MainWindow : Window
             return;
 
         var key = TimelineDatabase.MakeKey(currentTimeline.EncounterId, currentTimeline.SpecName);
+        var isCustomTimeline = plugin.Configuration.CustomTimelines.ContainsKey(key);
 
-        // Deep-copy via JSON, then strip entries that are currently filtered out
+        // Deep-copy via JSON, then strip entries that are currently filtered out.
+        // Keep the raw Auto Timeline source list separate from the condensed display
+        // list, but apply the same active skill filters to both so the copied custom
+        // timeline reflects the Encounter Timeline view without losing raw timing data.
         var json = Newtonsoft.Json.JsonConvert.SerializeObject(currentTimeline);
         var copy = Newtonsoft.Json.JsonConvert.DeserializeObject<AggregatedTimeline>(json)!;
 
-        // Only keep what is currently visible (respects per-ability thresholds + skill visibility)
-        copy.Entries = copy.Entries
-            .Where(e => skillVisibility.GetValueOrDefault(e.AbilityId, true))
-            .Where(e => e.Frequency >= GetAbilityThreshold(e.AbilityId))
-            .ToList();
+        copy.Entries = FilterCopiedTimelineEntries(copy.Entries);
+        copy.CachedFflogsParses = isCustomTimeline
+            ? currentTimeline.CachedFflogsParses
+                .Select(CloneCachedFflogsParseTimeline)
+                .ToList()
+            : FilterCopiedCachedFflogsParses(currentTimeline.CachedFflogsParses);
+        copy.AutoTimelineSourceEntries = BuildFilteredCopiedRawSource(currentTimeline, isCustomTimeline);
 
         plugin.Configuration.CustomTimelines[key] = copy;
         plugin.SaveConfig();
 
         // Refresh the editor if this key is already selected so it shows the new copy
         SelectCustomTimeline(key, copy);
+    }
+
+    private List<TimelineEntry> FilterCopiedTimelineEntries(IEnumerable<TimelineEntry> entries)
+    {
+        return entries
+            .Where(e => skillVisibility.GetValueOrDefault(e.AbilityId, true))
+            .Where(e => e.Frequency >= GetAbilityThreshold(e.AbilityId))
+            .Select(CloneTimelineEntry)
+            .ToList();
+    }
+
+    private List<CachedFflogsParseTimeline> FilterCopiedCachedFflogsParses(IEnumerable<CachedFflogsParseTimeline> parses)
+    {
+        return parses
+            .Select(parse => new CachedFflogsParseTimeline
+            {
+                ParseIndex = parse.ParseIndex,
+                ReportCode = parse.ReportCode,
+                FightId = parse.FightId,
+                RankingAmount = parse.RankingAmount,
+                DurationSec = parse.DurationSec,
+                Entries = FilterCopiedTimelineEntries(parse.Entries),
+            })
+            .Where(parse => parse.Entries.Count > 0)
+            .ToList();
+    }
+
+    private List<TimelineEntry> BuildFilteredCopiedRawSource(AggregatedTimeline timeline, bool isCustomTimeline)
+    {
+        var cachedSourceEntries = BuildAutoTimelineSourceFromCachedParses(timeline);
+        if (cachedSourceEntries.Count > 0)
+            return cachedSourceEntries;
+
+        if (isCustomTimeline)
+        {
+            if (timeline.AutoTimelineSourceEntries.Count > 0)
+                return FilterCopiedTimelineEntries(timeline.AutoTimelineSourceEntries);
+
+            return FilterCopiedTimelineEntries(timeline.Entries);
+        }
+
+        if (timeline.AutoTimelineSourceEntries.Count > 0)
+            return FilterCopiedTimelineEntries(timeline.AutoTimelineSourceEntries);
+
+        return FilterCopiedTimelineEntries(timeline.Entries);
+    }
+
+    private static List<TimelineEntry> FlattenCachedFflogsSourceEntries(IEnumerable<CachedFflogsParseTimeline> parses)
+    {
+        return parses
+            .OrderBy(parse => parse.ParseIndex)
+            .SelectMany(parse => parse.Entries)
+            .Select(CloneTimelineEntry)
+            .ToList();
+    }
+
+    private static bool IsSuspiciousFlattenedCustomSource(AggregatedTimeline tl)
+    {
+        if (tl.AutoTimelineSourceEntries.Count == 0 || tl.Entries.Count == 0)
+            return false;
+
+        if (tl.AutoTimelineSourceEntries.Count < Math.Max(500, tl.Entries.Count * 3))
+            return false;
+
+        var allFullFrequency = tl.AutoTimelineSourceEntries.All(entry => entry.Frequency >= 0.999);
+        if (!allFullFrequency)
+            return false;
+
+        var sourceHasAnyGcd = tl.AutoTimelineSourceEntries.Any(entry => entry.IsGcd);
+        var entriesHaveAnyGcd = tl.Entries.Any(entry => entry.IsGcd);
+        return !sourceHasAnyGcd && entriesHaveAnyGcd;
     }
 
     // ── Config tab ──────────────────────────────────────────────────────
@@ -7104,7 +7996,7 @@ public sealed class MainWindow : Window
             ImGui.TextColored(in bulletColor, "Step 3:");
             ImGui.SameLine();
             ImGui.TextWrapped(
-                "Click \"Create Client\". Give it any name (e.g. \"ATKTip\"). " +
+            "Click \"Create Client\". Give it any name (e.g. \"ATKTip\"). " +
                 "For the redirect URL, enter: http://localhost");
             ImGui.Spacing();
             ImGui.TextColored(in bulletColor, "Step 4:");
@@ -7223,19 +8115,19 @@ public sealed class MainWindow : Window
         ImGui.SetNextItemWidth(200);
         if (ImGui.SliderFloat("oGCD Size", ref ogcdSizeRatio, 0.25f, 1.0f, "%.2f"))
         { cfg.OGCDSizeRatio = ogcdSizeRatio; changed = true; }
-        CfgTooltip("oGCD icon size as a fraction of the GCD icon size.\n0.75 = 75% of GCD size (ATR default).\n1.0 = same size as GCDs.");
+        CfgTooltip("oGCD icon size as a fraction of the GCD icon size.\nSmaller values help dense weave windows stay readable and match the ATR-style playback look.");
 
         var ogcdOffset = cfg.OGCDVerticalOffset;
         ImGui.SetNextItemWidth(200);
         if (ImGui.SliderFloat("oGCD Vertical Offset", ref ogcdOffset, -1.0f, 1.0f, "%.2f"))
         { cfg.OGCDVerticalOffset = ogcdOffset; changed = true; }
-        CfgTooltip("How far above center oGCDs are positioned, as a fraction of GCD icon size.\n0.1 = slightly above center (ATR default).\n0 = same center as GCDs.\nNegative = below center.");
+        CfgTooltip("Move oGCDs upward from the main action lane.\n0.1 matches the ATR-style default.\nNegative values move them back down.");
 
         var ogcdHOffset = cfg.OGCDHorizontalOffset;
         ImGui.SetNextItemWidth(200);
         if (ImGui.SliderFloat("oGCD Horizontal Offset", ref ogcdHOffset, -100f, 100f, "%.0f px"))
         { cfg.OGCDHorizontalOffset = ogcdHOffset; changed = true; }
-        CfgTooltip("Shift oGCD icons left (negative) or right (positive) on the timeline.\nUseful to visually separate oGCDs from GCDs at the same timestamp.");
+        CfgTooltip("Nudge oGCD slot placement left (negative) or right (positive) after legal weave slots are chosen.");
 
         ImGui.Spacing();
         ImGui.TextDisabled("Visual");
@@ -7525,17 +8417,17 @@ public sealed class MainWindow : Window
             var cfg = plugin.Configuration;
             cfg.OverlayEnabled         = true;
             cfg.OverlayLocked          = true;
-            cfg.OverlayPixelsPerSec    = 60.0f;
-            cfg.OverlayIconSize        = 46.0f;
+            cfg.OverlayPixelsPerSec    = 72.0f;
+            cfg.OverlayIconSize        = 44.0f;
             cfg.OverlayTimeBehind      = 1.5f;
             cfg.OverlayBgOpacity       = 1.0f;
             cfg.OverlayPastAlpha       = 1.0f;
             cfg.OverlayFreqThreshold   = 0.0f;
             cfg.OverlayShowGrid        = true;
             cfg.OverlayMaxStackedIcons = 3;
-            cfg.OGCDSizeRatio          = 1.0f;
+            cfg.OGCDSizeRatio          = 0.75f;
             cfg.OGCDVerticalOffset     = 0.1f;
-            cfg.OGCDHorizontalOffset   = 45f;
+            cfg.OGCDHorizontalOffset   = 0f;
             cfg.BossBarUseCustomColor  = false;
             cfg.BossBarColor           = new Vector4(0.85f, 0.35f, 0.20f, 1.00f);
             cfg.MainIconSize           = 22.0f;
@@ -7578,7 +8470,7 @@ public sealed class MainWindow : Window
             currentTimeline = null;
             skillVisibility.Clear();
             expandedSkillNodes.Clear();
-            plugin.OverlayWindow.StopPreview();
+            HideEmbeddedTimelinePreview();
 
             cacheClearNotice = "Cleared cached logs.";
             updateProgress = 0f;
@@ -7620,22 +8512,110 @@ public sealed class MainWindow : Window
 
     private AggregatedTimeline PrepareAutoTimelineSourceClone(AggregatedTimeline tl)
     {
-        if (tl.AutoTimelineSourceEntries.Count == 0)
+        RefreshTimelineRuntimeMetadata(tl);
+        var timelineKey = TimelineDatabase.MakeKey(tl.EncounterId, tl.SpecName);
+        var isCustomTimeline = plugin.Configuration.CustomTimelines.ContainsKey(timelineKey);
+        var storeTimeline = plugin.TimelineStore.GetTimeline(tl.EncounterId, tl.SpecName);
+        RefreshTimelineRuntimeMetadata(storeTimeline);
+        var rebuiltCachedSource = BuildAutoTimelineSourceFromCachedParses(tl);
+        if (rebuiltCachedSource.Count > 0)
+            tl.AutoTimelineSourceEntries = rebuiltCachedSource;
+        else if (!isCustomTimeline &&
+                 storeTimeline != null &&
+                 !ReferenceEquals(storeTimeline, tl))
         {
-            var storeTimeline = plugin.TimelineStore.GetTimeline(tl.EncounterId, tl.SpecName);
-            var preferredSource = storeTimeline != null && !ReferenceEquals(storeTimeline, tl) && storeTimeline.Entries.Count > 0
-                ? storeTimeline.Entries
-                : tl.Entries;
-            tl.AutoTimelineSourceEntries = preferredSource
+            var storeCachedSource = BuildAutoTimelineSourceFromCachedParses(storeTimeline);
+            if (storeCachedSource.Count > 0)
+                tl.AutoTimelineSourceEntries = storeCachedSource;
+        }
+
+        if (isCustomTimeline && IsSuspiciousFlattenedCustomSource(tl))
+        {
+            tl.AutoTimelineSourceEntries = tl.Entries
                 .Select(CloneTimelineEntry)
                 .ToList();
         }
 
-        var sourceTimeline = CloneTimeline(tl);
-        sourceTimeline.Entries = tl.AutoTimelineSourceEntries
+        if (tl.AutoTimelineSourceEntries.Count == 0)
+        {
+            if (isCustomTimeline)
+            {
+                tl.AutoTimelineSourceEntries = tl.Entries
+                    .Select(CloneTimelineEntry)
+                    .ToList();
+            }
+            else
+            {
+                tl.AutoTimelineSourceEntries = [];
+            }
+        }
+
+        var effectiveSourceEntries = tl.AutoTimelineSourceEntries
             .Select(CloneTimelineEntry)
             .ToList();
+        if (ShouldSupplementAutoTimelineGcdShell(effectiveSourceEntries) &&
+            storeTimeline != null &&
+            !ReferenceEquals(storeTimeline, tl))
+        {
+            var donorEntries = BuildAutoTimelineSourceFromCachedParses(storeTimeline);
+            if (donorEntries.Count > 0)
+                effectiveSourceEntries = MergeAutoTimelineSourceWithGcdShell(effectiveSourceEntries, donorEntries);
+        }
+
+        var sourceTimeline = CloneTimeline(tl);
+        sourceTimeline.Entries = effectiveSourceEntries;
+        sourceTimeline.AutoTimelineSourceEntries = effectiveSourceEntries
+            .Select(CloneTimelineEntry)
+            .ToList();
+        RefreshTimelineRuntimeMetadata(sourceTimeline);
         return sourceTimeline;
+    }
+
+    private bool ShouldSupplementAutoTimelineGcdShell(IReadOnlyCollection<TimelineEntry> entries)
+        => entries.Count > 0 && entries.Count(IsGcdEntry) < 12;
+
+    private List<TimelineEntry> FilterAutoTimelineResultEntries(
+        IEnumerable<TimelineEntry> entries,
+        ISet<int> allowedAbilityIds)
+    {
+        if (allowedAbilityIds.Count == 0)
+            return entries
+                .Select(CloneTimelineEntry)
+                .ToList();
+
+        return entries
+            .Where(entry => allowedAbilityIds.Contains(entry.AbilityId))
+            .Select(CloneTimelineEntry)
+            .ToList();
+    }
+
+    private List<TimelineEntry> MergeAutoTimelineSourceWithGcdShell(
+        IEnumerable<TimelineEntry> primaryEntries,
+        IEnumerable<TimelineEntry> donorEntries)
+    {
+        var merged = primaryEntries
+            .Select(CloneTimelineEntry)
+            .ToList();
+        var seenKeys = merged
+            .Select(GetAutoEntryIdentityKey)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var donorEntry in donorEntries
+                     .Where(IsGcdEntry)
+                     .OrderBy(entry => entry.TimeOffsetSec)
+                     .ThenByDescending(entry => entry.Frequency))
+        {
+            var key = GetAutoEntryIdentityKey(donorEntry);
+            if (!seenKeys.Add(key))
+                continue;
+
+            merged.Add(CloneTimelineEntry(donorEntry));
+        }
+
+        return merged
+            .OrderBy(entry => entry.TimeOffsetSec)
+            .ThenByDescending(entry => entry.Frequency)
+            .ToList();
     }
 
     private static AggregatedTimeline CloneTimeline(AggregatedTimeline tl)
@@ -7647,16 +8627,14 @@ public sealed class MainWindow : Window
             SpecName = tl.SpecName,
             AverageDurationMs = tl.AverageDurationMs,
             ParseCount = tl.ParseCount,
-            DeltaMs = tl.DeltaMs,
-            CustomGcdRecastSec = tl.CustomGcdRecastSec,
-            EnableCustomGcdRecastSpacing = tl.EnableCustomGcdRecastSpacing,
-            CustomOgcdSlots = tl.CustomOgcdSlots,
-            EnableCustomOgcdSpacing = tl.EnableCustomOgcdSpacing,
             Entries = tl.Entries
                 .Select(CloneTimelineEntry)
                 .ToList(),
             AutoTimelineSourceEntries = tl.AutoTimelineSourceEntries
                 .Select(CloneTimelineEntry)
+                .ToList(),
+            CachedFflogsParses = tl.CachedFflogsParses
+                .Select(CloneCachedFflogsParseTimeline)
                 .ToList(),
             BossEntries = tl.BossEntries
                 .Select(entry => new BossTimelineEntry
@@ -7666,6 +8644,21 @@ public sealed class MainWindow : Window
                     CastStartSec = entry.CastStartSec,
                     CastEndSec = entry.CastEndSec,
                 })
+                .ToList(),
+        };
+    }
+
+    private static CachedFflogsParseTimeline CloneCachedFflogsParseTimeline(CachedFflogsParseTimeline parse)
+    {
+        return new CachedFflogsParseTimeline
+        {
+            ParseIndex = parse.ParseIndex,
+            ReportCode = parse.ReportCode,
+            FightId = parse.FightId,
+            RankingAmount = parse.RankingAmount,
+            DurationSec = parse.DurationSec,
+            Entries = parse.Entries
+                .Select(CloneTimelineEntry)
                 .ToList(),
         };
     }
@@ -7682,6 +8675,27 @@ public sealed class MainWindow : Window
             AverageUses = entry.AverageUses,
             IsGcd = entry.IsGcd,
         };
+    }
+
+    private void RefreshTimelineRuntimeMetadata(AggregatedTimeline? tl)
+    {
+        if (tl == null)
+            return;
+
+        RefreshTimelineEntryRuntimeMetadata(tl.Entries);
+        RefreshTimelineEntryRuntimeMetadata(tl.AutoTimelineSourceEntries);
+        foreach (var parse in tl.CachedFflogsParses)
+            RefreshTimelineEntryRuntimeMetadata(parse.Entries);
+    }
+
+    private void RefreshTimelineEntryRuntimeMetadata(IEnumerable<TimelineEntry> entries)
+    {
+        foreach (var entry in entries)
+        {
+            var info = plugin.RecastDatabase.Lookup(entry.AbilityId, entry.AbilityName);
+            if (info != null)
+                entry.IsGcd = info.IsGcdAction;
+        }
     }
 
     private static void CfgTooltip(string text)

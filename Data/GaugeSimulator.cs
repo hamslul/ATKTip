@@ -40,6 +40,7 @@ public static class GaugeSimulator
         "LemureShroud",
         "Lily",
         "LunarNadi",
+        "MP",
         "ManaStack",
         "Meditation",
         "Ninki",
@@ -75,6 +76,10 @@ public static class GaugeSimulator
         public string GaugeName  { get; init; } = string.Empty;
         /// <summary>Minimum gauge value required to use this ability (0 = no check).</summary>
         public int    MinRequired { get; init; }
+        /// <summary>Maximum gauge value allowed before use (int.MaxValue = no upper-bound check).</summary>
+        public int    MaxAllowedBeforeUse { get; init; } = int.MaxValue;
+        /// <summary>When set, the resource is refreshed directly to this value before applying Delta.</summary>
+        public int?   SetValue { get; init; }
         /// <summary>Amount added to gauge after use; negative = consume.</summary>
         public int    Delta       { get; init; }
     }
@@ -267,6 +272,32 @@ public static class GaugeSimulator
         AppendEffects(effects, grantedName, new GaugeEffect { GaugeName = resourceName, Delta = -1, MinRequired = 1 });
     }
 
+    private static void AddGroupedGrantedActions(
+        List<GaugeResource> resources,
+        Dictionary<string, IReadOnlyList<GaugeEffect>> effects,
+        string grantorName,
+        IEnumerable<string> grantedNames,
+        IEnumerable<string>? clearedNames = null)
+    {
+        foreach (var grantedName in grantedNames)
+        {
+            var resourceName = $"{grantedName} Ready";
+            EnsureResource(resources, resourceName, 1);
+            AppendEffects(effects, grantorName, new GaugeEffect { GaugeName = resourceName, Delta = +1 });
+            AppendEffects(effects, grantedName, new GaugeEffect { GaugeName = resourceName, Delta = -1, MinRequired = 1 });
+        }
+
+        if (clearedNames == null)
+            return;
+
+        foreach (var clearedName in clearedNames)
+        {
+            var resourceName = $"{clearedName} Ready";
+            EnsureResource(resources, resourceName, 1);
+            AppendEffects(effects, grantorName, new GaugeEffect { GaugeName = resourceName, Delta = -1 });
+        }
+    }
+
     private static void AddResourceConsumer(
         Dictionary<string, IReadOnlyList<GaugeEffect>> effects,
         string consumerName,
@@ -441,6 +472,8 @@ public static class GaugeSimulator
             ["Howling Fist"] = E("Chakra", -5, minRequired: 5),
             ["The Forbidden Chakra"] = E("Chakra", -5, minRequired: 5),
             ["Enlightenment"] = E("Chakra", -5, minRequired: 5),
+            ["Riddle of Earth"] = E("Earth's Reply Ready", +1),
+            ["Earth's Reply"] = E("Earth's Reply Ready", -1, minRequired: 1),
         };
 
         return new JobGaugeRules
@@ -451,6 +484,7 @@ public static class GaugeSimulator
                 new GaugeResource { Name = "BeastChakra", MaxValue = 3, InitialValue = 0, AvoidOvercap = true },
                 new GaugeResource { Name = "LunarNadi", MaxValue = 1, InitialValue = 0, AvoidOvercap = true },
                 new GaugeResource { Name = "SolarNadi", MaxValue = 1, InitialValue = 0, AvoidOvercap = true },
+                new GaugeResource { Name = "Earth's Reply Ready", MaxValue = 1, InitialValue = 0 },
             ],
             EffectByName = effects,
         };
@@ -637,11 +671,14 @@ public static class GaugeSimulator
             // Other
             ["Primal Rend"]     = E("Beast", 0),
             ["Primal Ruination"]= E("Beast", 0),
+            ["Inner Release"]   = E("Primal Wrath Ready", +1),
+            ["Primal Wrath"]    = E("Primal Wrath Ready", -1, minRequired: 1),
         };
 
         var resources = new List<GaugeResource>
         {
             new() { Name = "Beast", MaxValue = 100, InitialValue = 0, AvoidOvercap = true },
+            new() { Name = "Primal Wrath Ready", MaxValue = 1, InitialValue = 0 },
         };
         var repeatableGrantedActionRules = new List<RepeatableGrantedActionRule>();
 
@@ -662,11 +699,17 @@ public static class GaugeSimulator
         };
     }
 
-    // ── Dark Knight (DRK) — Blood Gauge ────────────────────────────────────
+    // ── Dark Knight (DRK) — Blood Gauge + MP ───────────────────────────────
     //
     // Blood Gauge: 0–100, starts at 0.
     //   Generators: combo hits (+10/+20)
     //   Spenders:   Bloodspiller / Quietus (≥50, cost 50)
+    // MP: 0–10000, starts full.
+    //   Generators: Syphon Strike +600, Stalwart Soul +600, Comeuppance +200,
+    //               Torcleaver +200, Impalement +500, Carve and Spit +600,
+    //               Abyssal Drain +600
+    //   Spenders:   Edge of Shadow / Flood of Shadow / The Blackest Night
+    //               (≥3000, cost 3000)
     //   Delirium: at level 100 Delirium transforms Bloodspiller into a free 3-hit chain
     //   (Scarlet Delirium → Comeuppance → Torcleaver). These are flagged as 0-cost.
     //   ► False positives possible if Bloodspiller is listed without the Delirium replacements.
@@ -676,11 +719,19 @@ public static class GaugeSimulator
         {
             // ST combo
             ["Hard Slash"]       = E("Blood", 0),
-            ["Syphon Strike"]    = E("Blood", 0),
+            ["Syphon Strike"]    =
+            [
+                new GaugeEffect { GaugeName = "Blood", Delta = 0 },
+                new GaugeEffect { GaugeName = "MP", Delta = +600 },
+            ],
             ["Souleater"]        = E("Blood", +20),
             // AoE combo
             ["Unleash"]          = E("Blood", 0),
-            ["Stalwart Soul"]    = E("Blood", +20),
+            ["Stalwart Soul"]    =
+            [
+                new GaugeEffect { GaugeName = "Blood", Delta = +20 },
+                new GaugeEffect { GaugeName = "MP", Delta = +600 },
+            ],
             // Spenders (need ≥50)
             ["Bloodspiller"]     = E("Blood", -50, minRequired: 50),
             ["Quietus"]          = E("Blood", -50, minRequired: 50),
@@ -699,22 +750,34 @@ public static class GaugeSimulator
             ["Comeuppance"]      =
             [
                 new GaugeEffect { GaugeName = "Blood", Delta = 0 },
+                new GaugeEffect { GaugeName = "MP", Delta = +200 },
                 new GaugeEffect { GaugeName = "Comeuppance Ready", Delta = -1, MinRequired = 1 },
                 new GaugeEffect { GaugeName = "Torcleaver Ready", Delta = +1 },
             ],
             ["Torcleaver"]       =
             [
                 new GaugeEffect { GaugeName = "Blood", Delta = 0 },
+                new GaugeEffect { GaugeName = "MP", Delta = +200 },
                 new GaugeEffect { GaugeName = "Torcleaver Ready", Delta = -1, MinRequired = 1 },
             ],
-            ["Impalement"]       = E("Blood", 0),   // AoE Delirium finisher
+            ["Impalement"]       =
+            [
+                new GaugeEffect { GaugeName = "Blood", Delta = 0 },
+                new GaugeEffect { GaugeName = "MP", Delta = +500 },
+            ],   // AoE Delirium finisher
             ["Salted Earth"]     = E("Salt and Darkness Ready", +1),
             ["Salt and Darkness"]= E("Salt and Darkness Ready", -1, minRequired: 1),
+            ["Edge of Shadow"]   = E("MP", -3000, minRequired: 3000),
+            ["Flood of Shadow"]  = E("MP", -3000, minRequired: 3000),
+            ["Carve and Spit"]   = E("MP", +600),
+            ["Abyssal Drain"]    = E("MP", +600),
+            ["The Blackest Night"] = E("MP", -3000, minRequired: 3000),
         };
 
         var resources = new List<GaugeResource>
         {
             new() { Name = "Blood", MaxValue = 100, InitialValue = 0, AvoidOvercap = true },
+            new() { Name = "MP", MaxValue = 10000, InitialValue = 10000, AvoidOvercap = true },
             new() { Name = "Salt and Darkness Ready", MaxValue = 1, InitialValue = 0 },
             new() { Name = "Delirium", MaxValue = 3, InitialValue = 0 },
             new() { Name = "Scarlet Delirium Ready", MaxValue = 1, InitialValue = 0 },
@@ -987,6 +1050,10 @@ public static class GaugeSimulator
         AddResourceGrant(effects, "Tenka Goken", "Meditation");
         AddResourceGrant(effects, "Midare Setsugekka", "Meditation");
         AddResourceGrant(effects, "Ogi Namikiri", "Meditation");
+        AppendEffects(effects, "Midare Setsugekka",
+            new GaugeEffect { GaugeName = "Setsu", Delta = -1, MinRequired = 1 },
+            new GaugeEffect { GaugeName = "Getsu", Delta = -1, MinRequired = 1 },
+            new GaugeEffect { GaugeName = "Ka", Delta = -1, MinRequired = 1 });
         AddGrantedAction(resources, effects, "Ikishoten", "Ogi Namikiri");
 
         return new JobGaugeRules
@@ -1147,6 +1214,7 @@ public static class GaugeSimulator
         EnsureResource(resources, "Dance of the Dawn Ready", 1);
         EnsureResource(resources, "Starfall Dance Ready", 1);
         EnsureResource(resources, "Last Dance Ready", 1);
+        EnsureResource(resources, "Improvised Finish Ready", 1);
         EnsureResource(resources, "Silken Symmetry", 1);
         EnsureResource(resources, "Silken Flow", 1);
 
@@ -1172,9 +1240,11 @@ public static class GaugeSimulator
             new GaugeEffect { GaugeName = "Finishing Move Ready", Delta = -1, MinRequired = 1 },
             new GaugeEffect { GaugeName = "Last Dance Ready", Delta = +1 });
         AddResourceGrant(effects, "Devilment", "Starfall Dance Ready");
+        AddResourceGrant(effects, "Improvisation", "Improvised Finish Ready");
         AppendEffects(effects, "Double Standard Finish",
             new GaugeEffect { GaugeName = "Standard Finish Ready", Delta = -1, MinRequired = 1 },
             new GaugeEffect { GaugeName = "Last Dance Ready", Delta = +1 });
+        AddResourceConsumer(effects, "Improvised Finish", "Improvised Finish Ready");
         AddResourceConsumer(effects, "Starfall Dance", "Starfall Dance Ready");
         AddResourceConsumer(effects, "Tillana", "Flourishing Finish");
         AddResourceConsumer(effects, "Dance of the Dawn", "Dance of the Dawn Ready");
@@ -1431,6 +1501,8 @@ public static class GaugeSimulator
             new() { Name = "Verfire Ready", MaxValue = 1, InitialValue = 0 },
             new() { Name = "Verstone Ready", MaxValue = 1, InitialValue = 0 },
             new() { Name = "Grand Impact Ready", MaxValue = 1, InitialValue = 0 },
+            new() { Name = "Prefulgence Ready", MaxValue = 1, InitialValue = 0 },
+            new() { Name = "Vice of Thorns Ready", MaxValue = 1, InitialValue = 0 },
         };
         var instantCastRules = new List<InstantCastRule>();
         var hardcastGrantRules = new List<HardcastGrantRule>
@@ -1514,11 +1586,21 @@ public static class GaugeSimulator
             new GaugeEffect { GaugeName = "Verstone Ready", Delta = -1, MinRequired = 1 },
         ];
         effects["Acceleration"] = E("Grand Impact Ready", +1);
+        effects["Manafication"] = E("Prefulgence Ready", +1);
+        effects["Embolden"] = E("Vice of Thorns Ready", +1);
         effects["Grand Impact"] =
         [
             new GaugeEffect { GaugeName = "BlackMana", Delta = +3 },
             new GaugeEffect { GaugeName = "WhiteMana", Delta = +3 },
             new GaugeEffect { GaugeName = "Grand Impact Ready", Delta = -1, MinRequired = 1 },
+        ];
+        effects["Prefulgence"] =
+        [
+            new GaugeEffect { GaugeName = "Prefulgence Ready", Delta = -1, MinRequired = 1 },
+        ];
+        effects["Vice of Thorns"] =
+        [
+            new GaugeEffect { GaugeName = "Vice of Thorns Ready", Delta = -1, MinRequired = 1 },
         ];
         effects["Enchanted Riposte"] =
         [
@@ -1644,8 +1726,14 @@ public static class GaugeSimulator
     {
         var effects = new Dictionary<string, IReadOnlyList<GaugeEffect>>(StringComparer.OrdinalIgnoreCase)
         {
-            ["Aetherflow"]       = E("Aetherflow", +3),
-            ["Dissipation"]      = E("Aetherflow", +3),
+            ["Aetherflow"]       =
+            [
+                new GaugeEffect { GaugeName = "Aetherflow", SetValue = 3, MaxAllowedBeforeUse = 0 },
+            ],
+            ["Dissipation"]      =
+            [
+                new GaugeEffect { GaugeName = "Aetherflow", SetValue = 3, MaxAllowedBeforeUse = 0 },
+            ],
             ["Energy Drain"]     =
             [
                 new GaugeEffect { GaugeName = "Aetherflow", Delta = -1, MinRequired = 1 },
@@ -1862,37 +1950,43 @@ public static class GaugeSimulator
 
     // ── Astrologian (AST) — Card Draw State ────────────────────────────────
     //
-    // No numeric gauge.  AST alternates between Astral Draw and Umbral Draw;
-    // each draw unlocks a distinct set of 4 cards. Playing a card from the wrong
-    // draw group is flagged as a conflict.
+    // No numeric gauge. AST alternates between Astral Draw and Umbral Draw;
+    // each draw unlocks a distinct set of 4 independently playable cards until
+    // the next draw swaps the active hand.
     //
     // Astral Draw  → Balance, Arrow, Spire, Lord of Crowns
     // Umbral Draw  → Spear, Ewer, Bole,  Lady of Crowns
     private static JobGaugeRules BuildAstrologianRules()
     {
+        var astralCards = new[]
+        {
+            "The Balance",
+            "The Arrow",
+            "The Spire",
+            "Lord of Crowns",
+        };
+        var umbralCards = new[]
+        {
+            "The Spear",
+            "The Ewer",
+            "The Bole",
+            "Lady of Crowns",
+        };
+
         var effects = new Dictionary<string, IReadOnlyList<GaugeEffect>>(StringComparer.OrdinalIgnoreCase)
         {
-            ["Astral Draw"]    = E("Card Play Ready", +1),
-            ["Umbral Draw"]    = E("Card Play Ready", +1),
-            ["The Balance"]    = E("Card Play Ready", -1, minRequired: 1),
-            ["The Arrow"]      = E("Card Play Ready", -1, minRequired: 1),
-            ["The Spire"]      = E("Card Play Ready", -1, minRequired: 1),
-            ["Lord of Crowns"] = E("Card Play Ready", -1, minRequired: 1),
-            ["The Spear"]      = E("Card Play Ready", -1, minRequired: 1),
-            ["The Ewer"]       = E("Card Play Ready", -1, minRequired: 1),
-            ["The Bole"]       = E("Card Play Ready", -1, minRequired: 1),
-            ["Lady of Crowns"] = E("Card Play Ready", -1, minRequired: 1),
-            ["Divination"]     = E("Divining", +1),
-            ["Oracle"]         = E("Divining", -1, minRequired: 1),
+            ["Divination"] = E("Divining", +1),
+            ["Oracle"] = E("Divining", -1, minRequired: 1),
         };
         var resources = new List<GaugeResource>
         {
-            new() { Name = "Card Play Ready", MaxValue = 1, InitialValue = 0 },
             new() { Name = "Divining", MaxValue = 1, InitialValue = 0 },
         };
         var instantCastRules = new List<InstantCastRule>();
         var repeatableGrantedActionRules = new List<RepeatableGrantedActionRule>();
         AddSwiftcast(resources, effects, instantCastRules);
+        AddGroupedGrantedActions(resources, effects, "Astral Draw", astralCards, umbralCards);
+        AddGroupedGrantedActions(resources, effects, "Umbral Draw", umbralCards, astralCards);
         AddGrantedAction(resources, effects, "Divination", "Oracle");
         AddGrantedAction(resources, effects, "Neutral Sect", "Sun Sign");
         AddGrantedAction(resources, effects, "Earthly Star", "Stellar Detonation");
@@ -1908,20 +2002,14 @@ public static class GaugeSimulator
 
         return new JobGaugeRules
         {
-            Resources    = resources,
+            Resources = resources,
             EffectByName = effects,
-            CardDraw     = new CardDrawRules
+            CardDraw = new CardDrawRules
             {
                 AstralDrawName = "Astral Draw",
                 UmbralDrawName = "Umbral Draw",
-                AstralCards    = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    "The Balance", "The Arrow", "The Spire", "Lord of Crowns",
-                },
-                UmbralCards    = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    "The Spear", "The Ewer", "The Bole", "Lady of Crowns",
-                },
+                AstralCards = new HashSet<string>(astralCards, StringComparer.OrdinalIgnoreCase),
+                UmbralCards = new HashSet<string>(umbralCards, StringComparer.OrdinalIgnoreCase),
             },
             InstantCastRules = instantCastRules,
             RepeatableGrantedActionRules = repeatableGrantedActionRules,

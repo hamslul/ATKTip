@@ -22,6 +22,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly WindowSystem windowSystem = new("ATKTip");
 
     public Configuration Configuration { get; }
+    public string ConfigDirectory { get; }
     public TimelineStore TimelineStore { get; }
     public FFLogsClient FFLogsClient { get; }
     public TimelineAggregator Aggregator { get; }
@@ -69,9 +70,10 @@ public sealed class Plugin : IDalamudPlugin
 
         // Load or create config
         Configuration = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        ConfigDirectory = pluginInterface.GetPluginConfigDirectory();
 
         // Data layer
-        var dataDir = Path.Combine(pluginInterface.GetPluginConfigDirectory(), "data");
+        var dataDir = Path.Combine(ConfigDirectory, "data");
         Directory.CreateDirectory(dataDir);
 
         TimelineStore  = new TimelineStore(dataDir, log);
@@ -112,7 +114,7 @@ public sealed class Plugin : IDalamudPlugin
 
         commandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open the ATKTip timeline window.",
+            HelpMessage = "Open the ATKTipDebug timeline window.",
         });
     }
 

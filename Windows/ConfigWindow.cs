@@ -90,7 +90,7 @@ public sealed class ConfigWindow : Window
             ImGui.TextColored(in bulletColor, "Step 3:");
             ImGui.SameLine();
             ImGui.TextWrapped(
-                "Click \"Create Client\". Give it any name (e.g. \"ATKTip\"). " +
+            "Click \"Create Client\". Give it any name (e.g. \"ATKTip\"). " +
                 "For the redirect URL, enter: http://localhost");
 
             ImGui.Spacing();
@@ -264,7 +264,7 @@ public sealed class ConfigWindow : Window
             cfg.OGCDSizeRatio = ogcdSizeRatio;
             changed = true;
         }
-        Tooltip("oGCD icon size as a fraction of the GCD icon size.\n0.75 = 75% of GCD size (ATR default).\n1.0 = same size as GCDs.");
+        Tooltip("oGCD icon size as a fraction of the GCD icon size.\nSmaller values help dense weave windows stay readable and match the ATR-style playback look.");
 
         var ogcdOffset = cfg.OGCDVerticalOffset;
         ImGui.SetNextItemWidth(200);
@@ -273,7 +273,7 @@ public sealed class ConfigWindow : Window
             cfg.OGCDVerticalOffset = ogcdOffset;
             changed = true;
         }
-        Tooltip("How far above center oGCDs are positioned, as a fraction of GCD icon size.\n0.1 = slightly above center (ATR default).\n0 = same center as GCDs.\nNegative = below center.");
+        Tooltip("Move oGCDs upward from the main action lane.\n0.1 matches the ATR-style default.\nNegative values move them back down.");
 
         var ogcdHOffset = cfg.OGCDHorizontalOffset;
         ImGui.SetNextItemWidth(200);
@@ -282,7 +282,7 @@ public sealed class ConfigWindow : Window
             cfg.OGCDHorizontalOffset = ogcdHOffset;
             changed = true;
         }
-        Tooltip("Shift oGCD icons left (negative) or right (positive) on the timeline.\nUseful to visually separate oGCDs from GCDs at the same timestamp.");
+        Tooltip("Nudge oGCD slot placement left (negative) or right (positive) after legal weave slots are chosen.");
 
         ImGui.Spacing();
 
@@ -573,17 +573,17 @@ public sealed class ConfigWindow : Window
 
             cfg.OverlayEnabled          = true;
             cfg.OverlayLocked           = true;
-            cfg.OverlayPixelsPerSec     = 60.0f;
-            cfg.OverlayIconSize         = 46.0f;
+            cfg.OverlayPixelsPerSec     = 72.0f;
+            cfg.OverlayIconSize         = 44.0f;
             cfg.OverlayTimeBehind       = 1.5f;
             cfg.OverlayBgOpacity        = 1.0f;
             cfg.OverlayPastAlpha        = 1.0f;
             cfg.OverlayFreqThreshold    = 0.0f;
             cfg.OverlayShowGrid         = true;
             cfg.OverlayMaxStackedIcons  = 3;
-            cfg.OGCDSizeRatio           = 1.0f;
+            cfg.OGCDSizeRatio           = 0.75f;
             cfg.OGCDVerticalOffset      = 0.1f;
-            cfg.OGCDHorizontalOffset    = 45f;
+            cfg.OGCDHorizontalOffset    = 0f;
             cfg.BossBarUseCustomColor   = false;
             cfg.BossBarColor            = new Vector4(0.85f, 0.35f, 0.20f, 1.00f);
             cfg.MainIconSize            = 22.0f;

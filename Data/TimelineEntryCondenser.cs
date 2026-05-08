@@ -67,14 +67,9 @@ public static class TimelineEntryCondenser
     {
         var info = recastDb.Lookup(entry.AbilityId, entry.AbilityName);
         if (info?.IsGcdAction == true)
-        {
-            var recastSec = info.RecastSec is > 0.0 and <= 4.5
-                ? info.RecastSec
-                : 2.5;
-            return Math.Clamp(recastSec * 0.5, 0.75, 1.25);
-        }
+            return Math.Max(AutoTimelineSourceBuilder.GcdSlotEarlyWindowSec, AutoTimelineSourceBuilder.GcdSlotLateWindowSec);
 
-        return 0.25;
+        return AutoTimelineSourceBuilder.OgcdSameActionWindowSec;
     }
 
     private static TimelineEntry MergeCluster(

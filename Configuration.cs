@@ -15,17 +15,17 @@ public sealed class Configuration : IPluginConfiguration
     // Overlay settings
     public bool OverlayEnabled { get; set; } = true;
     public bool OverlayLocked { get; set; } = true;
-    public float OverlayPixelsPerSec { get; set; } = 60.0f;
-    public float OverlayIconSize { get; set; } = 46.0f;
+    public float OverlayPixelsPerSec { get; set; } = 72.0f;
+    public float OverlayIconSize { get; set; } = 44.0f;
     public float OverlayTimeBehind { get; set; } = 1.5f;
     public float OverlayBgOpacity { get; set; } = 1.0f;
     public float OverlayPastAlpha { get; set; } = 1.0f;
     public float OverlayFreqThreshold { get; set; } = 0.0f;
     public bool OverlayShowGrid { get; set; } = true;
     public int OverlayMaxStackedIcons { get; set; } = 3;
-    public float OGCDSizeRatio { get; set; } = 1.0f;           // oGCD icon size as fraction of GCD icon size
-    public float OGCDVerticalOffset { get; set; } = 0.1f;  // fraction of GCD icon size above center
-    public float OGCDHorizontalOffset { get; set; } = 45f;  // pixel shift applied to all oGCD positions
+    public float OGCDSizeRatio { get; set; } = 0.75f;          // oGCD icon size as fraction of GCD icon size
+    public float OGCDVerticalOffset { get; set; } = 0.1f;      // offset above the main action lane
+    public float OGCDHorizontalOffset { get; set; } = 0f;      // manual pixel nudge applied after slot placement
 
     // Boss bar color (shared by overlay and main window)
     public bool    BossBarUseCustomColor { get; set; } = false;

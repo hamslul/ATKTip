@@ -119,16 +119,18 @@ public sealed class AggregatedTimeline
     public List<BossTimelineEntry> BossEntries { get; set; } = [];
     /// <summary>Original source entries used by Auto Timeline so repeated runs are stable.</summary>
     public List<TimelineEntry> AutoTimelineSourceEntries { get; set; } = [];
-    /// <summary>User-adjustable offset in milliseconds applied to all entry timestamps on save.</summary>
-    public int DeltaMs { get; set; } = 0;
-    /// <summary>User-adjustable GCD spacing used to normalize custom timelines after Auto Timeline.</summary>
-    public double CustomGcdRecastSec { get; set; } = 2.5;
-    /// <summary>Whether manual GCD spacing normalization is enabled for this custom timeline.</summary>
-    public bool EnableCustomGcdRecastSpacing { get; set; } = false;
-    /// <summary>Whether manual oGCD spacing normalization is enabled for this custom timeline.</summary>
-    public bool EnableCustomOgcdSpacing { get; set; } = false;
-    /// <summary>Maximum oGCD slots to distribute between adjacent 2.5s GCD anchors.</summary>
-    public int CustomOgcdSlots { get; set; } = 2;
+    /// <summary>Per-parse cached FFLogs timelines used for debug inspection of the top source parses.</summary>
+    public List<CachedFflogsParseTimeline> CachedFflogsParses { get; set; } = [];
+}
+
+public sealed class CachedFflogsParseTimeline
+{
+    public int ParseIndex { get; set; }
+    public string ReportCode { get; set; } = string.Empty;
+    public int FightId { get; set; }
+    public double RankingAmount { get; set; }
+    public double DurationSec { get; set; }
+    public List<TimelineEntry> Entries { get; set; } = [];
 }
 
 public sealed class TimelineEntry

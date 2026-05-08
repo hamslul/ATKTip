@@ -836,53 +836,18 @@ public sealed class FFLogsClient : IDisposable
 
     /// <summary>
     /// Fetch cast events for a specific player (by sourceID) in a single fight.
-    /// Re-queries fight times via fights(fightIDs:[X]) to get the same reference
-    /// point the aggregation path uses, then returns fight-relative timestamps.
+    /// Matches the FFLogs Events CSV for a filtered player view by using the
+    /// fight display start (typically the first limit break timeline update /
+    /// encounter pull marker) and emitting only "cast" events.
     /// </summary>
     public async Task<List<CastEvent>> GetCastEventsForPlayerAsync(
         string reportCode, int fightId, long fightStartTime, long fightEndTime,
         int sourceId, Dictionary<int, (string name, string icon)> abilityLookup, CancellationToken ct)
     {
-        // Re-query fight times using fights(fightIDs:[X]) — the same query the
-        // aggregation path uses.  fights(killType:Kills).startTime (passed in from
-        // the caller) can differ from fights(fightIDs:[X]).startTime for the same
-        // fight, causing a consistent timestamp offset.
-        var timesQuery = $$"""
-            {
-              reportData {
-                report(code: "{{reportCode}}") {
-                  fights(fightIDs: [{{fightId}}]) {
-                    startTime
-                    endTime
-                  }
-                }
-              }
-            }
-            """;
-
-        try
-        {
-            var timesRaw    = await QueryRawAsync(timesQuery, ct);
-            var timesResult = JObject.Parse(timesRaw);
-            var fightArr    = timesResult["data"]?["reportData"]?["report"]?["fights"] as JArray;
-            if (fightArr != null && fightArr.Count > 0)
-            {
-                var newStart = fightArr[0]?["startTime"]?.Value<long>() ?? fightStartTime;
-                var newEnd   = fightArr[0]?["endTime"]?.Value<long>()   ?? fightEndTime;
-                log.Info("[FFLogs/RI] Fight {0}: killType startTime={1}, fightIDs startTime={2}, delta={3}ms.",
-                    fightId, fightStartTime, newStart, newStart - fightStartTime);
-                fightStartTime = newStart;
-                fightEndTime   = newEnd;
-            }
-        }
-        catch (Exception ex)
-        {
-            log.Warning(ex, "[FFLogs/RI] Could not re-query fight times for fight {0}; using caller values.", fightId);
-        }
-
         var allEvents = new List<CastEvent>();
         long? nextStart = null;
         var pageNum = 0;
+        var displayStartTime = await GetFightDisplayStartTimeAsync(reportCode, fightId, fightStartTime, fightEndTime, ct);
 
         while (true)
         {
@@ -946,61 +911,23 @@ public sealed class FFLogsClient : IDisposable
 
             if (data == null || data.Count == 0) break;
 
-            // FFLogs cast timeline displays "begincast" time for spells with cast bars,
-            // and "cast" time for instant abilities (which have no begincast event).
-            // To match the timeline view exactly:
-            //   1. Collect all begincast timestamps per ability (spells).
-            //   2. Emit begincast events as-is.
-            //   3. Emit cast events only when no begincast was seen for the same ability
-            //      within the preceding 5 s (i.e., the ability is an instant).
-
-            // Pass 1 — record begincast timestamps keyed by abilityId.
-            var begincastByAbility = new Dictionary<int, List<long>>();
-            foreach (var e in data)
-            {
-                if (e["type"]?.ToString() != "begincast") continue;
-                var id = e["abilityGameID"]?.Value<int>() ?? 0;
-                if (id == 0) continue;
-                var ts = e["timestamp"]?.Value<long>() ?? 0;
-                if (!begincastByAbility.TryGetValue(id, out var list))
-                { list = []; begincastByAbility[id] = list; }
-                list.Add(ts);
-            }
-
-            // Pass 2 — emit events.
+            // The downloadable FFLogs Events CSV uses cast timestamps, not
+            // begincast timestamps. To mirror it exactly, keep only "cast".
             foreach (var e in data)
             {
                 var type = e["type"]?.ToString() ?? string.Empty;
-                if (type != "begincast" && type != "cast") continue;
+                if (type != "cast") continue;
 
                 var abilityId = e["abilityGameID"]?.Value<int>() ?? 0;
                 if (abilityId == 0) continue;
 
                 var rawTs = e["timestamp"]?.Value<long>() ?? 0;
 
-                if (type == "cast")
-                {
-                    // Skip if a begincast was already seen for this ability within 5 s
-                    // (meaning this is the resolution event of a cast-bar spell — the
-                    // begincast already represents it in the timeline).
-                    const long MaxCastMs = 5_000L;
-                    if (begincastByAbility.TryGetValue(abilityId, out var bcTimes))
-                    {
-                        var hasPriorBegincast = false;
-                        foreach (var bts in bcTimes)
-                        {
-                            var delta = rawTs - bts;
-                            if (delta >= 0 && delta <= MaxCastMs) { hasPriorBegincast = true; break; }
-                        }
-                        if (hasPriorBegincast) continue;
-                    }
-                }
-
                 var (abilityName, abilityIcon) = abilityLookup.GetValueOrDefault(abilityId, (string.Empty, string.Empty));
 
                 allEvents.Add(new CastEvent
                 {
-                    Timestamp     = rawTs - fightStartTime,
+                    Timestamp     = rawTs - displayStartTime,
                     AbilityGameID = abilityId,
                     AbilityName   = abilityName,
                     AbilityIcon   = abilityIcon,
@@ -1017,6 +944,80 @@ public sealed class FFLogsClient : IDisposable
         log.Info("[FFLogs/RI] Report {0} fight {1} sourceID {2}: {3} cast events across {4} page(s).",
             reportCode, fightId, sourceId, allEvents.Count, pageNum);
         return allEvents;
+    }
+
+    private async Task<long> GetFightDisplayStartTimeAsync(
+        string reportCode, int fightId, long fightStartTime, long fightEndTime, CancellationToken ct)
+    {
+        var previewEndTime = Math.Min(fightEndTime, fightStartTime + 30000);
+        var query = $$"""
+            {
+              reportData {
+                report(code: "{{reportCode}}") {
+                  events(
+                    fightIDs: [{{fightId}}]
+                    endTime: {{previewEndTime}}
+                    limit: 1000
+                  ) {
+                    data
+                  }
+                }
+              }
+            }
+            """;
+
+        var raw = await QueryRawAsync(query, ct);
+        var result = JObject.Parse(raw);
+
+        if (result["errors"] is JArray errors && errors.Count > 0)
+            throw new Exception($"Display start query error: {errors[0]?["message"]}");
+
+        var eventsToken = result["data"]?["reportData"]?["report"]?["events"];
+        if (eventsToken == null || eventsToken.Type == JTokenType.Null)
+            return fightStartTime;
+
+        JToken? dataToken = null;
+        if (eventsToken is JObject eo)
+            dataToken = eo["data"];
+        else
+        {
+            try
+            {
+                var parsed = JObject.Parse(eventsToken.ToString());
+                dataToken = parsed["data"];
+            }
+            catch
+            {
+                return fightStartTime;
+            }
+        }
+
+        var data = dataToken as JArray;
+        if (data == null && dataToken != null && dataToken.Type != JTokenType.Null)
+        {
+            try { data = JArray.Parse(dataToken.ToString()); }
+            catch { return fightStartTime; }
+        }
+
+        if (data == null || data.Count == 0)
+            return fightStartTime;
+
+        var explicitStart = data
+            .Where(e =>
+            {
+                var type = e["type"]?.ToString();
+                return type == "encounterstart"
+                    || type == "dungeonencounterstart"
+                    || type == "towerstart"
+                    || type == "limitbreakupdate";
+            })
+            .Select(e => e["timestamp"]?.Value<long>() ?? long.MaxValue)
+            .DefaultIfEmpty(long.MaxValue)
+            .Min();
+        if (explicitStart != long.MaxValue)
+            return explicitStart;
+
+        return fightStartTime;
     }
 
     // ── Rate limit ──

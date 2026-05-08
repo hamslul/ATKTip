@@ -45,14 +45,15 @@ public sealed class OverlayWindow : Window, IDisposable
     // ── ATR geometry constants (match ATR defaults exactly) ──
     // GCDHeightHigh / GCDHeightLow control the vertical extent of the GCD bar.
     // ATR defaults: high=0.5, low=0.8 → bar spans centerY+0 to centerY+0.3*iconSize.
+    private const float BaseActionAnimationLockSec = 0.50f;
+    private const float AssumedAnimationLockLatencySec = 0.02f;
     private const float GCDHeightHigh  = 0.5f;
     private const float GCDHeightLow   = 0.8f;
-    // OGCDOffset: fraction of GCD icon size above center the oGCD sits.
-    private const float OGCDOffset     = 0.1f;
     // GCD window duration (no live cast data available, use the standard 2.5 s).
     private const float GCDWindowSec   = 2.5f;
     // oGCD animlock window (shorter bar for oGCDs).
-    private const float OGCDWindowSec  = 0.8f;
+    private const float OGCDWindowSec  = BaseActionAnimationLockSec + AssumedAnimationLockLatencySec;
+    private const double OverlayMinOgcdVisualGapSec = 0.8;
     // Rounding radius for bars (matches ATR GCDRound default ~4).
     private const float BarRound       = 4.0f;
     // Gap between stacked icons in the same bucket.
@@ -102,6 +103,15 @@ public sealed class OverlayWindow : Window, IDisposable
     private double   previewManualTimeSec;
     private bool     isScrubbing;
 
+    private AggregatedTimeline?      embeddedPreviewTimeline;
+    private string                   embeddedPreviewTimelineKey = string.Empty;
+    private readonly Dictionary<int, bool> embeddedSkillVisibility = [];
+    private bool                     embeddedPreviewAutoplay;
+    private DateTime                 embeddedPreviewStartTime;
+    private double                   embeddedPreviewElapsedSec;
+    private double                   embeddedPreviewManualTimeSec;
+    private bool                     embeddedPreviewIsScrubbing;
+
     // ── Timeline data ──
     private AggregatedTimeline?      activeTimeline;
     private string                   activeTimelineKey = string.Empty;
@@ -112,6 +122,21 @@ public sealed class OverlayWindow : Window, IDisposable
     private readonly ConcurrentDictionary<int, bool> oGcdCache = new();
 
     private Configuration Cfg => plugin.Configuration;
+
+    private sealed class OverlayGcdBucket
+    {
+        public float X { get; init; }
+        public bool IsPast { get; init; }
+        public List<TimelineEntry> Entries { get; init; } = [];
+    }
+
+    private sealed class OverlayOgcdPlacement
+    {
+        public required TimelineEntry Entry { get; init; }
+        public double DisplayTimeSec { get; set; }
+        public float X { get; set; }
+        public bool IsPast { get; set; }
+    }
 
     // ═══════════════════════════════════════════════════════════════════
 
@@ -138,15 +163,20 @@ public sealed class OverlayWindow : Window, IDisposable
 
         SizeConstraints = new WindowSizeConstraints
         {
-            MinimumSize = new Vector2(300,  60),
+            MinimumSize = new Vector2(300, 128),
             MaximumSize = new Vector2(float.MaxValue, 400),
         };
+        Size = new Vector2(
+            MathF.Max(1280f, plugin.Configuration.OverlayPixelsPerSec * 18f),
+            MathF.Max(164f, plugin.Configuration.OverlayIconSize * 2.6f + 42f));
+        SizeCondition = ImGuiCond.FirstUseEver;
     }
 
     // ── Public API ──────────────────────────────────────────────────────
 
     /// <summary>True when a timeline is loaded and ready to display.</summary>
     public bool HasActiveTimeline => activeTimeline != null;
+    public bool IsEmbeddedPreviewScrubbing => embeddedPreviewIsScrubbing;
 
     public bool CanManageAbilityAnts()
         => Cfg.AntsEnabled &&
@@ -170,15 +200,27 @@ public sealed class OverlayWindow : Window, IDisposable
 
         if (timeline != null)
         {
-            var hidden = plugin.Configuration.HiddenAbilities.GetValueOrDefault(key);
-            foreach (var id in timeline.Entries.Select(e => e.AbilityId).Distinct())
-                skillVisibility[id] = hidden == null || !hidden.Contains(id);
-
-            // Pre-classify every entry as GCD or oGCD once at load time so per-frame
-            // loops can use the cached flag instead of re-querying RecastDatabase.
-            foreach (var e in timeline.Entries)
-                e.IsGcd = !IsOGCD(e.AbilityId, e.AbilityName);
+            PopulateTimelineVisibility(timeline, key, skillVisibility);
+            ClassifyTimelineEntries(timeline);
         }
+    }
+
+    private void PopulateTimelineVisibility(
+        AggregatedTimeline timeline,
+        string key,
+        Dictionary<int, bool> target)
+    {
+        target.Clear();
+
+        var hidden = plugin.Configuration.HiddenAbilities.GetValueOrDefault(key);
+        foreach (var id in timeline.Entries.Select(e => e.AbilityId).Distinct())
+            target[id] = hidden == null || !hidden.Contains(id);
+    }
+
+    private void ClassifyTimelineEntries(AggregatedTimeline timeline)
+    {
+        foreach (var e in timeline.Entries)
+            e.IsGcd = !IsOGCD(e.AbilityId, e.AbilityName);
     }
 
     public void StartPreview(AggregatedTimeline timeline)
@@ -209,6 +251,55 @@ public sealed class OverlayWindow : Window, IDisposable
         isScrubbing          = false;
         isEncounterZone      = false;
         IsOpen               = false;
+    }
+
+    public void ResetEmbeddedPreview()
+    {
+        embeddedPreviewTimeline      = null;
+        embeddedPreviewTimelineKey   = string.Empty;
+        embeddedSkillVisibility.Clear();
+        embeddedPreviewAutoplay      = false;
+        embeddedPreviewElapsedSec    = 0;
+        embeddedPreviewManualTimeSec = 0;
+        embeddedPreviewIsScrubbing   = false;
+    }
+
+    public bool DrawEmbeddedPreview(AggregatedTimeline timeline, Vector2 size, string childId)
+    {
+        EnsureEmbeddedPreviewTimeline(timeline);
+
+        if (!ImGui.BeginChild(childId, size, true,
+                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse))
+        {
+            ImGui.EndChild();
+            return true;
+        }
+
+        var keepOpen = embeddedPreviewTimeline == null || DrawEmbeddedPreviewContents(embeddedPreviewTimeline);
+
+        ImGui.EndChild();
+        return keepOpen;
+    }
+
+    private void EnsureEmbeddedPreviewTimeline(AggregatedTimeline timeline)
+    {
+        var key = TimelineDatabase.MakeKey(timeline.EncounterId, timeline.SpecName);
+        if (ReferenceEquals(embeddedPreviewTimeline, timeline) &&
+            string.Equals(embeddedPreviewTimelineKey, key, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        embeddedPreviewTimeline    = timeline;
+        embeddedPreviewTimelineKey = key;
+        PopulateTimelineVisibility(timeline, key, embeddedSkillVisibility);
+        ClassifyTimelineEntries(timeline);
+
+        embeddedPreviewAutoplay      = false;
+        embeddedPreviewStartTime     = DateTime.UtcNow;
+        embeddedPreviewElapsedSec    = 0;
+        embeddedPreviewManualTimeSec = 0;
+        embeddedPreviewIsScrubbing   = false;
     }
 
     /// <summary>
@@ -259,6 +350,8 @@ public sealed class OverlayWindow : Window, IDisposable
     public bool IsAbilityInAntsWindow(int abilityId)
     {
         if (!CanManageAbilityAnts()) return false;
+        var timeline = activeTimeline;
+        if (timeline == null) return false;
 
         // Compute elapsed time fresh so the hook (game thread) stays in sync with
         // the red line regardless of when the last Draw() frame ran.
@@ -272,16 +365,23 @@ public sealed class OverlayWindow : Window, IDisposable
 
             var before        = (double)Cfg.AntsDurationBefore;
             var after         = (double)Cfg.AntsDurationAfter;
-            // oGCD visual positions are shifted by OGCDHorizontalOffset pixels.
-            var ogcdTimeDelta = Cfg.OverlayPixelsPerSec > 0f
-                ? (double)Cfg.OGCDHorizontalOffset / (double)Cfg.OverlayPixelsPerSec
-                : 0.0;
+            var visibleEntries = timeline.Entries
+                .Where(e => !e.IsGcd)
+                .Where(e => e.AbilityId == abilityId)
+                .Where(e => skillVisibility.GetValueOrDefault(e.AbilityId, true))
+                .Where(e => e.Frequency >= GetAbilityThreshold(e.AbilityId))
+                .OrderBy(e => e.TimeOffsetSec)
+                .ToList();
+            var placements = BuildOverlayOgcdPlacements(
+                visibleEntries,
+                elapsed,
+                0f,
+                Math.Max(Cfg.OverlayPixelsPerSec, 1f),
+                Cfg.OverlayMaxStackedIcons);
 
-            foreach (var e in activeTimeline.Entries)
+            foreach (var placement in placements)
             {
-                if (e.AbilityId != abilityId) continue;
-                if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
-                var rel = (e.TimeOffsetSec + ogcdTimeDelta) - elapsed;
+                var rel = placement.DisplayTimeSec - elapsed;
                 if (rel >= -after && rel <= before) return true;
             }
             return false;
@@ -296,9 +396,10 @@ public sealed class OverlayWindow : Window, IDisposable
             // GCDs: exactly one glows — the entry closest to the red line.
             Data.TimelineEntry? bestGcd = null;
             var minAbsRel = double.MaxValue;
-            foreach (var e in activeTimeline.Entries)
+            foreach (var e in timeline.Entries)
             {
                 if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
+                if (!skillVisibility.GetValueOrDefault(e.AbilityId, true)) continue;
                 if (!e.IsGcd) continue;
                 var rel = e.TimeOffsetSec - elapsed;
                 if (rel < -after || rel > before) continue;
@@ -318,6 +419,8 @@ public sealed class OverlayWindow : Window, IDisposable
         var gcd  = new HashSet<int>();
         var ogcd = new HashSet<int>();
         if (!CanManageAbilityAnts()) return (gcd, ogcd);
+        var timeline = activeTimeline;
+        if (timeline == null) return (gcd, ogcd);
 
         var elapsed = inCombat
             ? (DateTime.UtcNow - combatStartTime).TotalSeconds
@@ -328,16 +431,23 @@ public sealed class OverlayWindow : Window, IDisposable
         {
             var before        = (double)Cfg.AntsDurationBefore;
             var after         = (double)Cfg.AntsDurationAfter;
-            var ogcdTimeDelta = Cfg.OverlayPixelsPerSec > 0f
-                ? (double)Cfg.OGCDHorizontalOffset / (double)Cfg.OverlayPixelsPerSec
-                : 0.0;
+            var visibleEntries = timeline.Entries
+                .Where(e => !e.IsGcd)
+                .Where(e => skillVisibility.GetValueOrDefault(e.AbilityId, true))
+                .Where(e => e.Frequency >= GetAbilityThreshold(e.AbilityId))
+                .OrderBy(e => e.TimeOffsetSec)
+                .ToList();
+            var placements = BuildOverlayOgcdPlacements(
+                visibleEntries,
+                elapsed,
+                0f,
+                Math.Max(Cfg.OverlayPixelsPerSec, 1f),
+                Cfg.OverlayMaxStackedIcons);
 
-            foreach (var e in activeTimeline.Entries)
+            foreach (var placement in placements)
             {
-                if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
-                if (e.IsGcd) continue;
-                var rel = (e.TimeOffsetSec + ogcdTimeDelta) - elapsed;
-                if (rel >= -after && rel <= before) ogcd.Add(e.AbilityId);
+                var rel = placement.DisplayTimeSec - elapsed;
+                if (rel >= -after && rel <= before) ogcd.Add(placement.Entry.AbilityId);
             }
         }
 
@@ -349,9 +459,10 @@ public sealed class OverlayWindow : Window, IDisposable
 
             Data.TimelineEntry? bestGcd = null;
             var minAbsRel = double.MaxValue;
-            foreach (var e in activeTimeline.Entries)
+            foreach (var e in timeline.Entries)
             {
                 if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
+                if (!skillVisibility.GetValueOrDefault(e.AbilityId, true)) continue;
                 if (!e.IsGcd) continue;
                 var rel = e.TimeOffsetSec - elapsed;
                 if (rel < -after || rel > before) continue;
@@ -764,7 +875,9 @@ public sealed class OverlayWindow : Window, IDisposable
         // Vertical center of the timeline (ATR centers all items here)
         var centerY = tlTop + tlH / 2f;
 
-        // oGCD size and center Y — driven by config so the user can dial them in
+        // oGCD size and center Y — follow ATR's presentation more closely:
+        // smaller icons that sit above the center line, while still sharing
+        // the same horizontal timing space as GCDs.
         var oGcdSize    = iconSize * Cfg.OGCDSizeRatio;
         var oGcdCenterY = centerY - (Cfg.OGCDVerticalOffset * iconSize + oGcdSize / 2f);
 
@@ -816,19 +929,6 @@ public sealed class OverlayWindow : Window, IDisposable
             new Vector2(nowX, tlBot),
             ImGui.GetColorU32(ColNowLine), 2.0f);
 
-        // ── oGCD "now" indicator — shifted by OGCDHorizontalOffset ────
-        // oGCD icons are rendered OGCDHorizontalOffset pixels to the right of their
-        // "true" time position, so the effective crossing point for oGCDs is at this line.
-        if (Cfg.OGCDHorizontalOffset != 0f)
-        {
-            var ogcdNowX = nowX + Cfg.OGCDHorizontalOffset;
-            if (ogcdNowX >= tlLeft && ogcdNowX <= tlRight)
-                drawList.AddLine(
-                    new Vector2(ogcdNowX, oGcdCenterY - oGcdSize * 0.6f),
-                    new Vector2(ogcdNowX, oGcdCenterY + oGcdSize * 0.6f),
-                    ImGui.GetColorU32(new Vector4(1.00f, 0.70f, 0.20f, 0.60f)), 1.5f);
-        }
-
         // ── Idle message ──────────────────────────────────────────────
         if (!isActive)
         {
@@ -841,44 +941,55 @@ public sealed class OverlayWindow : Window, IDisposable
         else
         {
             // ── Collect and bucket visible entries ────────────────────
-            var buckets = activeTimeline.Entries
+            var visibleEntries = TimelineJobRules.ApplyPostSelectionRules(
+                    activeTimeline.SpecName,
+                    activeTimeline.Entries,
+                    promoteMacrocosmosToVisualGcd: true)
                 .Where(e => e.TimeOffsetSec >= visStart - 5 && e.TimeOffsetSec <= visEnd + 5)
                 .Where(e => skillVisibility.GetValueOrDefault(e.AbilityId, true))
                 .Where(e => e.Frequency >= GetAbilityThreshold(e.AbilityId))
+                .OrderBy(e => e.TimeOffsetSec)
+                .ThenByDescending(e => e.Frequency)
+                .ToList();
+            var gcdWindowSec = GCDWindowSec;
+            var gcdBuckets = visibleEntries
+                .Where(e => e.IsGcd)
                 .GroupBy(e => e.TimeOffsetSec)
                 .OrderBy(g => g.Key)
-                .Select(g =>
+                .Select(g => new OverlayGcdBucket
                 {
-                    var sorted  = g.OrderByDescending(e => e.Frequency).Take(maxStack).ToList();
-                    var x       = nowX + (float)(g.Key - combatElapsedSec) * pxPerSec;
-                    var isPast  = g.Key < combatElapsedSec;
-                    var gcds    = sorted.Where(e => e.IsGcd).Take(1).ToList();
-                    var ogcds   = sorted.Where(e => !e.IsGcd).ToList();
-                    return (x, isPast, gcds, ogcds);
+                    X = nowX + (float)(g.Key - combatElapsedSec) * pxPerSec,
+                    IsPast = g.Key < combatElapsedSec,
+                    Entries = g.OrderByDescending(e => e.Frequency).Take(maxStack).ToList(),
                 })
                 .ToList();
+            var ogcdPlacements = BuildOverlayOgcdPlacements(
+                visibleEntries,
+                combatElapsedSec,
+                nowX,
+                pxPerSec,
+                maxStack);
 
             // ══════════════════════════════════════════════════════════
             // PASS 1 — TimelineLayer.General
             // Draw horizontal bars for every GCD and oGCD.
             // ATR draws: Background → AnimLock (skipped: no data) → Cast fill → Border
             // ══════════════════════════════════════════════════════════
-            foreach (var (x, isPast, gcds, ogcds) in buckets)
+            foreach (var bucket in gcdBuckets)
             {
                 // ── GCD bars ──
-                for (var i = 0; i < gcds.Count; i++)
+                for (var i = 0; i < bucket.Entries.Count; i++)
                 {
-                    var e        = gcds[i];
-                    var alpha    = (float)Math.Clamp(e.Frequency, 0.30, 1.0);
-                    if (isPast) alpha *= pastAlpha;
+                    var e        = bucket.Entries[i];
+                    var alpha    = bucket.IsPast ? pastAlpha : 1.0f;
                     if (alpha < 0.01f) continue;
                     var barAlpha = alpha * bgOpacity;
 
                     // Icon center X for this stacked GCD
-                    var cx   = x - i * (iconSize + IconGap);
+                    var cx   = bucket.X - i * (iconSize + IconGap);
                     // ATR: bar starts at centerPos + iconSize/2 in time direction (right)
                     var barL = MathF.Max(cx + iconSize / 2f, tlLeft);
-                    var barR = MathF.Min(cx + iconSize / 2f + GCDWindowSec * pxPerSec, tlRight);
+                    var barR = MathF.Min(cx + iconSize / 2f + gcdWindowSec * pxPerSec, tlRight);
                     if (barR <= barL) continue;
 
                     if (barAlpha >= 0.01f)
@@ -905,76 +1016,30 @@ public sealed class OverlayWindow : Window, IDisposable
                     }
                 }
 
-                // ── oGCD bars ──
-                for (var i = 0; i < ogcds.Count; i++)
+                // Each GCD bucket now shares a single unified action lane with the
+                // oGCD icons, so no special per-bucket oGCD pass lives here anymore.
+            }
+
+            foreach (var bucket in gcdBuckets)
+            {
+                for (var i = 0; i < bucket.Entries.Count; i++)
                 {
-                    var e        = ogcds[i];
-                    var alpha    = (float)Math.Clamp(e.Frequency, 0.30, 1.0);
-                    if (isPast) alpha *= pastAlpha;
-                    if (alpha < 0.01f) continue;
-                    var barAlpha = alpha * bgOpacity;
-
-                    var cx = x - i * (oGcdSize + IconGap) + Cfg.OGCDHorizontalOffset;
-                    var barL = MathF.Max(cx + oGcdSize / 2f, tlLeft);
-                    var barR = MathF.Min(cx + oGcdSize / 2f + OGCDWindowSec * pxPerSec, tlRight);
-                    if (barR <= barL) continue;
-
-                    // Apply same height formula to oGCD, relative to oGcdCenterY
-                    var oBarTop = oGcdCenterY + GCDHeightHigh * oGcdSize - oGcdSize / 2f;
-                    var oBarBot = oGcdCenterY + GCDHeightLow  * oGcdSize - oGcdSize / 2f;
-
-                    if (barAlpha >= 0.01f)
-                    {
-                        drawList.AddRectFilled(
-                            new Vector2(barL, oBarTop),
-                            new Vector2(barR, oBarBot),
-                            MulAlpha(ColOGCDBackground, barAlpha), 2f);
-
-                        var castR = barL + (barR - barL) * 0.45f;
-                        drawList.AddRectFilled(
-                            new Vector2(barL, oBarTop),
-                            new Vector2(castR, oBarBot),
-                            MulAlpha(ColOGCDCast, barAlpha), 2f);
-
-                        drawList.AddRect(
-                            new Vector2(barL, oBarTop),
-                            new Vector2(barR, oBarBot),
-                            MulAlpha(ColOGCDBorder, barAlpha),
-                            2f, ImDrawFlags.RoundCornersAll, 1.0f);
-                    }
+                    var e   = bucket.Entries[i];
+                    var cx  = bucket.X - i * (iconSize + IconGap);
+                    var pos = new Vector2(cx - iconSize / 2f, centerY - iconSize / 2f);
+                    DrawIcon(drawList, e, pos, iconSize, bucket.IsPast, pastAlpha, combatElapsedSec);
                 }
             }
 
-            // ══════════════════════════════════════════════════════════
-            // PASS 2 — TimelineLayer.Icon
-            // Draw icons on top of the bars.
-            // ATR: pos = centerPos - iconSize/2 * RealDownDirection
-            //   → icon top-left = (cx - iconSize/2, centerY - iconSize/2)
-            // ══════════════════════════════════════════════════════════
-            foreach (var (x, isPast, gcds, ogcds) in buckets)
+            foreach (var placement in ogcdPlacements)
             {
-                // GCDs — icon straddles the center line
-                for (var i = 0; i < gcds.Count; i++)
-                {
-                    var e   = gcds[i];
-                    var cx  = x - i * (iconSize + IconGap);
-                    var pos = new Vector2(cx - iconSize / 2f, centerY - iconSize / 2f);
-                    DrawIcon(drawList, e, pos, iconSize, isPast, pastAlpha, combatElapsedSec);
-                }
-
-                // oGCDs — icon straddles oGcdCenterY (above the center line)
-                for (var i = 0; i < ogcds.Count; i++)
-                {
-                    var e   = ogcds[i];
-                    var cx  = x - i * (oGcdSize + IconGap) + Cfg.OGCDHorizontalOffset;
-                    var pos = new Vector2(cx - oGcdSize / 2f, oGcdCenterY - oGcdSize / 2f);
-                    DrawIcon(drawList, e, pos, oGcdSize, isPast, pastAlpha, combatElapsedSec);
-                }
+                var pos = new Vector2(placement.X - oGcdSize / 2f, oGcdCenterY - oGcdSize / 2f);
+                DrawIcon(drawList, placement.Entry, pos, oGcdSize, placement.IsPast, pastAlpha, combatElapsedSec);
             }
         }
 
         // ══════════════════════════════════════════════════════════════
-        // BOSS CAST STRIP — anchored to bottom, always 100% opacity
+        // BOSS CAST STRIP — anchored to bottom
         // ══════════════════════════════════════════════════════════════
         if (hasBoss)
         {
@@ -1008,11 +1073,13 @@ public sealed class OverlayWindow : Window, IDisposable
                 if (endX < tlLeft || startX > tlRight) continue;
                 var dL = MathF.Max(startX, tlLeft);
                 var dR = MathF.Min(endX,   tlRight);
+                var isPastBoss = boss.CastEndSec < combatElapsedSec;
+                var bossAlpha = isPastBoss ? pastAlpha : 1.0f;
+                if (bossAlpha < 0.01f) continue;
 
-                // Always 100% opacity
                 drawList.AddRectFilled(
                     new Vector2(dL, bBarMinY), new Vector2(dR, bBarMaxY),
-                    BossAbilityColor(boss.AbilityId), 2.0f);
+                    BossAbilityColor(boss.AbilityId, bossAlpha), 2.0f);
 
                 // Name text
                 var castW = dR - dL;
@@ -1024,7 +1091,7 @@ public sealed class OverlayWindow : Window, IDisposable
                         var lsz = ImGui.CalcTextSize(lbl);
                         drawList.AddText(
                             new Vector2(dL + 3f, bCenY - lsz.Y / 2f),
-                            ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 1.0f)), lbl);
+                            ImGui.GetColorU32(new Vector4(1f, 1f, 1f, bossAlpha)), lbl);
                     }
                 }
 
@@ -1050,11 +1117,423 @@ public sealed class OverlayWindow : Window, IDisposable
     // PASS 2 ICON HELPER
     // ═══════════════════════════════════════════════════════════════════
 
+    private bool DrawEmbeddedPreviewContents(AggregatedTimeline timeline)
+    {
+        var pxPerSec   = Cfg.OverlayPixelsPerSec;
+        var iconSize   = Cfg.OverlayIconSize;
+        var pastAlpha  = Cfg.OverlayPastAlpha;
+        var bgOpacity  = Cfg.OverlayBgOpacity;
+        var showGrid   = Cfg.OverlayShowGrid;
+        var timeBehind = Cfg.OverlayTimeBehind;
+        var maxStack   = Cfg.OverlayMaxStackedIcons;
+        var fightDur   = timeline.AverageDurationMs / 1000.0;
+
+        if (embeddedPreviewAutoplay)
+        {
+            embeddedPreviewElapsedSec = (DateTime.UtcNow - embeddedPreviewStartTime).TotalSeconds;
+            if (fightDur > 0 && embeddedPreviewElapsedSec > fightDur + 5)
+            {
+                embeddedPreviewStartTime = DateTime.UtcNow;
+                embeddedPreviewElapsedSec = 0;
+            }
+
+            embeddedPreviewManualTimeSec = embeddedPreviewElapsedSec;
+        }
+        else
+        {
+            embeddedPreviewElapsedSec = embeddedPreviewManualTimeSec;
+        }
+
+        var drawList = ImGui.GetWindowDrawList();
+        var wPos     = ImGui.GetWindowPos();
+        var wSize    = ImGui.GetWindowSize();
+
+        drawList.AddRectFilled(wPos, wPos + wSize,
+            ImGui.GetColorU32(new Vector4(0.06f, 0.06f, 0.10f, bgOpacity)), 4.0f);
+
+        var scrubH = 0.0f;
+        if (fightDur > 0)
+        {
+            const float btnH   = 18.0f;
+            const float btnW   = 18.0f;
+            const float margin = 4.0f;
+            const float btnGap = 3.0f;
+            const float trackH = 6.0f;
+
+            var sTop   = wPos.Y + 3f;
+            var midY   = sTop + btnH / 2f;
+            var playX  = wPos.X + margin;
+            var closeX = wPos.X + wSize.X - margin - btnW;
+            var trackL = playX + btnW + btnGap;
+            var trackR = closeX - btnGap;
+            var trackW = MathF.Max(trackR - trackL, 1f);
+            var frac   = (float)Math.Clamp(embeddedPreviewElapsedSec / fightDur, 0.0, 1.0);
+
+            drawList.AddRectFilled(
+                new Vector2(trackL, midY - trackH / 2f),
+                new Vector2(trackR, midY + trackH / 2f),
+                ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.10f)), 3f);
+
+            if (frac > 0)
+            {
+                drawList.AddRectFilled(
+                    new Vector2(trackL, midY - trackH / 2f),
+                    new Vector2(trackL + trackW * frac, midY + trackH / 2f),
+                    ImGui.GetColorU32(new Vector4(0.40f, 0.70f, 1.00f, 0.55f)), 3f);
+            }
+
+            drawList.AddCircleFilled(
+                new Vector2(trackL + trackW * frac, midY),
+                5.0f,
+                ImGui.GetColorU32(new Vector4(0.65f, 0.88f, 1.00f, 0.95f)));
+
+            var timeLabel = FormatTime(embeddedPreviewElapsedSec) + " / " + FormatTime(fightDur);
+            var labelSz   = ImGui.CalcTextSize(timeLabel);
+            drawList.AddText(
+                new Vector2(trackR - labelSz.X, sTop + btnH + 1f),
+                ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.35f)),
+                timeLabel);
+
+            var savedCursorPos = ImGui.GetCursorScreenPos();
+
+            var playTL    = new Vector2(playX, sTop);
+            var playBR    = new Vector2(playX + btnW, sTop + btnH);
+            ImGui.SetCursorScreenPos(playTL);
+            ImGui.InvisibleButton("##EmbeddedPreviewPlay", playBR - playTL);
+            var playHover = ImGui.IsItemHovered();
+            var playPressed = ImGui.IsItemClicked(ImGuiMouseButton.Left);
+
+            drawList.AddRectFilled(playTL, playBR,
+                ImGui.GetColorU32(playHover
+                    ? new Vector4(0.30f, 0.65f, 1.00f, 0.90f)
+                    : new Vector4(0.15f, 0.35f, 0.65f, 0.72f)), 3f);
+
+            if (embeddedPreviewAutoplay)
+            {
+                var bw  = 2.5f;
+                var bh  = btnH * 0.55f;
+                var cx2 = playX + btnW / 2f;
+                var ty  = midY - bh / 2f;
+                drawList.AddRectFilled(
+                    new Vector2(cx2 - bw * 2f, ty),
+                    new Vector2(cx2 - bw * 0.5f, ty + bh),
+                    ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.95f)));
+                drawList.AddRectFilled(
+                    new Vector2(cx2 + bw * 0.5f, ty),
+                    new Vector2(cx2 + bw * 2f, ty + bh),
+                    ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.95f)));
+            }
+            else
+            {
+                var th  = btnH * 0.55f;
+                var cx2 = playX + btnW / 2f - 1f;
+                drawList.AddTriangleFilled(
+                    new Vector2(cx2 - th * 0.4f, midY - th / 2f),
+                    new Vector2(cx2 - th * 0.4f, midY + th / 2f),
+                    new Vector2(cx2 + th * 0.6f, midY),
+                    ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.95f)));
+            }
+
+            if (playPressed)
+            {
+                if (embeddedPreviewAutoplay)
+                {
+                    embeddedPreviewAutoplay = false;
+                    embeddedPreviewManualTimeSec = embeddedPreviewElapsedSec;
+                }
+                else
+                {
+                    embeddedPreviewAutoplay = true;
+                    embeddedPreviewStartTime = DateTime.UtcNow - TimeSpan.FromSeconds(embeddedPreviewManualTimeSec);
+                }
+            }
+
+            var closeTL    = new Vector2(closeX, sTop);
+            var closeBR    = new Vector2(closeX + btnW, sTop + btnH);
+            ImGui.SetCursorScreenPos(closeTL);
+            ImGui.InvisibleButton("##EmbeddedPreviewClose", closeBR - closeTL);
+            var closeHover = ImGui.IsItemHovered();
+            var closePressed = ImGui.IsItemClicked(ImGuiMouseButton.Left);
+
+            drawList.AddRectFilled(closeTL, closeBR,
+                ImGui.GetColorU32(closeHover
+                    ? new Vector4(0.85f, 0.20f, 0.20f, 0.92f)
+                    : new Vector4(0.50f, 0.10f, 0.10f, 0.72f)), 3f);
+
+            var xLbl = "x";
+            var xSz  = ImGui.CalcTextSize(xLbl);
+            drawList.AddText(
+                new Vector2(closeX + (btnW - xSz.X) / 2f, sTop + (btnH - xSz.Y) / 2f),
+                ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.95f)),
+                xLbl);
+
+            if (closePressed)
+            {
+                ResetEmbeddedPreview();
+                return false;
+            }
+
+            var barTL = new Vector2(trackL, midY - trackH / 2f - 4f);
+            var barBR = new Vector2(trackR, midY + trackH / 2f + 4f);
+            ImGui.SetCursorScreenPos(barTL);
+            ImGui.InvisibleButton("##EmbeddedPreviewScrubBar", barBR - barTL);
+            var scrubActive = ImGui.IsItemActive();
+
+            embeddedPreviewIsScrubbing = scrubActive;
+            if (scrubActive)
+            {
+                var mfrac = Math.Clamp((ImGui.GetMousePos().X - trackL) / trackW, 0.0, 1.0);
+                embeddedPreviewElapsedSec = mfrac * fightDur;
+                embeddedPreviewAutoplay = false;
+                embeddedPreviewManualTimeSec = embeddedPreviewElapsedSec;
+            }
+
+            ImGui.SetCursorScreenPos(savedCursorPos);
+
+            if (ImGui.IsWindowHovered())
+            {
+                var wheel = ImGui.GetIO().MouseWheel;
+                if (MathF.Abs(wheel) > 0.01f)
+                {
+                    embeddedPreviewElapsedSec = Math.Clamp(embeddedPreviewElapsedSec - wheel * 2.0, 0.0, fightDur);
+                    embeddedPreviewAutoplay = false;
+                    embeddedPreviewManualTimeSec = embeddedPreviewElapsedSec;
+                }
+            }
+
+            scrubH = btnH + labelSz.Y + 5f;
+        }
+
+        var hasBoss    = timeline.BossEntries.Count > 0;
+        var bossStripH = hasBoss ? 26.0f : 0.0f;
+        var tlTop      = wPos.Y + scrubH + 2f;
+        var tlBot      = wPos.Y + wSize.Y - bossStripH - 2f;
+        var tlLeft     = wPos.X + 2f;
+        var tlRight    = wPos.X + wSize.X - 2f;
+        var tlH        = tlBot - tlTop;
+        var tlW        = tlRight - tlLeft;
+
+        if (tlH < 16f || tlW < 50f)
+            return true;
+
+        var nowX        = tlLeft + timeBehind * pxPerSec;
+        var centerY     = tlTop + tlH / 2f;
+        var oGcdSize    = iconSize * Cfg.OGCDSizeRatio;
+        var oGcdCenterY = centerY - (Cfg.OGCDVerticalOffset * iconSize + oGcdSize / 2f);
+        var gcdBarTop   = centerY + GCDHeightHigh * iconSize - iconSize / 2f;
+        var gcdBarBot   = centerY + GCDHeightLow * iconSize - iconSize / 2f;
+        var visStart    = embeddedPreviewElapsedSec - (nowX - tlLeft) / pxPerSec;
+        var visEnd      = embeddedPreviewElapsedSec + (tlRight - nowX) / pxPerSec;
+
+        if (showGrid)
+        {
+            for (var t = Math.Ceiling(visStart); t <= visEnd; t += 1.0)
+            {
+                if (t < 0)
+                    continue;
+
+                var gx = nowX + (float)(t - embeddedPreviewElapsedSec) * pxPerSec;
+                if (gx < tlLeft || gx > tlRight)
+                    continue;
+
+                var major = (int)t % 5 == 0;
+                drawList.AddLine(
+                    new Vector2(gx, tlTop),
+                    new Vector2(gx, tlBot),
+                    ImGui.GetColorU32(major ? ColGridMajor : ColGrid),
+                    major ? 1.5f : 1.0f);
+
+                if (major)
+                {
+                    var lbl = FormatTimeShort(t);
+                    var lsz = ImGui.CalcTextSize(lbl);
+                    drawList.AddText(
+                        new Vector2(gx - lsz.X / 2f, tlTop + 1f),
+                        ImGui.GetColorU32(ColGridLabel),
+                        lbl);
+                }
+            }
+        }
+
+        drawList.AddLine(
+            new Vector2(tlLeft, centerY),
+            new Vector2(tlRight, centerY),
+            ImGui.GetColorU32(ColCenterLine),
+            1.0f);
+
+        drawList.AddLine(
+            new Vector2(nowX, tlTop),
+            new Vector2(nowX, tlBot),
+            ImGui.GetColorU32(ColNowLine),
+            2.0f);
+
+        var visibleEntries = TimelineJobRules.ApplyPostSelectionRules(
+                timeline.SpecName,
+                timeline.Entries,
+                promoteMacrocosmosToVisualGcd: true)
+            .Where(e => e.TimeOffsetSec >= visStart - 5 && e.TimeOffsetSec <= visEnd + 5)
+            .Where(e => embeddedSkillVisibility.GetValueOrDefault(e.AbilityId, true))
+            .Where(e => e.Frequency >= GetAbilityThreshold(timeline, e.AbilityId))
+            .OrderBy(e => e.TimeOffsetSec)
+            .ThenByDescending(e => e.Frequency)
+            .ToList();
+        var gcdWindowSec = GCDWindowSec;
+        var gcdBuckets = visibleEntries
+            .Where(e => e.IsGcd)
+            .GroupBy(e => e.TimeOffsetSec)
+            .OrderBy(g => g.Key)
+            .Select(g => new OverlayGcdBucket
+            {
+                X = nowX + (float)(g.Key - embeddedPreviewElapsedSec) * pxPerSec,
+                IsPast = g.Key < embeddedPreviewElapsedSec,
+                Entries = g.OrderByDescending(e => e.Frequency).Take(maxStack).ToList(),
+            })
+            .ToList();
+        var ogcdPlacements = BuildOverlayOgcdPlacements(
+            visibleEntries,
+            embeddedPreviewElapsedSec,
+            nowX,
+            pxPerSec,
+            maxStack);
+
+        foreach (var bucket in gcdBuckets)
+        {
+            for (var i = 0; i < bucket.Entries.Count; i++)
+            {
+                var alpha = bucket.IsPast ? pastAlpha : 1.0f;
+                if (alpha < 0.01f)
+                    continue;
+
+                var barAlpha = alpha * bgOpacity;
+                var cx       = bucket.X - i * (iconSize + IconGap);
+                var barL     = MathF.Max(cx + iconSize / 2f, tlLeft);
+                var barR     = MathF.Min(cx + iconSize / 2f + gcdWindowSec * pxPerSec, tlRight);
+                if (barR <= barL)
+                    continue;
+
+                drawList.AddRectFilled(
+                    new Vector2(barL, gcdBarTop),
+                    new Vector2(barR, gcdBarBot),
+                    MulAlpha(ColGCDBackground, barAlpha),
+                    BarRound);
+
+                var castR = barL + (barR - barL) * 0.45f;
+                drawList.AddRectFilled(
+                    new Vector2(barL, gcdBarTop),
+                    new Vector2(castR, gcdBarBot),
+                    MulAlpha(ColGCDCast, barAlpha),
+                    BarRound);
+
+                drawList.AddRect(
+                    new Vector2(barL, gcdBarTop),
+                    new Vector2(barR, gcdBarBot),
+                    MulAlpha(ColGCDBorder, barAlpha),
+                    BarRound,
+                    ImDrawFlags.RoundCornersAll,
+                    1.0f);
+            }
+        }
+
+        foreach (var bucket in gcdBuckets)
+        {
+            for (var i = 0; i < bucket.Entries.Count; i++)
+            {
+                var e   = bucket.Entries[i];
+                var cx  = bucket.X - i * (iconSize + IconGap);
+                var pos = new Vector2(cx - iconSize / 2f, centerY - iconSize / 2f);
+                DrawIcon(drawList, e, pos, iconSize, bucket.IsPast, pastAlpha, embeddedPreviewElapsedSec);
+            }
+        }
+
+        foreach (var placement in ogcdPlacements)
+        {
+            var pos = new Vector2(placement.X - oGcdSize / 2f, oGcdCenterY - oGcdSize / 2f);
+            DrawIcon(drawList, placement.Entry, pos, oGcdSize, placement.IsPast, pastAlpha, embeddedPreviewElapsedSec);
+        }
+
+        if (!hasBoss)
+            return true;
+
+        var bTop     = wPos.Y + wSize.Y - bossStripH - 2f;
+        var bBot     = wPos.Y + wSize.Y - 2f;
+        var bH       = bBot - bTop;
+        var bThick   = bH * 0.65f;
+        var bCenY    = bTop + bH / 2f;
+        var bBarMinY = bCenY - bThick / 2f;
+        var bBarMaxY = bCenY + bThick / 2f;
+
+        drawList.AddRectFilled(
+            new Vector2(tlLeft, bTop),
+            new Vector2(tlRight, bBot),
+            ImGui.GetColorU32(new Vector4(0.15f, 0.03f, 0.03f, bgOpacity)));
+        drawList.AddLine(
+            new Vector2(tlLeft, bTop),
+            new Vector2(tlRight, bTop),
+            ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.18f)));
+        drawList.AddText(
+            new Vector2(tlLeft + 3f, bTop + (bH - ImGui.GetTextLineHeight()) / 2f),
+            ImGui.GetColorU32(new Vector4(1f, 0.50f, 0.50f, 0.70f)),
+            "Boss");
+
+        foreach (var boss in timeline.BossEntries)
+        {
+            var startX = nowX + (float)(boss.CastStartSec - embeddedPreviewElapsedSec) * pxPerSec;
+            var endX   = nowX + (float)(boss.CastEndSec - embeddedPreviewElapsedSec) * pxPerSec;
+            if (endX - startX < 3f)
+                endX = startX + 3f;
+
+            if (endX < tlLeft || startX > tlRight)
+                continue;
+
+            var dL         = MathF.Max(startX, tlLeft);
+            var dR         = MathF.Min(endX, tlRight);
+            var isPastBoss = boss.CastEndSec < embeddedPreviewElapsedSec;
+            var bossAlpha  = isPastBoss ? pastAlpha : 1.0f;
+            if (bossAlpha < 0.01f)
+                continue;
+
+            drawList.AddRectFilled(
+                new Vector2(dL, bBarMinY),
+                new Vector2(dR, bBarMaxY),
+                BossAbilityColor(boss.AbilityId, bossAlpha),
+                2.0f);
+
+            var castW = dR - dL;
+            if (castW > 28f)
+            {
+                var lbl = TruncateTextToWidth(boss.AbilityName, castW - 6f);
+                if (!string.IsNullOrEmpty(lbl))
+                {
+                    var lsz = ImGui.CalcTextSize(lbl);
+                    drawList.AddText(
+                        new Vector2(dL + 3f, bCenY - lsz.Y / 2f),
+                        ImGui.GetColorU32(new Vector4(1f, 1f, 1f, bossAlpha)),
+                        lbl);
+                }
+            }
+
+            if (ImGui.IsMouseHoveringRect(new Vector2(dL, bBarMinY), new Vector2(dR, bBarMaxY)))
+            {
+                var castDur = boss.CastEndSec - boss.CastStartSec;
+                ImGui.BeginTooltip();
+                ImGui.Text(boss.AbilityName);
+                ImGui.Separator();
+                ImGui.Text($"Cast start:  {FormatTime(boss.CastStartSec)}");
+                if (castDur > 0.05)
+                    ImGui.Text($"Cast finish: {FormatTime(boss.CastEndSec)}  ({castDur:F2}s)");
+                else
+                    ImGui.Text("Instant cast");
+                ImGui.EndTooltip();
+            }
+        }
+
+        return true;
+    }
+
     private void DrawIcon(ImDrawListPtr dl, TimelineEntry entry, Vector2 pos, float size,
         bool isPast, float pastAlpha, double elapsed)
     {
-        var alpha = (float)Math.Clamp(entry.Frequency, 0.25, 1.0);
-        if (isPast) alpha *= pastAlpha;
+        var alpha = isPast ? pastAlpha : 1.0f;
 
         var end = pos + new Vector2(size, size);
 
@@ -1091,6 +1570,138 @@ public sealed class OverlayWindow : Window, IDisposable
             ImGui.Text($"Avg uses:  {entry.AverageUses:F1}x");
             ImGui.EndTooltip();
         }
+    }
+
+    private List<OverlayOgcdPlacement> BuildOverlayOgcdPlacements(
+        IReadOnlyList<TimelineEntry> visibleEntries,
+        double elapsed,
+        float nowX,
+        float pxPerSec,
+        int maxStack)
+    {
+        if (visibleEntries.Count == 0)
+            return [];
+
+        var ogcdEntries = visibleEntries
+            .Where(e => !e.IsGcd)
+            .GroupBy(e => e.TimeOffsetSec)
+            .OrderBy(g => g.Key)
+            .SelectMany(g => g.OrderByDescending(e => e.Frequency).Take(maxStack))
+            .ToList();
+        if (ogcdEntries.Count == 0)
+            return [];
+
+        var gcdTimes = visibleEntries
+            .Where(e => e.IsGcd)
+            .Select(e => e.TimeOffsetSec)
+            .Distinct()
+            .OrderBy(t => t)
+            .ToList();
+        var gcdForbiddenRanges = BuildOverlayGcdForbiddenRanges(gcdTimes);
+
+        var placements = new List<OverlayOgcdPlacement>(ogcdEntries.Count);
+        var horizontalTimeOffset = pxPerSec > 0f
+            ? (double)Cfg.OGCDHorizontalOffset / pxPerSec
+            : 0.0;
+        var previousDisplayTime = double.NegativeInfinity;
+
+        foreach (var entry in ogcdEntries.OrderBy(e => e.TimeOffsetSec).ThenByDescending(e => e.Frequency))
+        {
+            var baseDisplayTime = entry.TimeOffsetSec + horizontalTimeOffset;
+            var resolvedDisplayTime = ResolveOverlayOgcdDisplayTime(baseDisplayTime, previousDisplayTime, gcdForbiddenRanges);
+            placements.Add(new OverlayOgcdPlacement
+            {
+                Entry = entry,
+                DisplayTimeSec = resolvedDisplayTime,
+                X = nowX + (float)(resolvedDisplayTime - elapsed) * pxPerSec,
+                IsPast = resolvedDisplayTime < elapsed,
+            });
+            previousDisplayTime = resolvedDisplayTime;
+        }
+
+        return placements
+            .OrderBy(p => p.DisplayTimeSec)
+            .ThenByDescending(p => p.Entry.Frequency)
+            .ToList();
+    }
+
+    private static double ResolveOverlayOgcdDisplayTime(
+        double baseDisplayTime,
+        double previousDisplayTime,
+        IReadOnlyList<(double Start, double End)> gcdForbiddenRanges)
+    {
+        var lowerBound = double.IsNegativeInfinity(previousDisplayTime)
+            ? double.NegativeInfinity
+            : previousDisplayTime + OverlayMinOgcdVisualGapSec;
+        var displayTime = baseDisplayTime;
+
+        var containingRangeIndex = FindOverlayContainingForbiddenRange(gcdForbiddenRanges, baseDisplayTime);
+        if (containingRangeIndex >= 0)
+        {
+            var containingRange = gcdForbiddenRanges[containingRangeIndex];
+            var leftCandidate = containingRange.Start;
+            var rightCandidate = containingRange.End;
+            var leftAllowed = leftCandidate >= lowerBound;
+
+            if (leftAllowed && Math.Abs(baseDisplayTime - leftCandidate) <= Math.Abs(rightCandidate - baseDisplayTime))
+                displayTime = leftCandidate;
+            else
+                displayTime = Math.Max(rightCandidate, lowerBound);
+        }
+        else
+        {
+            displayTime = Math.Max(baseDisplayTime, lowerBound);
+        }
+
+        foreach (var forbiddenRange in gcdForbiddenRanges)
+        {
+            if (displayTime > forbiddenRange.Start && displayTime < forbiddenRange.End)
+            {
+                displayTime = forbiddenRange.End;
+            }
+        }
+
+        return displayTime;
+    }
+
+    private static List<(double Start, double End)> BuildOverlayGcdForbiddenRanges(IReadOnlyList<double> gcdTimes)
+    {
+        var ranges = new List<(double Start, double End)>(gcdTimes.Count);
+        if (gcdTimes.Count == 0)
+            return ranges;
+
+        foreach (var gcdTime in gcdTimes)
+        {
+            var start = gcdTime - OverlayMinOgcdVisualGapSec;
+            var end = gcdTime + OverlayMinOgcdVisualGapSec;
+            if (ranges.Count == 0)
+            {
+                ranges.Add((start, end));
+                continue;
+            }
+
+            var lastRange = ranges[^1];
+            if (start <= lastRange.End)
+                ranges[^1] = (lastRange.Start, Math.Max(lastRange.End, end));
+            else
+                ranges.Add((start, end));
+        }
+
+        return ranges;
+    }
+
+    private static int FindOverlayContainingForbiddenRange(
+        IReadOnlyList<(double Start, double End)> forbiddenRanges,
+        double time)
+    {
+        for (var index = 0; index < forbiddenRanges.Count; index++)
+        {
+            var range = forbiddenRanges[index];
+            if (time > range.Start && time < range.End)
+                return index;
+        }
+
+        return -1;
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1142,7 +1753,12 @@ public sealed class OverlayWindow : Window, IDisposable
         if (activeTimeline == null)
             return Cfg.OverlayFreqThreshold;
 
-        var key = TimelineDatabase.MakeKey(activeTimeline.EncounterId, activeTimeline.SpecName);
+        return GetAbilityThreshold(activeTimeline, abilityId);
+    }
+
+    private float GetAbilityThreshold(AggregatedTimeline timeline, int abilityId)
+    {
+        var key = TimelineDatabase.MakeKey(timeline.EncounterId, timeline.SpecName);
         if (Cfg.AbilityFreqThresholds.TryGetValue(key, out var perAbility) &&
             perAbility.TryGetValue(abilityId, out var custom))
             return custom;
@@ -1211,15 +1827,15 @@ public sealed class OverlayWindow : Window, IDisposable
         }
     }
 
-    private uint BossAbilityColor(int abilityId)
+    private uint BossAbilityColor(int abilityId, float alpha = 1.0f)
     {
         if (Cfg.BossBarUseCustomColor)
-            return ImGui.GetColorU32(Cfg.BossBarColor);
+            return MulAlpha(Cfg.BossBarColor, alpha);
 
         float[] hues = [0.0f, 0.05f, 0.90f, 0.75f, 0.12f, 0.85f];
         var hue = hues[Math.Abs(abilityId) % hues.Length];
         HsvToRgb(hue, 0.7f, 0.75f, out var r, out var g, out var b);
-        return ImGui.GetColorU32(new Vector4(r, g, b, 1.0f));
+        return ImGui.GetColorU32(new Vector4(r, g, b, alpha));
     }
 
     /// <summary>
