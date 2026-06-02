@@ -51,9 +51,12 @@ public static class GrantedActionDatabase
         public string ResourceName { get; init; } = string.Empty;
         public int GrantCount { get; init; } = 1;
         public int ConsumeCount { get; init; } = 1;
+        public double? WindowDurationSec { get; init; }
         public bool TriggerConsumesWhenResourcePresent { get; init; }
         public bool SkipCooldownWhenConsuming { get; init; }
+        public bool BypassGaugeSpendChecksWhenConsuming { get; init; }
         public HashSet<string> ConsumerNames { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+        public IReadOnlyList<GaugeSimulator.GaugeEffect> ConsumeBonusEffects { get; init; } = [];
     }
 
     public sealed class JobGrantedActionRules
@@ -144,9 +147,21 @@ public static class GrantedActionDatabase
                     ResourceName = rule.ResourceName,
                     GrantCount = rule.GrantCount,
                     ConsumeCount = rule.ConsumeCount,
+                    WindowDurationSec = rule.WindowDurationSec,
                     TriggerConsumesWhenResourcePresent = rule.TriggerConsumesWhenResourcePresent,
                     SkipCooldownWhenConsuming = rule.SkipCooldownWhenConsuming,
+                    BypassGaugeSpendChecksWhenConsuming = rule.BypassGaugeSpendChecksWhenConsuming,
                     ConsumerNames = new HashSet<string>(rule.ConsumerNames, StringComparer.OrdinalIgnoreCase),
+                    ConsumeBonusEffects = rule.ConsumeBonusEffects
+                        .Select(effect => new GaugeSimulator.GaugeEffect
+                        {
+                            GaugeName = effect.GaugeName,
+                            MinRequired = effect.MinRequired,
+                            MaxAllowedBeforeUse = effect.MaxAllowedBeforeUse,
+                            SetValue = effect.SetValue,
+                            Delta = effect.Delta,
+                        })
+                        .ToList(),
                 })
                 .ToList(),
         };

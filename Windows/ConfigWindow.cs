@@ -1,3 +1,4 @@
+using System;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
@@ -7,6 +8,9 @@ namespace ATKTip.Windows;
 public sealed class ConfigWindow : Window
 {
     private readonly Plugin plugin;
+    private bool pendingDeferredUiSettingsSave;
+    private DateTime pendingDeferredUiSettingsSaveAt = DateTime.MinValue;
+    private static readonly TimeSpan DeferredUiSettingsSaveDelay = TimeSpan.FromMilliseconds(350);
 
     private string clientId = string.Empty;
     private string clientSecret = string.Empty;
@@ -34,6 +38,8 @@ public sealed class ConfigWindow : Window
     {
         if (!initialized)
             OnOpen();
+
+        ProcessDeferredUiSettingsSave();
 
         DrawApiCredentials();
         ImGui.Spacing();
@@ -174,7 +180,7 @@ public sealed class ConfigWindow : Window
         if (ImGui.Checkbox("Enable Overlay", ref overlayEnabled))
         {
             cfg.OverlayEnabled = overlayEnabled;
-            plugin.SaveConfig();
+            RequestDeferredUiSettingsSave();
         }
         if (ImGui.IsItemHovered())
         {
@@ -188,7 +194,7 @@ public sealed class ConfigWindow : Window
         if (ImGui.Checkbox("Lock Overlay Position", ref overlayLocked))
         {
             cfg.OverlayLocked = overlayLocked;
-            plugin.SaveConfig();
+            RequestDeferredUiSettingsSave();
         }
         if (ImGui.IsItemHovered())
         {
@@ -355,7 +361,7 @@ public sealed class ConfigWindow : Window
         }
 
         if (changed)
-            plugin.SaveConfig();
+            RequestDeferredUiSettingsSave();
     }
 
     private void DrawMainTimelineSettings()
@@ -397,7 +403,7 @@ public sealed class ConfigWindow : Window
         ImGui.TextDisabled("Boss bar color is shared with the overlay — see Boss Bar above.");
 
         if (changed)
-            plugin.SaveConfig();
+            RequestDeferredUiSettingsSave();
     }
 
     private void DrawCustomTimelines()
@@ -424,8 +430,9 @@ public sealed class ConfigWindow : Window
 
             if (toRemove != null)
             {
-                customTimelines.Remove(toRemove);
-                plugin.SaveConfig();
+                plugin.CustomTimelineStore.RemoveTimeline(plugin.Configuration, toRemove);
+                plugin.Configuration.TimelineGroupAssignments.Remove(toRemove);
+                plugin.SaveTimelineUserState();
             }
         }
     }
@@ -476,17 +483,8 @@ public sealed class ConfigWindow : Window
             ImGui.Spacing();
 
             // ── Custom ants ──────────────────────────────────────────────
-            var customEnabled = cfg.AntsCustomEnabled;
-            if (ImGui.Checkbox("Custom Ants (replace native highlight)", ref customEnabled))
-            {
-                cfg.AntsCustomEnabled = customEnabled;
-                changed = true;
-            }
-            Tooltip("Replaces FFXIV's built-in marching-ants highlight with a fully\n" +
-                    "customisable ImGui-drawn dashed border. Colour, speed and size\n" +
-                    "are all adjustable below.");
+            ImGui.TextDisabled("Custom ants are always enabled.");
 
-            if (cfg.AntsCustomEnabled)
             {
                 ImGui.Spacing();
 
@@ -551,11 +549,144 @@ public sealed class ConfigWindow : Window
                     changed = true;
                 }
                 Tooltip("Expand (+) or shrink (-) the ants border relative to the slot edge.\n0 = flush with slot bounds.");
+
+                var xOff = cfg.AntsXOffset;
+                ImGui.SetNextItemWidth(200);
+                if (ImGui.SliderFloat("Horizontal offset (px)##ants", ref xOff, -20.0f, 20.0f, "%.1f"))
+                {
+                    cfg.AntsXOffset = xOff;
+                    changed = true;
+                }
+                Tooltip("Shift the ants border left (-) or right (+).");
+
+                var yOff = cfg.AntsYOffset;
+                ImGui.SetNextItemWidth(200);
+                if (ImGui.SliderFloat("Vertical offset (px)##ants", ref yOff, -20.0f, 20.0f, "%.1f"))
+                {
+                    cfg.AntsYOffset = yOff;
+                    changed = true;
+                }
+                Tooltip("Shift the ants border up (-) or down (+).");
+
+                ImGui.Spacing();
+                ImGui.Spacing();
+                ImGui.TextColored(new Vector4(0.2f, 0.8f, 1.0f, 1.0f), "GCD Ants");
+                ImGui.Separator();
+
+                var gcdEnabled = cfg.GcdAntsEnabled;
+                if (ImGui.Checkbox("Enable GCD Ants", ref gcdEnabled))
+                {
+                    cfg.GcdAntsEnabled = gcdEnabled;
+                    changed = true;
+                }
+                Tooltip("Show ants on the next upcoming GCD as it approaches the now-line.\nOnly the single closest GCD entry glows at a time.");
+
+                if (cfg.GcdAntsEnabled)
+                {
+                    var gcdBefore = cfg.GcdAntsDurationBefore;
+                    ImGui.SetNextItemWidth(200);
+                    if (ImGui.SliderFloat("Before (sec)##gcdAnts", ref gcdBefore, 0.0f, 4.0f, "%.1f"))
+                    {
+                        cfg.GcdAntsDurationBefore = gcdBefore;
+                        changed = true;
+                    }
+                    Tooltip("How many seconds before crossing the now-line the ants appear.");
+
+                    var gcdAfter = cfg.GcdAntsDurationAfter;
+                    ImGui.SetNextItemWidth(200);
+                    if (ImGui.SliderFloat("After (sec)##gcdAnts", ref gcdAfter, 0.0f, 4.0f, "%.1f"))
+                    {
+                        cfg.GcdAntsDurationAfter = gcdAfter;
+                        changed = true;
+                    }
+                    Tooltip("How many seconds after crossing the now-line the ants remain.");
+
+                    ImGui.Spacing();
+                    ImGui.TextDisabled($"Window: {cfg.GcdAntsDurationBefore + cfg.GcdAntsDurationAfter:F1}s  " +
+                                       $"({cfg.GcdAntsDurationBefore:F1}s before + {cfg.GcdAntsDurationAfter:F1}s after)");
+
+                    var gcdDashCol = cfg.GcdAntsColor;
+                    if (ImGui.ColorEdit4("Dash colour##gcdAnts", ref gcdDashCol,
+                        ImGuiColorEditFlags.AlphaBar | ImGuiColorEditFlags.AlphaPreviewHalf))
+                    {
+                        cfg.GcdAntsColor = gcdDashCol;
+                        changed = true;
+                    }
+
+                    var gcdGapCol = cfg.GcdAntsGapColor;
+                    if (ImGui.ColorEdit4("Gap colour##gcdAnts", ref gcdGapCol,
+                        ImGuiColorEditFlags.AlphaBar | ImGuiColorEditFlags.AlphaPreviewHalf))
+                    {
+                        cfg.GcdAntsGapColor = gcdGapCol;
+                        changed = true;
+                    }
+                    Tooltip("Set alpha to 0 for transparent gaps.");
+
+                    var gcdDashLen = cfg.GcdAntsDashLength;
+                    ImGui.SetNextItemWidth(200);
+                    if (ImGui.SliderFloat("Dash length (px)##gcdAnts", ref gcdDashLen, 1.0f, 30.0f, "%.0f"))
+                    {
+                        cfg.GcdAntsDashLength = gcdDashLen;
+                        changed = true;
+                    }
+
+                    var gcdGapLen = cfg.GcdAntsGapLength;
+                    ImGui.SetNextItemWidth(200);
+                    if (ImGui.SliderFloat("Gap length (px)##gcdAnts", ref gcdGapLen, 0.0f, 20.0f, "%.0f"))
+                    {
+                        cfg.GcdAntsGapLength = gcdGapLen;
+                        changed = true;
+                    }
+
+                    var gcdSpeed = cfg.GcdAntsSpeed;
+                    ImGui.SetNextItemWidth(200);
+                    if (ImGui.SliderFloat("March speed (px/s)##gcdAnts", ref gcdSpeed, 5.0f, 200.0f, "%.0f"))
+                    {
+                        cfg.GcdAntsSpeed = gcdSpeed;
+                        changed = true;
+                    }
+                    Tooltip("How fast the dashes march around the border.");
+
+                    var gcdThick = cfg.GcdAntsThickness;
+                    ImGui.SetNextItemWidth(200);
+                    if (ImGui.SliderFloat("Line thickness (px)##gcdAnts", ref gcdThick, 1.0f, 6.0f, "%.1f"))
+                    {
+                        cfg.GcdAntsThickness = gcdThick;
+                        changed = true;
+                    }
+
+                    var gcdPadding = cfg.GcdAntsBorderPadding;
+                    ImGui.SetNextItemWidth(200);
+                    if (ImGui.SliderFloat("Border expansion (px)##gcdAnts", ref gcdPadding, -10.0f, 10.0f, "%.1f"))
+                    {
+                        cfg.GcdAntsBorderPadding = gcdPadding;
+                        changed = true;
+                    }
+                    Tooltip("Expand (+) or shrink (-) the ants border relative to the slot edge.\n0 = flush with slot bounds.");
+
+                    var gcdXOff = cfg.GcdAntsXOffset;
+                    ImGui.SetNextItemWidth(200);
+                    if (ImGui.SliderFloat("Horizontal offset (px)##gcdAnts", ref gcdXOff, -20.0f, 20.0f, "%.1f"))
+                    {
+                        cfg.GcdAntsXOffset = gcdXOff;
+                        changed = true;
+                    }
+                    Tooltip("Shift the ants border left (-) or right (+).");
+
+                    var gcdYOff = cfg.GcdAntsYOffset;
+                    ImGui.SetNextItemWidth(200);
+                    if (ImGui.SliderFloat("Vertical offset (px)##gcdAnts", ref gcdYOff, -20.0f, 20.0f, "%.1f"))
+                    {
+                        cfg.GcdAntsYOffset = gcdYOff;
+                        changed = true;
+                    }
+                    Tooltip("Shift the ants border up (-) or down (+).");
+                }
             }
         }
 
         if (changed)
-            plugin.SaveConfig();
+            RequestDeferredUiSettingsSave();
     }
 
     private void DrawResetSection()
@@ -589,10 +720,14 @@ public sealed class ConfigWindow : Window
             cfg.MainIconSize            = 22.0f;
             cfg.MainIconOpacity         = 1.0f;
             cfg.MainIconScale           = 1.0f;
+            cfg.AutoTimelineGcdRecastSec = 2.5f;
+            cfg.AutoTimelineDotRefreshBufferSec = 6.0f;
+            cfg.AutoTimelineDisabledAbilities.Clear();
             cfg.AntsEnabled             = true;
+            cfg.OgcdAntsEnabled         = true;
             cfg.AntsDurationBefore      = 1.5f;
             cfg.AntsDurationAfter       = 1.5f;
-            cfg.AntsCustomEnabled       = false;
+            cfg.AntsCustomEnabled       = true;
             cfg.AntsColor               = new Vector4(1.0f, 0.85f, 0.0f, 1.0f);
             cfg.AntsGapColor            = new Vector4(0.0f, 0.0f, 0.0f, 0.5f);
             cfg.AntsDashLength          = 6.0f;
@@ -600,8 +735,22 @@ public sealed class ConfigWindow : Window
             cfg.AntsSpeed               = 40.0f;
             cfg.AntsThickness           = 2.0f;
             cfg.AntsBorderPadding       = 0.0f;
+            cfg.AntsXOffset             = -5.0f;
+            cfg.AntsYOffset             = 0.0f;
+            cfg.GcdAntsEnabled          = true;
+            cfg.GcdAntsDurationBefore   = 0.5f;
+            cfg.GcdAntsDurationAfter    = 0.5f;
+            cfg.GcdAntsColor            = new Vector4(0.2f, 0.8f, 1.0f, 1.0f);
+            cfg.GcdAntsGapColor         = new Vector4(0.0f, 0.0f, 0.0f, 0.5f);
+            cfg.GcdAntsDashLength       = 6.0f;
+            cfg.GcdAntsGapLength        = 4.0f;
+            cfg.GcdAntsSpeed            = 40.0f;
+            cfg.GcdAntsThickness        = 2.0f;
+            cfg.GcdAntsBorderPadding    = 0.0f;
+            cfg.GcdAntsXOffset          = -5.0f;
+            cfg.GcdAntsYOffset          = 0.0f;
 
-            plugin.SaveConfig();
+            plugin.SaveUiSettings();
         }
     }
 
@@ -613,5 +762,29 @@ public sealed class ConfigWindow : Window
             ImGui.Text(text);
             ImGui.EndTooltip();
         }
+    }
+
+    private void RequestDeferredUiSettingsSave()
+    {
+        pendingDeferredUiSettingsSave = true;
+        pendingDeferredUiSettingsSaveAt = DateTime.UtcNow + DeferredUiSettingsSaveDelay;
+    }
+
+    private void ProcessDeferredUiSettingsSave()
+    {
+        if (!pendingDeferredUiSettingsSave || DateTime.UtcNow < pendingDeferredUiSettingsSaveAt)
+            return;
+
+        if (ImGui.IsAnyItemActive() ||
+            ImGui.IsMouseDown(ImGuiMouseButton.Left) ||
+            ImGui.IsMouseDown(ImGuiMouseButton.Right) ||
+            ImGui.IsMouseDown(ImGuiMouseButton.Middle))
+        {
+            pendingDeferredUiSettingsSaveAt = DateTime.UtcNow + DeferredUiSettingsSaveDelay;
+            return;
+        }
+
+        plugin.SaveUiSettings();
+        pendingDeferredUiSettingsSave = false;
     }
 }

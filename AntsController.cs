@@ -12,8 +12,8 @@ namespace ATKTip;
 
 /// <summary>
 /// Hooks <c>ActionManager.IsActionHighlighted</c> to drive FFXIV's native marching-ants
-/// combo/proc highlight. ATKTip may optionally add its own standard or custom ants
-/// for overlay-managed actions, but never suppresses FFXIV's native highlight.
+/// combo/proc highlight. ATKTip draws only its own custom ants for overlay-managed
+/// actions and never suppresses FFXIV's native highlight.
 /// </summary>
 public sealed unsafe class AntsController : IDisposable
 {
@@ -61,15 +61,7 @@ public sealed unsafe class AntsController : IDisposable
         if (!plugin.OverlayWindow.CanManageAbilityAnts())
             return original;
 
-        // Custom mode draws ATKTip ants separately and leaves FFXIV's native highlight alone.
-        if (cfg.AntsEnabled && cfg.AntsCustomEnabled)
-            return original;
-
-        // Standard mode: pass through native highlights; additionally highlight ATKTip abilities.
-        if (original) return true;
-
-        var inAntsStd = plugin.OverlayWindow.IsAbilityInAntsWindow((int)actionId);
-        return cfg.AntsEnabled && inAntsStd;
+        return original;
     }
 
     // ── Draw (called on UI thread via UiBuilder.Draw) ────────────────────
@@ -79,7 +71,7 @@ public sealed unsafe class AntsController : IDisposable
         SyncHookState();
 
         var cfg = plugin.Configuration;
-        if (!cfg.AntsEnabled || !cfg.AntsCustomEnabled) return;
+        if (!cfg.AntsEnabled) return;
 
         var (gcdIds, ogcdIds) = plugin.OverlayWindow.GetAntsAbilityIds();
         if (gcdIds.Count == 0 && ogcdIds.Count == 0) return;
@@ -147,8 +139,9 @@ public sealed unsafe class AntsController : IDisposable
                 var padding = (isGcdSlot ? cfg.GcdAntsBorderPadding : cfg.AntsBorderPadding) - 10f;
 
                 var xOffset = isGcdSlot ? cfg.GcdAntsXOffset : cfg.AntsXOffset;
+                var yOffset = isGcdSlot ? cfg.GcdAntsYOffset : cfg.AntsYOffset;
                 var x = node->ScreenX - padding + xOffset;
-                var y = node->ScreenY - padding;
+                var y = node->ScreenY - padding + yOffset;
                 var w = nodeW * node->ScaleX * scale + padding * 2f;
                 var h = nodeH * node->ScaleY * scale + padding * 2f;
 
@@ -232,10 +225,7 @@ public sealed unsafe class AntsController : IDisposable
         if (hook == null)
             return;
 
-        var shouldEnable =
-            plugin.Configuration.AntsEnabled &&
-            !plugin.Configuration.AntsCustomEnabled &&
-            plugin.OverlayWindow.CanManageAbilityAnts();
+        var shouldEnable = false;
 
         if (shouldEnable == hookEnabled)
             return;

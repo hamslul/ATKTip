@@ -120,6 +120,25 @@ public sealed class OverlayWindow : Window, IDisposable
     // ── Caches ──
     private readonly Dictionary<int, uint> iconIdCache = [];
     private readonly ConcurrentDictionary<int, bool> oGcdCache = new();
+    private AggregatedTimeline? cachedActiveFilteredTimeline;
+    private int cachedActiveFilteredRevision = -1;
+    private int activeTimelineFilterRevision;
+    private readonly List<TimelineEntry> cachedActiveFilteredEntries = [];
+    private readonly List<TimelineEntry> cachedActiveFilteredGcdEntries = [];
+    private readonly List<TimelineEntry> cachedActiveFilteredOgcdEntries = [];
+    private AggregatedTimeline? cachedEmbeddedFilteredTimeline;
+    private int cachedEmbeddedFilteredRevision = -1;
+    private int embeddedTimelineFilterRevision;
+    private readonly List<TimelineEntry> cachedEmbeddedFilteredEntries = [];
+    private readonly List<TimelineEntry> cachedEmbeddedFilteredGcdEntries = [];
+    private readonly List<TimelineEntry> cachedEmbeddedFilteredOgcdEntries = [];
+    private readonly List<TimelineEntry> activeVisibleEntriesScratch = [];
+    private readonly List<TimelineEntry> embeddedVisibleEntriesScratch = [];
+    private readonly HashSet<int> cachedAntsGcdIds = [];
+    private readonly HashSet<int> cachedAntsOgcdIds = [];
+    private AggregatedTimeline? cachedAntsTimeline;
+    private int cachedAntsRevision = -1;
+    private long cachedAntsElapsedBucket = long.MinValue;
 
     private Configuration Cfg => plugin.Configuration;
 
@@ -178,6 +197,18 @@ public sealed class OverlayWindow : Window, IDisposable
     public bool HasActiveTimeline => activeTimeline != null;
     public bool IsEmbeddedPreviewScrubbing => embeddedPreviewIsScrubbing;
 
+    public void InvalidateTimelineCaches()
+    {
+        unchecked
+        {
+            activeTimelineFilterRevision++;
+        }
+
+        cachedAntsTimeline = null;
+        cachedAntsRevision = -1;
+        cachedAntsElapsedBucket = long.MinValue;
+    }
+
     public bool CanManageAbilityAnts()
         => Cfg.AntsEnabled &&
            IsOpen &&
@@ -186,17 +217,19 @@ public sealed class OverlayWindow : Window, IDisposable
            activeTimeline != null &&
            (inCombat || isPreview);
 
-    public void SetTimeline(AggregatedTimeline? timeline, string key)
+    public void SetTimeline(AggregatedTimeline? timeline, string key, bool resetDismissed = true)
     {
         activeTimeline    = timeline;
         activeTimelineKey = key;
-        overlayDismissed  = false;      // fresh load — re-enable ants and auto-exec
+        if (resetDismissed)
+            overlayDismissed = false;      // fresh load — re-enable ants and auto-exec
         antsArmed         = false;
         skillVisibility.Clear();
         oGcdCache.Clear();
         autoExecQueue.Clear();
         autoExecQueued.Clear();
         autoExecLastElapsed = -1.0;
+        InvalidateTimelineCaches();
 
         if (timeline != null)
         {
@@ -223,6 +256,156 @@ public sealed class OverlayWindow : Window, IDisposable
             e.IsGcd = !IsOGCD(e.AbilityId, e.AbilityName);
     }
 
+    private void EnsureActiveFilteredEntriesCache()
+    {
+        var timeline = activeTimeline;
+        if (timeline == null)
+            return;
+
+        if (ReferenceEquals(cachedActiveFilteredTimeline, timeline) &&
+            cachedActiveFilteredRevision == activeTimelineFilterRevision)
+            return;
+
+        cachedActiveFilteredTimeline = timeline;
+        cachedActiveFilteredRevision = activeTimelineFilterRevision;
+        cachedActiveFilteredEntries.Clear();
+        cachedActiveFilteredGcdEntries.Clear();
+        cachedActiveFilteredOgcdEntries.Clear();
+
+        cachedActiveFilteredEntries.AddRange(TimelineJobRules.ApplyPostSelectionRules(
+            timeline.SpecName,
+            timeline.Entries,
+            promoteMacrocosmosToVisualGcd: true)
+            .Where(e => skillVisibility.GetValueOrDefault(e.AbilityId, true))
+            .Where(e => e.Frequency >= GetAbilityThreshold(timeline, e.AbilityId))
+            .OrderBy(e => e.TimeOffsetSec)
+            .ThenByDescending(e => e.Frequency));
+
+        foreach (var entry in cachedActiveFilteredEntries)
+        {
+            if (entry.IsGcd)
+                cachedActiveFilteredGcdEntries.Add(entry);
+            else
+                cachedActiveFilteredOgcdEntries.Add(entry);
+        }
+    }
+
+    private void EnsureEmbeddedFilteredEntriesCache()
+    {
+        var timeline = embeddedPreviewTimeline;
+        if (timeline == null)
+            return;
+
+        if (ReferenceEquals(cachedEmbeddedFilteredTimeline, timeline) &&
+            cachedEmbeddedFilteredRevision == embeddedTimelineFilterRevision)
+            return;
+
+        cachedEmbeddedFilteredTimeline = timeline;
+        cachedEmbeddedFilteredRevision = embeddedTimelineFilterRevision;
+        cachedEmbeddedFilteredEntries.Clear();
+        cachedEmbeddedFilteredGcdEntries.Clear();
+        cachedEmbeddedFilteredOgcdEntries.Clear();
+
+        cachedEmbeddedFilteredEntries.AddRange(TimelineJobRules.ApplyPostSelectionRules(
+            timeline.SpecName,
+            timeline.Entries,
+            promoteMacrocosmosToVisualGcd: true)
+            .Where(e => embeddedSkillVisibility.GetValueOrDefault(e.AbilityId, true))
+            .Where(e => e.Frequency >= GetAbilityThreshold(timeline, e.AbilityId))
+            .OrderBy(e => e.TimeOffsetSec)
+            .ThenByDescending(e => e.Frequency));
+
+        foreach (var entry in cachedEmbeddedFilteredEntries)
+        {
+            if (entry.IsGcd)
+                cachedEmbeddedFilteredGcdEntries.Add(entry);
+            else
+                cachedEmbeddedFilteredOgcdEntries.Add(entry);
+        }
+    }
+
+    private static void CollectEntriesInTimeWindow(
+        IReadOnlyList<TimelineEntry> source,
+        double minTimeSec,
+        double maxTimeSec,
+        List<TimelineEntry> target)
+    {
+        target.Clear();
+        for (var i = 0; i < source.Count; i++)
+        {
+            var entry = source[i];
+            if (entry.TimeOffsetSec < minTimeSec)
+                continue;
+            if (entry.TimeOffsetSec > maxTimeSec)
+                break;
+            target.Add(entry);
+        }
+    }
+
+    private void EnsureAntsAbilityCache(double elapsed)
+    {
+        var timeline = activeTimeline;
+        if (timeline == null)
+            return;
+
+        EnsureActiveFilteredEntriesCache();
+
+        var elapsedBucket = (long)Math.Round(elapsed * 20.0);
+        if (ReferenceEquals(cachedAntsTimeline, timeline) &&
+            cachedAntsRevision == activeTimelineFilterRevision &&
+            cachedAntsElapsedBucket == elapsedBucket)
+            return;
+
+        cachedAntsTimeline = timeline;
+        cachedAntsRevision = activeTimelineFilterRevision;
+        cachedAntsElapsedBucket = elapsedBucket;
+        cachedAntsGcdIds.Clear();
+        cachedAntsOgcdIds.Clear();
+
+        if (Cfg.OgcdAntsEnabled)
+        {
+            var before = (double)Cfg.AntsDurationBefore;
+            var after = (double)Cfg.AntsDurationAfter;
+            var placements = BuildOverlayOgcdPlacements(
+                cachedActiveFilteredOgcdEntries,
+                elapsed,
+                0f,
+                Math.Max(Cfg.OverlayPixelsPerSec, 1f),
+                Cfg.OverlayMaxStackedIcons);
+
+            foreach (var placement in placements)
+            {
+                var rel = placement.DisplayTimeSec - elapsed;
+                if (rel >= -after && rel <= before)
+                    cachedAntsOgcdIds.Add(placement.Entry.AbilityId);
+            }
+        }
+
+        if (Cfg.GcdAntsEnabled)
+        {
+            var before = (double)Cfg.GcdAntsDurationBefore;
+            var after = (double)Cfg.GcdAntsDurationAfter;
+            TimelineEntry? bestGcd = null;
+            var minAbsRel = double.MaxValue;
+            foreach (var entry in cachedActiveFilteredGcdEntries)
+            {
+                var rel = entry.TimeOffsetSec - elapsed;
+                if (rel < -after || rel > before)
+                    continue;
+
+                var absRel = Math.Abs(rel);
+                if (absRel < minAbsRel)
+                {
+                    minAbsRel = absRel;
+                    bestGcd = entry;
+                }
+            }
+
+            if (bestGcd != null)
+                cachedAntsGcdIds.Add(bestGcd.AbilityId);
+        }
+    }
+
     public void StartPreview(AggregatedTimeline timeline)
     {
         var key = TimelineDatabase.MakeKey(timeline.EncounterId, timeline.SpecName);
@@ -238,6 +421,29 @@ public sealed class OverlayWindow : Window, IDisposable
         autoExecQueued.Clear();
         autoExecLastElapsed  = -1.0;
         IsOpen               = true;
+    }
+
+    public void SwitchCombatTimeline(AggregatedTimeline timeline, string key)
+    {
+        var preserveDismissed = overlayDismissed;
+        var preserveOpen = IsOpen;
+
+        SetTimeline(timeline, key, resetDismissed: false);
+        overlayDismissed  = preserveDismissed;
+        antsArmed         = !overlayDismissed;
+        isEncounterZone   = true;
+        isPreview         = false;
+        previewAutoplay   = false;
+        previewManualTimeSec = 0;
+        isScrubbing       = false;
+        combatViewPaused  = false;
+        inCombat          = true;
+        combatStartTime   = DateTime.UtcNow;
+        combatElapsedSec  = 0;
+        autoExecQueue.Clear();
+        autoExecQueued.Clear();
+        autoExecLastElapsed = -1.0;
+        IsOpen = preserveOpen && !overlayDismissed && Cfg.OverlayEnabled;
     }
 
     public void StopPreview()
@@ -262,6 +468,10 @@ public sealed class OverlayWindow : Window, IDisposable
         embeddedPreviewElapsedSec    = 0;
         embeddedPreviewManualTimeSec = 0;
         embeddedPreviewIsScrubbing   = false;
+        unchecked
+        {
+            embeddedTimelineFilterRevision++;
+        }
     }
 
     public bool DrawEmbeddedPreview(AggregatedTimeline timeline, Vector2 size, string childId)
@@ -294,6 +504,10 @@ public sealed class OverlayWindow : Window, IDisposable
         embeddedPreviewTimelineKey = key;
         PopulateTimelineVisibility(timeline, key, embeddedSkillVisibility);
         ClassifyTimelineEntries(timeline);
+        unchecked
+        {
+            embeddedTimelineFilterRevision++;
+        }
 
         embeddedPreviewAutoplay      = false;
         embeddedPreviewStartTime     = DateTime.UtcNow;
@@ -328,7 +542,9 @@ public sealed class OverlayWindow : Window, IDisposable
     {
         var key = TimelineDatabase.MakeKey(timeline.EncounterId, timeline.SpecName);
         SetTimeline(timeline, key);
-        antsArmed            = false;
+        // Manual/zone preview should show ability ants immediately while the user
+        // studies or plays the timeline before the pull starts.
+        antsArmed            = true;
         isPreview            = true;
         previewAutoplay      = false;   // paused — user scrubs freely
         previewStartTime     = DateTime.UtcNow;
@@ -350,64 +566,15 @@ public sealed class OverlayWindow : Window, IDisposable
     public bool IsAbilityInAntsWindow(int abilityId)
     {
         if (!CanManageAbilityAnts()) return false;
-        var timeline = activeTimeline;
-        if (timeline == null) return false;
+        if (activeTimeline == null) return false;
 
         // Compute elapsed time fresh so the hook (game thread) stays in sync with
         // the red line regardless of when the last Draw() frame ran.
         var elapsed = inCombat
             ? (DateTime.UtcNow - combatStartTime).TotalSeconds
             : combatElapsedSec;   // preview uses the scrub position set on the UI thread
-
-        if (IsOGCD(abilityId))
-        {
-            if (!Cfg.OgcdAntsEnabled) return false;
-
-            var before        = (double)Cfg.AntsDurationBefore;
-            var after         = (double)Cfg.AntsDurationAfter;
-            var visibleEntries = timeline.Entries
-                .Where(e => !e.IsGcd)
-                .Where(e => e.AbilityId == abilityId)
-                .Where(e => skillVisibility.GetValueOrDefault(e.AbilityId, true))
-                .Where(e => e.Frequency >= GetAbilityThreshold(e.AbilityId))
-                .OrderBy(e => e.TimeOffsetSec)
-                .ToList();
-            var placements = BuildOverlayOgcdPlacements(
-                visibleEntries,
-                elapsed,
-                0f,
-                Math.Max(Cfg.OverlayPixelsPerSec, 1f),
-                Cfg.OverlayMaxStackedIcons);
-
-            foreach (var placement in placements)
-            {
-                var rel = placement.DisplayTimeSec - elapsed;
-                if (rel >= -after && rel <= before) return true;
-            }
-            return false;
-        }
-        else
-        {
-            if (!Cfg.GcdAntsEnabled) return false;
-
-            var before    = (double)Cfg.GcdAntsDurationBefore;
-            var after     = (double)Cfg.GcdAntsDurationAfter;
-
-            // GCDs: exactly one glows — the entry closest to the red line.
-            Data.TimelineEntry? bestGcd = null;
-            var minAbsRel = double.MaxValue;
-            foreach (var e in timeline.Entries)
-            {
-                if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
-                if (!skillVisibility.GetValueOrDefault(e.AbilityId, true)) continue;
-                if (!e.IsGcd) continue;
-                var rel = e.TimeOffsetSec - elapsed;
-                if (rel < -after || rel > before) continue;
-                var absRel = Math.Abs(rel);
-                if (absRel < minAbsRel) { minAbsRel = absRel; bestGcd = e; }
-            }
-            return bestGcd != null && bestGcd.AbilityId == abilityId;
-        }
+        EnsureAntsAbilityCache(elapsed);
+        return cachedAntsOgcdIds.Contains(abilityId) || cachedAntsGcdIds.Contains(abilityId);
     }
 
     /// <summary>
@@ -419,59 +586,15 @@ public sealed class OverlayWindow : Window, IDisposable
         var gcd  = new HashSet<int>();
         var ogcd = new HashSet<int>();
         if (!CanManageAbilityAnts()) return (gcd, ogcd);
-        var timeline = activeTimeline;
-        if (timeline == null) return (gcd, ogcd);
+        if (activeTimeline == null) return (gcd, ogcd);
 
         var elapsed = inCombat
             ? (DateTime.UtcNow - combatStartTime).TotalSeconds
             : combatElapsedSec;
 
-        // ── oGCDs ─────────────────────────────────────────────────────────
-        if (Cfg.OgcdAntsEnabled)
-        {
-            var before        = (double)Cfg.AntsDurationBefore;
-            var after         = (double)Cfg.AntsDurationAfter;
-            var visibleEntries = timeline.Entries
-                .Where(e => !e.IsGcd)
-                .Where(e => skillVisibility.GetValueOrDefault(e.AbilityId, true))
-                .Where(e => e.Frequency >= GetAbilityThreshold(e.AbilityId))
-                .OrderBy(e => e.TimeOffsetSec)
-                .ToList();
-            var placements = BuildOverlayOgcdPlacements(
-                visibleEntries,
-                elapsed,
-                0f,
-                Math.Max(Cfg.OverlayPixelsPerSec, 1f),
-                Cfg.OverlayMaxStackedIcons);
-
-            foreach (var placement in placements)
-            {
-                var rel = placement.DisplayTimeSec - elapsed;
-                if (rel >= -after && rel <= before) ogcd.Add(placement.Entry.AbilityId);
-            }
-        }
-
-        // ── GCDs — exactly one (the entry closest to the red line) ─────────
-        if (Cfg.GcdAntsEnabled)
-        {
-            var before    = (double)Cfg.GcdAntsDurationBefore;
-            var after     = (double)Cfg.GcdAntsDurationAfter;
-
-            Data.TimelineEntry? bestGcd = null;
-            var minAbsRel = double.MaxValue;
-            foreach (var e in timeline.Entries)
-            {
-                if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
-                if (!skillVisibility.GetValueOrDefault(e.AbilityId, true)) continue;
-                if (!e.IsGcd) continue;
-                var rel = e.TimeOffsetSec - elapsed;
-                if (rel < -after || rel > before) continue;
-                var absRel = Math.Abs(rel);
-                if (absRel < minAbsRel) { minAbsRel = absRel; bestGcd = e; }
-            }
-            if (bestGcd != null) gcd.Add(bestGcd.AbilityId);
-        }
-
+        EnsureAntsAbilityCache(elapsed);
+        gcd.UnionWith(cachedAntsGcdIds);
+        ogcd.UnionWith(cachedAntsOgcdIds);
         return (gcd, ogcd);
     }
 
@@ -497,10 +620,6 @@ public sealed class OverlayWindow : Window, IDisposable
             combatElapsedSec     = 0;
             autoExecQueue.Clear();
             autoExecQueued.Clear();
-
-            // Lock overlay when the fight starts so it stays in place
-            Cfg.OverlayLocked = true;
-            plugin.SaveConfig();
 
             if (activeTimeline != null && Cfg.OverlayEnabled)
                 IsOpen = true;
@@ -564,7 +683,7 @@ public sealed class OverlayWindow : Window, IDisposable
     public override void PreDraw()
     {
         // Lock applies in ALL modes (including preview) — respects config.
-        if (Cfg.OverlayLocked && !isScrubbing)
+        if ((Cfg.OverlayLocked || inCombat) && !isScrubbing)
             Flags |= ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize;
         else
             Flags &= ~(ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize);
@@ -761,7 +880,7 @@ public sealed class OverlayWindow : Window, IDisposable
             if (lockHover && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
             {
                 Cfg.OverlayLocked = !Cfg.OverlayLocked;
-                plugin.SaveConfig();
+                plugin.SaveUiSettings();
             }
 
             // ── Close button ──────────────────────────────────────────
@@ -941,16 +1060,9 @@ public sealed class OverlayWindow : Window, IDisposable
         else
         {
             // ── Collect and bucket visible entries ────────────────────
-            var visibleEntries = TimelineJobRules.ApplyPostSelectionRules(
-                    activeTimeline.SpecName,
-                    activeTimeline.Entries,
-                    promoteMacrocosmosToVisualGcd: true)
-                .Where(e => e.TimeOffsetSec >= visStart - 5 && e.TimeOffsetSec <= visEnd + 5)
-                .Where(e => skillVisibility.GetValueOrDefault(e.AbilityId, true))
-                .Where(e => e.Frequency >= GetAbilityThreshold(e.AbilityId))
-                .OrderBy(e => e.TimeOffsetSec)
-                .ThenByDescending(e => e.Frequency)
-                .ToList();
+            EnsureActiveFilteredEntriesCache();
+            CollectEntriesInTimeWindow(cachedActiveFilteredEntries, visStart - 5, visEnd + 5, activeVisibleEntriesScratch);
+            var visibleEntries = activeVisibleEntriesScratch;
             var gcdWindowSec = GCDWindowSec;
             var gcdBuckets = visibleEntries
                 .Where(e => e.IsGcd)
@@ -1367,16 +1479,9 @@ public sealed class OverlayWindow : Window, IDisposable
             ImGui.GetColorU32(ColNowLine),
             2.0f);
 
-        var visibleEntries = TimelineJobRules.ApplyPostSelectionRules(
-                timeline.SpecName,
-                timeline.Entries,
-                promoteMacrocosmosToVisualGcd: true)
-            .Where(e => e.TimeOffsetSec >= visStart - 5 && e.TimeOffsetSec <= visEnd + 5)
-            .Where(e => embeddedSkillVisibility.GetValueOrDefault(e.AbilityId, true))
-            .Where(e => e.Frequency >= GetAbilityThreshold(timeline, e.AbilityId))
-            .OrderBy(e => e.TimeOffsetSec)
-            .ThenByDescending(e => e.Frequency)
-            .ToList();
+        EnsureEmbeddedFilteredEntriesCache();
+        CollectEntriesInTimeWindow(cachedEmbeddedFilteredEntries, visStart - 5, visEnd + 5, embeddedVisibleEntriesScratch);
+        var visibleEntries = embeddedVisibleEntriesScratch;
         var gcdWindowSec = GCDWindowSec;
         var gcdBuckets = visibleEntries
             .Where(e => e.IsGcd)
@@ -1953,12 +2058,9 @@ public sealed class OverlayWindow : Window, IDisposable
         //   firing obviously stale actions if auto-execute is toggled on mid-fight.
         const double AcceptWindowSec = 0.350;
 
-        foreach (var e in activeTimeline.Entries)
+        EnsureActiveFilteredEntriesCache();
+        foreach (var e in cachedActiveFilteredEntries)
         {
-            // Respect the same visibility and frequency gates as the visual overlay.
-            if (!skillVisibility.GetValueOrDefault(e.AbilityId, true)) continue;
-            if (e.Frequency < GetAbilityThreshold(e.AbilityId)) continue;
-
             var key   = (e.TimeOffsetSec, e.AbilityId);
             var delta = elapsed - e.TimeOffsetSec;   // positive = we've passed the scheduled mark
 

@@ -9,7 +9,7 @@ namespace ATKTip.Windows;
 
 /// <summary>
 /// Compact one-click overlay for manually loading a custom timeline when auto-detection fails.
-/// Triggered by <c>/atktip preview</c>. Lists custom timelines sorted by relevance
+/// Triggered by <c>/ATKTip preview</c>. Lists custom timelines sorted by relevance
 /// (player's current job first), one click loads the overlay and closes this window.
 /// </summary>
 public sealed class QuickPickWindow : Window

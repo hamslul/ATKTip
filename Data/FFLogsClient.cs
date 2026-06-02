@@ -303,7 +303,7 @@ public sealed class FFLogsClient : IDisposable
     /// 1. Get fight times (relative to report start)
     /// 2. Fetch all events for the fight using fightIDs filter
     /// </summary>
-    public async Task<List<CastEvent>> GetCastEventsAsync(
+    public async Task<CastEventsResult> GetCastEventsAsync(
         string reportCode, int fightId, string specName, CancellationToken ct)
     {
         // FFLogs API expects sourceClass without spaces: "BlackMage", "DarkKnight", etc.
@@ -315,8 +315,25 @@ public sealed class FFLogsClient : IDisposable
               reportData {
                 report(code: "{{reportCode}}") {
                   fights(fightIDs: [{{fightId}}]) {
+                    encounterID
+                    name
                     startTime
                     endTime
+                    lastPhase
+                    lastPhaseAsAbsoluteIndex
+                    lastPhaseIsIntermission
+                    phaseTransitions {
+                      id
+                      startTime
+                    }
+                  }
+                  phases {
+                    encounterID
+                    phases {
+                      id
+                      name
+                      isIntermission
+                    }
                   }
                   masterData {
                     abilities {
@@ -344,7 +361,7 @@ public sealed class FFLogsClient : IDisposable
         if (reportToken == null || reportToken.Type == JTokenType.Null)
         {
             log.Warning("[FFLogs] Report {0} is null. Raw: {1}", reportCode, SafeTruncate(fightRaw, 300));
-            return [];
+            return new CastEventsResult();
         }
 
         var fights = reportToken["fights"] as JArray;
@@ -352,7 +369,7 @@ public sealed class FFLogsClient : IDisposable
         {
             log.Warning("[FFLogs] Report {0} fight {1}: no fights found. Raw: {2}",
                 reportCode, fightId, SafeTruncate(fightRaw, 300));
-            return [];
+            return new CastEventsResult();
         }
 
         var fightStartTime = fights[0]?["startTime"]?.Value<long>() ?? 0;
@@ -362,11 +379,32 @@ public sealed class FFLogsClient : IDisposable
         {
             log.Warning("[FFLogs] Report {0} fight {1}: invalid times start={2} end={3}",
                 reportCode, fightId, fightStartTime, fightEndTime);
-            return [];
+            return new CastEventsResult();
         }
 
         var durationMs = fightEndTime - fightStartTime;
         log.Debug("[FFLogs] Fight times: start={0} end={1} duration={2}ms", fightStartTime, fightEndTime, durationMs);
+
+        var encounterId = fights[0]?["encounterID"]?.Value<int>() ?? 0;
+        var encounterName = fights[0]?["name"]?.ToString() ?? string.Empty;
+        var lastPhase = fights[0]?["lastPhase"]?.Value<int>() ?? 0;
+        var lastPhaseAsAbsoluteIndex = fights[0]?["lastPhaseAsAbsoluteIndex"]?.Value<int>() ?? 0;
+        var lastPhaseIsIntermission = fights[0]?["lastPhaseIsIntermission"]?.Value<bool>() ?? false;
+        var encounterPhaseMap = ParseEncounterPhases(reportToken["phases"] as JArray);
+        var phaseInfo = new FightPhaseInfo
+        {
+            EncounterId = encounterId,
+            EncounterName = encounterName,
+            FightStartTime = fightStartTime,
+            FightEndTime = fightEndTime,
+            LastPhase = lastPhase,
+            LastPhaseAsAbsoluteIndex = lastPhaseAsAbsoluteIndex,
+            LastPhaseIsIntermission = lastPhaseIsIntermission,
+            PhaseTransitions = ParseFightPhaseTransitions(fights[0]?["phaseTransitions"] as JArray),
+            PhaseMetadata = encounterPhaseMap.TryGetValue(encounterId, out var metadata)
+                ? CloneEncounterPhaseMetadataList(metadata)
+                : [],
+        };
 
         // Build ability name/icon lookup from masterData
         var abilityLookup = new Dictionary<int, (string name, string icon)>();
@@ -576,7 +614,11 @@ public sealed class FFLogsClient : IDisposable
 
         log.Info("[FFLogs] Report {0} fight {1}: {2} cast events across {3} page(s).",
             reportCode, fightId, allEvents.Count, pageNum);
-        return allEvents;
+        return new CastEventsResult
+        {
+            Casts = allEvents,
+            PhaseInfo = phaseInfo,
+        };
     }
 
     /// <summary>
@@ -736,6 +778,75 @@ public sealed class FFLogsClient : IDisposable
         return allEvents;
     }
 
+    private static Dictionary<int, List<EncounterPhaseMetadata>> ParseEncounterPhases(JArray? phasesArray)
+    {
+        var result = new Dictionary<int, List<EncounterPhaseMetadata>>();
+        if (phasesArray == null)
+            return result;
+
+        foreach (var encounterPhasesToken in phasesArray)
+        {
+            var encounterId = encounterPhasesToken["encounterID"]?.Value<int>() ?? 0;
+            if (encounterId == 0)
+                continue;
+
+            var phases = new List<EncounterPhaseMetadata>();
+            if (encounterPhasesToken["phases"] is JArray phaseArray)
+            {
+                foreach (var phaseToken in phaseArray)
+                {
+                    var phaseId = phaseToken["id"]?.Value<int>() ?? 0;
+                    if (phaseId == 0)
+                        continue;
+
+                    phases.Add(new EncounterPhaseMetadata
+                    {
+                        Id = phaseId,
+                        Name = phaseToken["name"]?.ToString() ?? $"Phase {phaseId}",
+                        IsIntermission = phaseToken["isIntermission"]?.Value<bool>() ?? false,
+                    });
+                }
+            }
+
+            result[encounterId] = phases;
+        }
+
+        return result;
+    }
+
+    private static List<FightPhaseTransition> ParseFightPhaseTransitions(JArray? transitionsArray)
+    {
+        var transitions = new List<FightPhaseTransition>();
+        if (transitionsArray == null)
+            return transitions;
+
+        foreach (var transitionToken in transitionsArray)
+        {
+            var phaseId = transitionToken["id"]?.Value<int>() ?? 0;
+            if (phaseId == 0)
+                continue;
+
+            transitions.Add(new FightPhaseTransition
+            {
+                Id = phaseId,
+                StartTime = transitionToken["startTime"]?.Value<long>() ?? 0,
+            });
+        }
+
+        return transitions;
+    }
+
+    private static List<EncounterPhaseMetadata> CloneEncounterPhaseMetadataList(
+        IEnumerable<EncounterPhaseMetadata> metadata)
+        => metadata
+            .Select(phase => new EncounterPhaseMetadata
+            {
+                Id = phase.Id,
+                Name = phase.Name,
+                IsIntermission = phase.IsIntermission,
+            })
+            .ToList();
+
     // ── Report importer API ──
 
     /// <summary>
@@ -752,8 +863,24 @@ public sealed class FFLogsClient : IDisposable
                   fights(killType: Kills) {
                     id
                     name
+                    encounterID
                     startTime
                     endTime
+                    lastPhase
+                    lastPhaseAsAbsoluteIndex
+                    lastPhaseIsIntermission
+                    phaseTransitions {
+                      id
+                      startTime
+                    }
+                  }
+                  phases {
+                    encounterID
+                    phases {
+                      id
+                      name
+                      isIntermission
+                    }
                   }
                   masterData {
                     actors(type: "Player") {
@@ -781,6 +908,8 @@ public sealed class FFLogsClient : IDisposable
             return ([], [], []);
         }
 
+        var encounterPhaseMap = ParseEncounterPhases(reportToken["phases"] as JArray);
+
         // Parse fights
         var fights = new List<ReportFight>();
         if (reportToken["fights"] is JArray fightArray)
@@ -789,12 +918,21 @@ public sealed class FFLogsClient : IDisposable
             {
                 var id = f["id"]?.Value<int>() ?? 0;
                 if (id == 0) continue;
+                var encounterId = f["encounterID"]?.Value<int>() ?? 0;
                 fights.Add(new ReportFight
                 {
                     Id        = id,
                     Name      = f["name"]?.ToString() ?? $"Fight {id}",
+                    EncounterId = encounterId,
                     StartTime = f["startTime"]?.Value<long>() ?? 0,
                     EndTime   = f["endTime"]?.Value<long>() ?? 0,
+                    LastPhase = f["lastPhase"]?.Value<int>() ?? 0,
+                    LastPhaseAsAbsoluteIndex = f["lastPhaseAsAbsoluteIndex"]?.Value<int>() ?? 0,
+                    LastPhaseIsIntermission = f["lastPhaseIsIntermission"]?.Value<bool>() ?? false,
+                    PhaseTransitions = ParseFightPhaseTransitions(f["phaseTransitions"] as JArray),
+                    PhaseMetadata = encounterPhaseMap.TryGetValue(encounterId, out var metadata)
+                        ? CloneEncounterPhaseMetadataList(metadata)
+                        : [],
                 });
             }
         }

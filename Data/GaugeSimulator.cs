@@ -121,9 +121,12 @@ public static class GaugeSimulator
         public string ResourceName { get; init; } = string.Empty;
         public int GrantCount { get; init; } = 1;
         public int ConsumeCount { get; init; } = 1;
+        public double? WindowDurationSec { get; init; }
         public bool TriggerConsumesWhenResourcePresent { get; init; }
         public bool SkipCooldownWhenConsuming { get; init; }
+        public bool BypassGaugeSpendChecksWhenConsuming { get; init; }
         public HashSet<string> ConsumerNames { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+        public IReadOnlyList<GaugeEffect> ConsumeBonusEffects { get; init; } = [];
     }
 
     public sealed class JobGaugeRules
@@ -322,6 +325,23 @@ public static class GaugeSimulator
         string resourceName,
         int maxValue,
         params string[] consumerNames)
+        => AddRepeatableGrantedAction(
+            resources,
+            rules,
+            triggerName,
+            resourceName,
+            maxValue,
+            windowDurationSec: null,
+            consumerNames);
+
+    private static void AddRepeatableGrantedAction(
+        List<GaugeResource> resources,
+        List<RepeatableGrantedActionRule> rules,
+        string triggerName,
+        string resourceName,
+        int maxValue,
+        double? windowDurationSec,
+        params string[] consumerNames)
     {
         EnsureResource(resources, resourceName, maxValue);
         rules.Add(new RepeatableGrantedActionRule
@@ -329,8 +349,10 @@ public static class GaugeSimulator
             TriggerName = triggerName,
             ResourceName = resourceName,
             GrantCount = maxValue,
+            WindowDurationSec = windowDurationSec,
             TriggerConsumesWhenResourcePresent = true,
             SkipCooldownWhenConsuming = true,
+            BypassGaugeSpendChecksWhenConsuming = true,
             ConsumerNames = new HashSet<string>(consumerNames, StringComparer.OrdinalIgnoreCase),
         });
     }
@@ -702,7 +724,7 @@ public static class GaugeSimulator
     // ── Dark Knight (DRK) — Blood Gauge + MP ───────────────────────────────
     //
     // Blood Gauge: 0–100, starts at 0.
-    //   Generators: combo hits (+10/+20)
+    //   Generators: Souleater/Stalwart Soul (+20), Blood Weapon (+10 per stack)
     //   Spenders:   Bloodspiller / Quietus (≥50, cost 50)
     // MP: 0–10000, starts full.
     //   Generators: Syphon Strike +600, Stalwart Soul +600, Comeuppance +200,
@@ -710,9 +732,9 @@ public static class GaugeSimulator
     //               Abyssal Drain +600
     //   Spenders:   Edge of Shadow / Flood of Shadow / The Blackest Night
     //               (≥3000, cost 3000)
-    //   Delirium: at level 100 Delirium transforms Bloodspiller into a free 3-hit chain
-    //   (Scarlet Delirium → Comeuppance → Torcleaver). These are flagged as 0-cost.
-    //   ► False positives possible if Bloodspiller is listed without the Delirium replacements.
+    //   Delirium: grants 3 Delirium stacks and 3 Blood Weapon stacks for 15s.
+    //   Bloodspiller changes to Scarlet Delirium and Quietus changes to Impalement.
+    //   Blood Weapon: each landed weaponskill/spell spends 1 stack to grant +10 Blood and +600 MP.
     private static JobGaugeRules BuildDarkKnightRules()
     {
         var effects = new Dictionary<string, IReadOnlyList<GaugeEffect>>(StringComparer.OrdinalIgnoreCase)
@@ -735,15 +757,17 @@ public static class GaugeSimulator
             // Spenders (need ≥50)
             ["Bloodspiller"]     = E("Blood", -50, minRequired: 50),
             ["Quietus"]          = E("Blood", -50, minRequired: 50),
-            // Level-100 Delirium chain — free, no Blood cost
+            // Level-100 Delirium chain — free, enabled by Delirium
             ["Delirium"]         =
             [
                 new GaugeEffect { GaugeName = "Delirium", Delta = +3 },
+                new GaugeEffect { GaugeName = "Blood Weapon", Delta = +3 },
                 new GaugeEffect { GaugeName = "Scarlet Delirium Ready", Delta = +1 },
             ],
             ["Scarlet Delirium"] =
             [
                 new GaugeEffect { GaugeName = "Blood", Delta = 0 },
+                new GaugeEffect { GaugeName = "Delirium", Delta = -1, MinRequired = 1 },
                 new GaugeEffect { GaugeName = "Scarlet Delirium Ready", Delta = -1, MinRequired = 1 },
                 new GaugeEffect { GaugeName = "Comeuppance Ready", Delta = +1 },
             ],
@@ -751,6 +775,7 @@ public static class GaugeSimulator
             [
                 new GaugeEffect { GaugeName = "Blood", Delta = 0 },
                 new GaugeEffect { GaugeName = "MP", Delta = +200 },
+                new GaugeEffect { GaugeName = "Delirium", Delta = -1, MinRequired = 1 },
                 new GaugeEffect { GaugeName = "Comeuppance Ready", Delta = -1, MinRequired = 1 },
                 new GaugeEffect { GaugeName = "Torcleaver Ready", Delta = +1 },
             ],
@@ -758,12 +783,14 @@ public static class GaugeSimulator
             [
                 new GaugeEffect { GaugeName = "Blood", Delta = 0 },
                 new GaugeEffect { GaugeName = "MP", Delta = +200 },
+                new GaugeEffect { GaugeName = "Delirium", Delta = -1, MinRequired = 1 },
                 new GaugeEffect { GaugeName = "Torcleaver Ready", Delta = -1, MinRequired = 1 },
             ],
             ["Impalement"]       =
             [
                 new GaugeEffect { GaugeName = "Blood", Delta = 0 },
                 new GaugeEffect { GaugeName = "MP", Delta = +500 },
+                new GaugeEffect { GaugeName = "Delirium", Delta = -1, MinRequired = 1 },
             ],   // AoE Delirium finisher
             ["Salted Earth"]     = E("Salt and Darkness Ready", +1),
             ["Salt and Darkness"]= E("Salt and Darkness Ready", -1, minRequired: 1),
@@ -780,12 +807,40 @@ public static class GaugeSimulator
             new() { Name = "MP", MaxValue = 10000, InitialValue = 10000, AvoidOvercap = true },
             new() { Name = "Salt and Darkness Ready", MaxValue = 1, InitialValue = 0 },
             new() { Name = "Delirium", MaxValue = 3, InitialValue = 0 },
+            new() { Name = "Blood Weapon", MaxValue = 3, InitialValue = 0 },
             new() { Name = "Scarlet Delirium Ready", MaxValue = 1, InitialValue = 0 },
             new() { Name = "Comeuppance Ready", MaxValue = 1, InitialValue = 0 },
             new() { Name = "Torcleaver Ready", MaxValue = 1, InitialValue = 0 },
         };
         var repeatableGrantedActionRules = new List<RepeatableGrantedActionRule>();
-        AddRepeatableGrantedAction(resources, repeatableGrantedActionRules, "Delirium", "Delirium", 3, "Bloodspiller", "Quietus");
+        repeatableGrantedActionRules.Add(new RepeatableGrantedActionRule
+        {
+            TriggerName = "Delirium",
+            ResourceName = "Blood Weapon",
+            GrantCount = 0,
+            ConsumeCount = 1,
+            BypassGaugeSpendChecksWhenConsuming = false,
+            ConsumerNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "Hard Slash",
+                "Syphon Strike",
+                "Souleater",
+                "Unmend",
+                "Unleash",
+                "Stalwart Soul",
+                "Bloodspiller",
+                "Quietus",
+                "Scarlet Delirium",
+                "Comeuppance",
+                "Torcleaver",
+                "Impalement",
+            },
+            ConsumeBonusEffects =
+            [
+                new GaugeEffect { GaugeName = "Blood", Delta = +10 },
+                new GaugeEffect { GaugeName = "MP", Delta = +600 },
+            ],
+        });
 
         return new JobGaugeRules
         {
@@ -1779,13 +1834,23 @@ public static class GaugeSimulator
             new() { Name = "Consolation Ready", MaxValue = 2, InitialValue = 0 },
         };
         var instantCastRules = new List<InstantCastRule>();
+        var repeatableGrantedActionRules = new List<RepeatableGrantedActionRule>();
         AddSwiftcast(resources, effects, instantCastRules);
+        AddRepeatableGrantedAction(
+            resources,
+            repeatableGrantedActionRules,
+            "Summon Seraph",
+            "Consolation Ready",
+            2,
+            22.0,
+            "Consolation");
 
         return new JobGaugeRules
         {
             Resources    = resources,
             EffectByName = effects,
             InstantCastRules = instantCastRules,
+            RepeatableGrantedActionRules = repeatableGrantedActionRules,
         };
     }
 

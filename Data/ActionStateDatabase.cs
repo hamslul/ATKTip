@@ -164,7 +164,11 @@ public sealed class ActionStateDatabase
                     grantors.Add(abilityName);
                 }
 
-                if (effect.MinRequired > 0 || effect.Delta < 0)
+                // Pure "clear the old grant" effects should not make the clearing action
+                // depend on that granted state existing. This matters for AST draws:
+                // Astral Draw and Umbral Draw clear the opposite hand, but neither draw
+                // should require the other hand to be active before it can be used.
+                if (effect.MinRequired > 0)
                 {
                     if (!consumersByResource.TryGetValue(effect.ResourceName, out var consumers))
                     {
@@ -179,6 +183,12 @@ public sealed class ActionStateDatabase
 
         foreach (var rule in rules.RepeatableGrantedActionRules)
         {
+            if (!rule.SkipCooldownWhenConsuming &&
+                !rule.BypassGaugeSpendChecksWhenConsuming)
+            {
+                continue;
+            }
+
             AddExplicitStateEffect(actionsByName, effectsById, effectsByName, rule.TriggerName, new ActionStateEffect
             {
                 StateName = rule.ResourceName,

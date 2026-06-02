@@ -25,6 +25,7 @@ public sealed class RecastDatabase
         {
             ["Life Surge"] = new() { MaxCharges = 2 },
             ["Macrocosmos"] = new() { ActionCategory = 4 },
+            ["Bloodspiller"] = new() { ActionCategory = 3 },
             ["Forbidden Meditation"] = new() { ActionCategory = 3 },
             ["Enlightened Meditation"] = new() { ActionCategory = 3 },
             ["Shield Samba"] = new() { RecastSec = 90.0 },

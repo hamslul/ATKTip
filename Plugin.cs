@@ -12,7 +12,9 @@ namespace ATKTip;
 
 public sealed class Plugin : IDalamudPlugin
 {
-    private const string CommandName = "/atktip";
+    private const string CommandName = "/ATKTip";
+    private const string CommandAlias = "/atktip";
+    private const string CommandAliasHams = "/hams";
 
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly ICommandManager commandManager;
@@ -24,6 +26,9 @@ public sealed class Plugin : IDalamudPlugin
     public Configuration Configuration { get; }
     public string ConfigDirectory { get; }
     public TimelineStore TimelineStore { get; }
+    public UiSettingsStore UiSettingsStore { get; }
+    public TimelineUserStateStore TimelineUserStateStore { get; }
+    public CustomTimelineStore CustomTimelineStore { get; }
     public FFLogsClient FFLogsClient { get; }
     public TimelineAggregator Aggregator { get; }
     public Data.RecastDatabase RecastDatabase { get; }
@@ -77,6 +82,14 @@ public sealed class Plugin : IDalamudPlugin
         Directory.CreateDirectory(dataDir);
 
         TimelineStore  = new TimelineStore(dataDir, log);
+        UiSettingsStore = new UiSettingsStore(Path.Combine(dataDir, "ui-settings.json"), log);
+        TimelineUserStateStore = new TimelineUserStateStore(Path.Combine(dataDir, "timeline-ui-state.json"), log);
+        CustomTimelineStore = new CustomTimelineStore(dataDir, log);
+        TimelineStore.Load();
+        UiSettingsStore.LoadInto(Configuration);
+        TimelineUserStateStore.LoadInto(Configuration);
+        CustomTimelineStore.LoadInto(Configuration);
+        TimelineUserStateStore.SaveFrom(Configuration);
         FFLogsClient   = new FFLogsClient(Configuration, log);
         RecastDatabase = new Data.RecastDatabase(dataManager, log);
         ActionStateDatabase = new ActionStateDatabase(RecastDatabase);
@@ -112,10 +125,18 @@ public sealed class Plugin : IDalamudPlugin
         pluginInterface.UiBuilder.OpenConfigUi += () => mainWindow.FocusConfigTab();
         pluginInterface.UiBuilder.OpenMainUi += () => mainWindow.Toggle();
 
-        commandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
+        var commandInfo = new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open the ATKTipDebug timeline window.",
-        });
+            HelpMessage = "Open the ATKTip timeline window.",
+        };
+        commandManager.AddHandler(CommandName, commandInfo);
+        if (!string.Equals(CommandAlias, CommandName, StringComparison.Ordinal))
+            commandManager.AddHandler(CommandAlias, commandInfo);
+        if (!string.Equals(CommandAliasHams, CommandName, StringComparison.Ordinal) &&
+            !string.Equals(CommandAliasHams, CommandAlias, StringComparison.Ordinal))
+        {
+            commandManager.AddHandler(CommandAliasHams, commandInfo);
+        }
     }
 
     private void OnCommand(string command, string args)
@@ -144,6 +165,16 @@ public sealed class Plugin : IDalamudPlugin
         pluginInterface.SavePluginConfig(Configuration);
     }
 
+    public void SaveUiSettings()
+    {
+        UiSettingsStore.SaveFrom(Configuration);
+    }
+
+    public void SaveTimelineUserState()
+    {
+        TimelineUserStateStore.SaveFrom(Configuration);
+    }
+
     private void OnLogin()
     {
         framework.RunOnFrameworkThread(() => RecastDatabase.RefreshFromLive(log));
@@ -153,6 +184,13 @@ public sealed class Plugin : IDalamudPlugin
     {
         clientState.Login -= OnLogin;
         commandManager.RemoveHandler(CommandName);
+        if (!string.Equals(CommandAlias, CommandName, StringComparison.Ordinal))
+            commandManager.RemoveHandler(CommandAlias);
+        if (!string.Equals(CommandAliasHams, CommandName, StringComparison.Ordinal) &&
+            !string.Equals(CommandAliasHams, CommandAlias, StringComparison.Ordinal))
+        {
+            commandManager.RemoveHandler(CommandAliasHams);
+        }
         pluginInterface.UiBuilder.Draw -= windowSystem.Draw;
         pluginInterface.UiBuilder.Draw -= antsController.Draw;
         windowSystem.RemoveAllWindows();

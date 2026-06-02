@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Numerics;
 using Dalamud.Configuration;
+using Newtonsoft.Json;
 
 namespace ATKTip;
 
@@ -35,11 +36,13 @@ public sealed class Configuration : IPluginConfiguration
     public float MainIconSize    { get; set; } = 22.0f;
     public float MainIconOpacity { get; set; } = 1.0f;
     public float MainIconScale   { get; set; } = 1.0f;
+    public float AutoTimelineGcdRecastSec { get; set; } = 2.5f;
+    public float AutoTimelineDotRefreshBufferSec { get; set; } = 6.0f;
 
     // Ability Ants — master toggle + custom mode
     public bool    AntsEnabled         { get; set; } = true;
     // Custom mode replaces the native FFXIV highlight with an ImGui-drawn border (both GCD + oGCD)
-    public bool    AntsCustomEnabled   { get; set; } = false;
+    public bool    AntsCustomEnabled   { get; set; } = true;
 
     // oGCD ants (existing field names kept for JSON backward-compat)
     public bool    OgcdAntsEnabled     { get; set; } = true;
@@ -53,6 +56,7 @@ public sealed class Configuration : IPluginConfiguration
     public float   AntsThickness       { get; set; } = 2.0f;
     public float   AntsBorderPadding   { get; set; } = 0.0f;
     public float   AntsXOffset         { get; set; } = -5.0f;
+    public float   AntsYOffset         { get; set; } = 0.0f;
 
     // GCD ants (new — separate customisation from oGCDs)
     public bool    GcdAntsEnabled        { get; set; } = true;
@@ -66,20 +70,30 @@ public sealed class Configuration : IPluginConfiguration
     public float   GcdAntsThickness      { get; set; } = 2.0f;
     public float   GcdAntsBorderPadding  { get; set; } = 0.0f;
     public float   GcdAntsXOffset        { get; set; } = -5.0f;
+    public float   GcdAntsYOffset        { get; set; } = 0.0f;
 
     // Per-timeline skill visibility: key = "encounterId_specName", value = set of hidden ability IDs
+    [JsonIgnore]
     public Dictionary<string, HashSet<int>> HiddenAbilities { get; set; } = [];
 
     // Per-ability frequency thresholds: key = "encounterId_specName", value = { abilityId -> threshold (0..1) }
     // Overrides OverlayFreqThreshold for specific abilities. Falls back to global if not set.
+    [JsonIgnore]
     public Dictionary<string, Dictionary<int, float>> AbilityFreqThresholds { get; set; } = [];
 
+    // Per-auto-timeline skill filters: key = "encounterId_specName", value = set of ability IDs excluded from auto-timeline generation
+    [JsonIgnore]
+    public Dictionary<string, HashSet<int>> AutoTimelineDisabledAbilities { get; set; } = [];
+
     // Custom timelines the user has saved (serialized copies they can edit)
+    [JsonIgnore]
     public Dictionary<string, Data.AggregatedTimeline> CustomTimelines { get; set; } = [];
 
     // Custom timeline groups: ordered list of group names
+    [JsonIgnore]
     public List<string> TimelineGroups { get; set; } = [];
 
     // Maps timeline key → group name (unassigned keys = ungrouped)
+    [JsonIgnore]
     public Dictionary<string, string> TimelineGroupAssignments { get; set; } = [];
 }

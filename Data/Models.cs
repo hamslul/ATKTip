@@ -121,6 +121,8 @@ public sealed class AggregatedTimeline
     public List<TimelineEntry> AutoTimelineSourceEntries { get; set; } = [];
     /// <summary>Per-parse cached FFLogs timelines used for debug inspection of the top source parses.</summary>
     public List<CachedFflogsParseTimeline> CachedFflogsParses { get; set; } = [];
+    /// <summary>Optional FFLogs phase metadata for fights that can be split into phase-scoped custom or auto timelines.</summary>
+    public FightPhaseInfo? PhaseInfo { get; set; }
 }
 
 public sealed class CachedFflogsParseTimeline
@@ -131,6 +133,8 @@ public sealed class CachedFflogsParseTimeline
     public double RankingAmount { get; set; }
     public double DurationSec { get; set; }
     public List<TimelineEntry> Entries { get; set; } = [];
+    public FightPhaseInfo? PhaseInfo { get; set; }
+    public bool HasVisiblePhaseEntries { get; set; }
 }
 
 public sealed class TimelineEntry
@@ -194,8 +198,14 @@ public sealed class ReportFight
 {
     public int Id { get; set; }
     public string Name { get; set; } = string.Empty;
+    public int EncounterId { get; set; }
     public long StartTime { get; set; }   // ms from report start
     public long EndTime { get; set; }     // ms from report start
+    public int LastPhase { get; set; }
+    public int LastPhaseAsAbsoluteIndex { get; set; }
+    public bool LastPhaseIsIntermission { get; set; }
+    public List<FightPhaseTransition> PhaseTransitions { get; set; } = [];
+    public List<EncounterPhaseMetadata> PhaseMetadata { get; set; } = [];
     public long DurationMs => EndTime - StartTime;
 }
 
@@ -205,6 +215,45 @@ public sealed class ReportPlayer
     public string Name { get; set; } = string.Empty;
     public string Type { get; set; } = string.Empty;     // e.g. "Player"
     public string SubType { get; set; } = string.Empty;  // job CamelCase, e.g. "BlackMage"
+}
+
+public sealed class EncounterPhaseMetadata
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public bool IsIntermission { get; set; }
+}
+
+public sealed class EncounterPhasesInfo
+{
+    public int EncounterId { get; set; }
+    public bool SeparatesWipes { get; set; }
+    public List<EncounterPhaseMetadata> Phases { get; set; } = [];
+}
+
+public sealed class FightPhaseTransition
+{
+    public int Id { get; set; }
+    public long StartTime { get; set; }
+}
+
+public sealed class FightPhaseInfo
+{
+    public int EncounterId { get; set; }
+    public string EncounterName { get; set; } = string.Empty;
+    public long FightStartTime { get; set; }
+    public long FightEndTime { get; set; }
+    public int LastPhase { get; set; }
+    public int LastPhaseAsAbsoluteIndex { get; set; }
+    public bool LastPhaseIsIntermission { get; set; }
+    public List<FightPhaseTransition> PhaseTransitions { get; set; } = [];
+    public List<EncounterPhaseMetadata> PhaseMetadata { get; set; } = [];
+}
+
+public sealed class CastEventsResult
+{
+    public List<CastEvent> Casts { get; set; } = [];
+    public FightPhaseInfo? PhaseInfo { get; set; }
 }
 
 // ── UI state helpers ──

@@ -2,12 +2,12 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
 
   <PropertyGroup>
-    <Version>1.1.0</Version>
-    <Author>ATK</Author>
+    <Version>1.2.2</Version>
+    <Author>hamslul</Author>
     <Name>ATKTip</Name>
-    <Punchline>FFLogs-powered average rotation timelines for every fight and job.</Punchline>
-    <Description>Displays aggregated skill timelines from top FFLogs parses. Shows what the average top player does at any given moment in a fight, with a live overlay that tracks your current encounter.</Description>
-    <PackageProjectUrl>https://github.com/ATK/ATKTip</PackageProjectUrl>
+    <Punchline>FFLogs-powered rotation timelines for every fight and job.</Punchline>
+    <Description>Aggregated top 100 FFLogs with custom timelines.</Description>
+    <PackageProjectUrl>https://github.com/hamslul/ATKTip</PackageProjectUrl>
     <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
     <IsPackable>false</IsPackable>
     <DalamudApiLevel>15</DalamudApiLevel>
@@ -16,6 +16,9 @@
 
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <None Include="json.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
   <PropertyGroup>
@@ -23,5 +26,9 @@
     <OutputPath>bin\x64\Release</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
+
+  <Target Name="CopyRepositoryManifest" AfterTargets="Build">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;Copy-Item -LiteralPath '$(MSBuildProjectDirectory)\json.txt' -Destination '$(TargetDir)ATKTip.json' -Force&quot;" />
+  </Target>
 
 </Project>
