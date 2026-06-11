@@ -431,7 +431,7 @@ public sealed class ConfigWindow : Window
             if (toRemove != null)
             {
                 plugin.CustomTimelineStore.RemoveTimeline(plugin.Configuration, toRemove);
-                plugin.Configuration.TimelineGroupAssignments.Remove(toRemove);
+                plugin.Configuration.RemoveTimelineReferences(toRemove);
                 plugin.SaveTimelineUserState();
             }
         }

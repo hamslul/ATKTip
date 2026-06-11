@@ -84,6 +84,7 @@ public sealed class OverlayWindow : Window, IDisposable
     /// <summary>When true the view is frozen at <see cref="combatElapsedSec"/> so the
     /// user can study upcoming abilities without the red line advancing.</summary>
     private bool     combatViewPaused;
+    private bool     manualOverlayActive;
     /// <summary>Set when the user clicks × to close the overlay mid-combat.
     /// Suppresses ants and auto-execute until a fresh timeline is loaded.</summary>
     private bool     overlayDismissed;
@@ -215,7 +216,8 @@ public sealed class OverlayWindow : Window, IDisposable
            antsArmed &&
            !overlayDismissed &&
            activeTimeline != null &&
-           (inCombat || isPreview);
+           (inCombat || isPreview) &&
+           (!manualOverlayActive || inCombat);
 
     public void SetTimeline(AggregatedTimeline? timeline, string key, bool resetDismissed = true)
     {
@@ -429,6 +431,7 @@ public sealed class OverlayWindow : Window, IDisposable
         var preserveOpen = IsOpen;
 
         SetTimeline(timeline, key, resetDismissed: false);
+        manualOverlayActive = false;
         overlayDismissed  = preserveDismissed;
         antsArmed         = !overlayDismissed;
         isEncounterZone   = true;
@@ -449,6 +452,7 @@ public sealed class OverlayWindow : Window, IDisposable
     public void StopPreview()
     {
         SetTimeline(null, string.Empty);
+        manualOverlayActive = false;
         antsArmed            = false;
         isPreview            = false;
         previewAutoplay      = false;
@@ -456,6 +460,22 @@ public sealed class OverlayWindow : Window, IDisposable
         previewManualTimeSec = 0;
         isScrubbing          = false;
         isEncounterZone      = false;
+        IsOpen               = false;
+    }
+
+    public void ClearForPhaseTransition()
+    {
+        SetTimeline(null, string.Empty, resetDismissed: false);
+        manualOverlayActive = false;
+        antsArmed            = false;
+        isPreview            = false;
+        previewAutoplay      = false;
+        previewManualTimeSec = 0;
+        combatElapsedSec     = 0;
+        isScrubbing          = false;
+        inCombat             = false;
+        combatViewPaused     = false;
+        isEncounterZone      = true;
         IsOpen               = false;
     }
 
@@ -523,6 +543,7 @@ public sealed class OverlayWindow : Window, IDisposable
     public void ClearForZoneChange()
     {
         SetTimeline(null, string.Empty);
+        manualOverlayActive = false;
         antsArmed         = false;
         isPreview        = false;
         previewAutoplay  = false;
@@ -538,10 +559,13 @@ public sealed class OverlayWindow : Window, IDisposable
     /// timeline before the pull. When combat starts, OnConditionChange locks the
     /// overlay and switches to live tracking automatically.
     /// </summary>
-    public void PrepareCombatPreview(AggregatedTimeline timeline)
+    public void PrepareCombatPreview(AggregatedTimeline timeline, string? key = null)
     {
-        var key = TimelineDatabase.MakeKey(timeline.EncounterId, timeline.SpecName);
-        SetTimeline(timeline, key);
+        var resolvedKey = string.IsNullOrWhiteSpace(key)
+            ? TimelineDatabase.MakeKey(timeline.EncounterId, timeline.SpecName)
+            : key;
+        SetTimeline(timeline, resolvedKey);
+        manualOverlayActive = false;
         // Manual/zone preview should show ability ants immediately while the user
         // studies or plays the timeline before the pull starts.
         antsArmed            = true;
@@ -556,6 +580,34 @@ public sealed class OverlayWindow : Window, IDisposable
         autoExecQueued.Clear();
         autoExecLastElapsed  = -1.0;
         IsOpen               = true;
+    }
+
+    public void LoadManualOverlay(AggregatedTimeline timeline, string? key = null)
+    {
+        var resolvedKey = string.IsNullOrWhiteSpace(key)
+            ? TimelineDatabase.MakeKey(timeline.EncounterId, timeline.SpecName)
+            : key;
+        SetTimeline(timeline, resolvedKey);
+        manualOverlayActive = true;
+        antsArmed           = false;
+        isPreview           = false;
+        previewAutoplay     = false;
+        previewManualTimeSec = 0;
+        isScrubbing         = false;
+        isEncounterZone     = false;
+        inCombat            = false;
+        combatViewPaused    = false;
+        combatStartTime     = DateTime.UtcNow;
+        combatElapsedSec    = 0;
+        autoExecQueue.Clear();
+        autoExecQueued.Clear();
+        autoExecLastElapsed = -1.0;
+        IsOpen              = true;
+    }
+
+    public void StopManualOverlay()
+    {
+        StopPreview();
     }
 
     /// <summary>
@@ -609,9 +661,10 @@ public sealed class OverlayWindow : Window, IDisposable
             // Only start live tracking for timelines loaded by EncounterTracker
             // (i.e. the player is actually in a mapped encounter zone).
             // Ignoring combat from training dummies, open-world mobs, etc.
-            if (!isEncounterZone) return;
+            if (!isEncounterZone && !manualOverlayActive) return;
 
             inCombat             = true;
+            antsArmed            = true;
             isPreview            = false;
             previewAutoplay      = false;
             isScrubbing          = false;
@@ -627,6 +680,17 @@ public sealed class OverlayWindow : Window, IDisposable
         else if (!value && inCombat)
         {
             inCombat = false;
+            antsArmed = false;
+
+            if (manualOverlayActive)
+            {
+                combatViewPaused  = false;
+                combatElapsedSec  = 0;
+                previewManualTimeSec = 0;
+                isScrubbing       = false;
+                return;
+            }
+
             // Instead of going blank, resume paused preview at the time combat ended.
             if (activeTimeline != null)
             {
@@ -641,8 +705,19 @@ public sealed class OverlayWindow : Window, IDisposable
     private void OnDutyWiped(Dalamud.Game.DutyState.IDutyStateEventArgs _)
     {
         inCombat = false;
+        antsArmed = false;
         autoExecQueue.Clear();
         autoExecQueued.Clear();
+
+        if (manualOverlayActive)
+        {
+            combatViewPaused     = false;
+            combatElapsedSec     = 0;
+            previewManualTimeSec = 0;
+            isScrubbing          = false;
+            return;
+        }
+
         // Wipe — snap back to t=0 in paused preview.
         if (activeTimeline != null)
         {
@@ -657,6 +732,14 @@ public sealed class OverlayWindow : Window, IDisposable
     private void OnDutyCompleted(Dalamud.Game.DutyState.IDutyStateEventArgs _)
     {
         inCombat = false;
+        antsArmed = false;
+
+        if (manualOverlayActive)
+        {
+            combatViewPaused = true;
+            return;
+        }
+
         // Completion — stay paused at wherever the timeline is.
         if (activeTimeline != null)
         {
@@ -737,8 +820,12 @@ public sealed class OverlayWindow : Window, IDisposable
             if (!combatViewPaused)
                 combatElapsedSec = (DateTime.UtcNow - combatStartTime).TotalSeconds;
         }
+        else if (manualOverlayActive)
+        {
+            combatElapsedSec = 0;
+        }
 
-        var isActive   = inCombat || isPreview;
+        var isActive   = inCombat || isPreview || manualOverlayActive;
         var drawList   = ImGui.GetWindowDrawList();
         var wPos       = ImGui.GetWindowPos();
         var wSize      = ImGui.GetWindowSize();
@@ -760,14 +847,17 @@ public sealed class OverlayWindow : Window, IDisposable
 
             var sTop = wPos.Y + 3f;
             var midY = sTop + btnH / 2f;
+            var trackerState = plugin.EncounterTracker.GetTrackerDebugState();
+            var hasManualNextPhase = trackerState.HasActiveEncounter && trackerState.HasNextPhase;
 
             // Button X anchors
             var playX  = wPos.X + margin;
             var lockX  = playX  + btnW + btnGap;
+            var nextX  = lockX  + btnW + btnGap;
             var closeX = wPos.X + wSize.X - margin - btnW;
 
-            // Track sits between lock button and close button
-            var trackL = lockX + btnW + btnGap;
+            // Track sits between next button and close button
+            var trackL = nextX + btnW + btnGap;
             var trackR = closeX - btnGap;
             var trackW = MathF.Max(trackR - trackL, 1f);
 
@@ -883,6 +973,42 @@ public sealed class OverlayWindow : Window, IDisposable
                 plugin.SaveUiSettings();
             }
 
+            var nextTL    = new Vector2(nextX,        sTop);
+            var nextBR    = new Vector2(nextX + btnW, sTop + btnH);
+            var nextHover = ImGui.IsMouseHoveringRect(nextTL, nextBR);
+
+            drawList.AddRectFilled(nextTL, nextBR,
+                ImGui.GetColorU32(
+                    !hasManualNextPhase
+                        ? new Vector4(0.16f, 0.16f, 0.18f, 0.45f)
+                        : nextHover
+                            ? new Vector4(0.25f, 0.72f, 0.35f, 0.92f)
+                            : new Vector4(0.16f, 0.45f, 0.22f, 0.78f)), 3f);
+
+            var nextLbl = ">";
+            var nextSz  = ImGui.CalcTextSize(nextLbl);
+            drawList.AddText(
+                new Vector2(nextX + (btnW - nextSz.X) / 2f, sTop + (btnH - nextSz.Y) / 2f),
+                ImGui.GetColorU32(hasManualNextPhase
+                    ? new Vector4(1f, 1f, 1f, 0.95f)
+                    : new Vector4(1f, 1f, 1f, 0.35f)),
+                nextLbl);
+
+            if (nextHover)
+            {
+                ImGui.SetTooltip(hasManualNextPhase
+                    ? $"Advance manually to phase {trackerState.ActivePhaseOrdinal + 1}."
+                    : "No further phase timeline is available.");
+            }
+
+            if (hasManualNextPhase && nextHover && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+            {
+                if (plugin.EncounterTracker.DebugCommitNextPhase(out var message))
+                    log.Info("Overlay manual phase advance: {0}", message);
+                else
+                    log.Warning("Overlay manual phase advance failed: {0}", message);
+            }
+
             // ── Close button ──────────────────────────────────────────
             var closeTL    = new Vector2(closeX,        sTop);
             var closeBR    = new Vector2(closeX + btnW, sTop + btnH);
@@ -911,9 +1037,16 @@ public sealed class OverlayWindow : Window, IDisposable
 
                 if (inCombat)
                 {
-                    antsArmed = false;
-                    overlayDismissed = true;    // suppress ants + auto-exec for rest of pull
-                    IsOpen = false;
+                    if (manualOverlayActive)
+                    {
+                        StopManualOverlay();
+                    }
+                    else
+                    {
+                        antsArmed = false;
+                        overlayDismissed = true;    // suppress ants + auto-exec for rest of pull
+                        IsOpen = false;
+                    }
                 }
                 else
                     StopPreview();

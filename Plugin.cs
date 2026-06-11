@@ -108,7 +108,7 @@ public sealed class Plugin : IDalamudPlugin
         overlayWindow.StopPreview();
 
         // Zone + combat tracker — auto-loads timelines when entering mapped instances
-        encounterTracker = new EncounterTracker(this, clientState, objectTable, condition, dataManager, framework, log);
+        encounterTracker = new EncounterTracker(this, clientState, objectTable, condition, dutyState, dataManager, framework, log);
 
         // Hotbar ants — hooks IsActionHighlighted to drive FFXIV's native combo/proc animation
         antsController = new AntsController(this, gameGui, gameInterop);

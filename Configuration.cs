@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 using Dalamud.Configuration;
@@ -96,4 +97,23 @@ public sealed class Configuration : IPluginConfiguration
     // Maps timeline key → group name (unassigned keys = ungrouped)
     [JsonIgnore]
     public Dictionary<string, string> TimelineGroupAssignments { get; set; } = [];
+
+    [JsonIgnore]
+    public Dictionary<string, string> TimelineNextLinks { get; set; } = [];
+
+    public void RemoveTimelineReferences(string key)
+    {
+        TimelineGroupAssignments.Remove(key);
+        TimelineNextLinks.Remove(key);
+
+        var sourceKeysToClear = new List<string>();
+        foreach (var (sourceKey, targetKey) in TimelineNextLinks)
+        {
+            if (string.Equals(targetKey, key, StringComparison.Ordinal))
+                sourceKeysToClear.Add(sourceKey);
+        }
+
+        foreach (var sourceKey in sourceKeysToClear)
+            TimelineNextLinks.Remove(sourceKey);
+    }
 }

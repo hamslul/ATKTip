@@ -1107,6 +1107,44 @@ public sealed class MainWindow : Window
                         ImGui.EndMenu();
                     }
 
+                    if (ImGui.BeginMenu("Link Next Timeline"))
+                    {
+                        var currentLinkedKey = cfg.TimelineNextLinks.GetValueOrDefault(key, string.Empty);
+                        if (ImGui.MenuItem("None", string.Empty, string.IsNullOrWhiteSpace(currentLinkedKey)))
+                        {
+                            cfg.TimelineNextLinks.Remove(key);
+                            plugin.SaveTimelineUserState();
+                            plugin.EncounterTracker.RebuildZoneMappings();
+                            SetDebugStatus($"Cleared the next timeline link for {BuildTimelineLinkLabel(key, tl)}.");
+                        }
+
+                        var linkCandidates = GetLinkableCustomTimelineCandidates(key, tl).ToList();
+                        if (linkCandidates.Count > 0)
+                            ImGui.Separator();
+
+                        if (linkCandidates.Count == 0)
+                        {
+                            ImGui.BeginDisabled();
+                            ImGui.MenuItem("No compatible timelines");
+                            ImGui.EndDisabled();
+                        }
+                        else
+                        {
+                            foreach (var (candidateKey, candidateTimeline) in linkCandidates)
+                            {
+                                var isCurrent = string.Equals(currentLinkedKey, candidateKey, StringComparison.Ordinal);
+                                if (ImGui.MenuItem(BuildTimelineLinkLabel(candidateKey, candidateTimeline), string.Empty, isCurrent))
+                                {
+                                    SetCustomTimelineNextLink(key, candidateKey);
+                                    plugin.EncounterTracker.RebuildZoneMappings();
+                                    SetDebugStatus($"Linked {BuildTimelineLinkLabel(key, tl)} to {BuildTimelineLinkLabel(candidateKey, candidateTimeline)}.");
+                                }
+                            }
+                        }
+
+                        ImGui.EndMenu();
+                    }
+
                     ImGui.EndPopup();
                 }
 
@@ -9410,9 +9448,16 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         var keysToRemove = plugin.Configuration.CustomTimelines.Keys
             .Where(key => key.StartsWith($"{baseKey}_p", StringComparison.OrdinalIgnoreCase))
             .ToList();
+        if (keysToRemove.Count == 0)
+            return;
 
         foreach (var key in keysToRemove)
+        {
             plugin.CustomTimelineStore.RemoveTimeline(plugin.Configuration, key);
+            plugin.Configuration.RemoveTimelineReferences(key);
+        }
+
+        plugin.SaveTimelineUserState();
     }
 
     private void RemoveStoredEncounterPhaseTimelines(int baseEncounterId, string specName)
@@ -9753,7 +9798,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 // Also remove from custom timelines
                 var key = TimelineDatabase.MakeKey(encounterId, specName);
                 plugin.CustomTimelineStore.RemoveTimeline(plugin.Configuration, key);
-                plugin.Configuration.TimelineGroupAssignments.Remove(key);
+                plugin.Configuration.RemoveTimelineReferences(key);
                 plugin.SaveTimelineUserState();
                 InvalidateCustomTimelineListCache();
 
@@ -9769,7 +9814,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
     private void DeleteCustomTimeline(string key)
     {
         plugin.CustomTimelineStore.RemoveTimeline(plugin.Configuration, key);
-        plugin.Configuration.TimelineGroupAssignments.Remove(key);
+        plugin.Configuration.RemoveTimelineReferences(key);
         plugin.SaveTimelineUserState();
         InvalidateCustomTimelineListCache();
 
@@ -9879,6 +9924,113 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
 
         baseEncounterId = encounterId;
         return encounterId > 0;
+    }
+
+    private IEnumerable<(string Key, AggregatedTimeline Timeline)> GetLinkableCustomTimelineCandidates(string sourceKey, AggregatedTimeline sourceTimeline)
+    {
+        if (!TryGetBaseEncounterIdFromPhaseEncounterId(sourceTimeline.EncounterId, out var sourceBaseEncounterId) ||
+            sourceBaseEncounterId <= 0)
+        {
+            yield break;
+        }
+
+        var candidates = plugin.Configuration.CustomTimelines
+            .Where(entry => !string.Equals(entry.Key, sourceKey, StringComparison.Ordinal))
+            .Where(entry => string.Equals(entry.Value.SpecName, sourceTimeline.SpecName, StringComparison.OrdinalIgnoreCase))
+            .Where(entry => TryGetBaseEncounterIdFromPhaseEncounterId(entry.Value.EncounterId, out var candidateBaseEncounterId) &&
+                            candidateBaseEncounterId == sourceBaseEncounterId)
+            .OrderBy(entry => BuildTimelineLinkLabel(entry.Key, entry.Value), StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (candidateKey, candidateTimeline) in candidates)
+        {
+            if (!WouldCreateTimelineLinkCycle(sourceKey, candidateKey))
+                yield return (candidateKey, candidateTimeline);
+        }
+    }
+
+    private void SetCustomTimelineNextLink(string sourceKey, string targetKey)
+    {
+        var conflictingSources = plugin.Configuration.TimelineNextLinks
+            .Where(entry => !string.Equals(entry.Key, sourceKey, StringComparison.Ordinal) &&
+                            string.Equals(entry.Value, targetKey, StringComparison.Ordinal))
+            .Select(entry => entry.Key)
+            .ToList();
+
+        foreach (var conflictingSource in conflictingSources)
+            plugin.Configuration.TimelineNextLinks.Remove(conflictingSource);
+
+        plugin.Configuration.TimelineNextLinks[sourceKey] = targetKey;
+        plugin.SaveTimelineUserState();
+    }
+
+    private bool WouldCreateTimelineLinkCycle(string sourceKey, string targetKey)
+    {
+        if (string.Equals(sourceKey, targetKey, StringComparison.Ordinal))
+            return true;
+
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        var currentKey = targetKey;
+        while (!string.IsNullOrWhiteSpace(currentKey) && visited.Add(currentKey))
+        {
+            if (string.Equals(currentKey, sourceKey, StringComparison.Ordinal))
+                return true;
+
+            if (!plugin.Configuration.TimelineNextLinks.TryGetValue(currentKey, out currentKey!))
+                break;
+        }
+
+        return false;
+    }
+
+    private static string BuildTimelineLinkLabel(string key, AggregatedTimeline timeline)
+    {
+        if (TryGetBaseEncounterIdFromPhaseEncounterId(timeline.EncounterId, out var baseEncounterId) &&
+            TryGetPhaseOrdinalFromEncounterId(timeline.EncounterId, baseEncounterId, out var encounterPhaseOrdinal))
+        {
+            return $"{timeline.EncounterName} {GetRomanNumeral(encounterPhaseOrdinal)}";
+        }
+
+        var phaseMatch = Regex.Match(key, @"_p(?<phase>\d+)$", RegexOptions.IgnoreCase);
+        if (phaseMatch.Success &&
+            int.TryParse(phaseMatch.Groups["phase"].Value, out var keyPhaseOrdinal) &&
+            keyPhaseOrdinal > 0)
+        {
+            return $"{timeline.EncounterName} {GetRomanNumeral(keyPhaseOrdinal)}";
+        }
+
+        return $"{timeline.EncounterName} [{key}]";
+    }
+
+    private static bool TryGetPhaseOrdinalFromEncounterId(int encounterId, int baseEncounterId, out int phaseOrdinal)
+    {
+        phaseOrdinal = 0;
+
+        if (baseEncounterId <= 0 || encounterId <= 0)
+            return false;
+
+        if (LegacyGeneratedEncounterPhaseIds.TryGetValue(baseEncounterId, out var legacyPhaseIds))
+        {
+            foreach (var (ordinal, legacyEncounterId) in legacyPhaseIds)
+            {
+                if (legacyEncounterId == encounterId)
+                {
+                    phaseOrdinal = ordinal;
+                    return true;
+                }
+            }
+        }
+
+        if (encounterId < SyntheticPhaseEncounterIdBase)
+            return false;
+
+        var rawValue = encounterId - SyntheticPhaseEncounterIdBase;
+        var candidateBaseEncounterId = rawValue / 100;
+        var candidatePhaseOrdinal = rawValue % 100;
+        if (candidateBaseEncounterId != baseEncounterId || candidatePhaseOrdinal <= 1)
+            return false;
+
+        phaseOrdinal = candidatePhaseOrdinal;
+        return true;
     }
 
     private static string GetEncounterPhaseName(string encounterName, int phaseOrdinal)

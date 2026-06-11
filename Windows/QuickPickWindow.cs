@@ -8,16 +8,16 @@ using ATKTip.Data;
 namespace ATKTip.Windows;
 
 /// <summary>
-/// Compact one-click overlay for manually loading a custom timeline when auto-detection fails.
+/// Compact one-click overlay loader for manually loading a custom timeline when auto-detection fails.
 /// Triggered by <c>/ATKTip preview</c>. Lists custom timelines sorted by relevance
-/// (player's current job first), one click loads the overlay and closes this window.
+/// (player's current job first), one click loads the live encounter overlay and closes this window.
 /// </summary>
 public sealed class QuickPickWindow : Window
 {
     private readonly Plugin plugin;
 
     public QuickPickWindow(Plugin plugin)
-        : base("Quick Preview##ATKTip",
+        : base("Quick Timeline Load##ATKTip",
                ImGuiWindowFlags.NoScrollbar |
                ImGuiWindowFlags.NoResize |
                ImGuiWindowFlags.AlwaysAutoResize |
@@ -45,18 +45,18 @@ public sealed class QuickPickWindow : Window
         var currentSpec = plugin.EncounterTracker.GetCurrentSpecNamePublic();
 
         // Sort: timelines matching current job first, then alphabetical by encounter
-        var sorted = customs.Values
-            .OrderBy(t => !string.Equals(t.SpecName, currentSpec, StringComparison.OrdinalIgnoreCase))
-            .ThenBy(t => t.EncounterName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(t => t.SpecName, StringComparer.OrdinalIgnoreCase)
+        var sorted = customs
+            .OrderBy(entry => !string.Equals(entry.Value.SpecName, currentSpec, StringComparison.OrdinalIgnoreCase))
+            .ThenBy(entry => entry.Value.EncounterName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(entry => entry.Value.SpecName, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         bool shownSeparator = false;
 
-        ImGui.TextDisabled("Click a timeline to preview it:");
+        ImGui.TextDisabled("Click a timeline to load it:");
         ImGui.Spacing();
 
-        foreach (var timeline in sorted)
+        foreach (var (key, timeline) in sorted)
         {
             bool isCurrentJob = string.Equals(timeline.SpecName, currentSpec, StringComparison.OrdinalIgnoreCase);
 
@@ -64,7 +64,7 @@ public sealed class QuickPickWindow : Window
             if (!isCurrentJob && !shownSeparator)
             {
                 // Only draw separator if there were any current-job entries above
-                if (sorted.Any(t => string.Equals(t.SpecName, currentSpec, StringComparison.OrdinalIgnoreCase)))
+                if (sorted.Any(entry => string.Equals(entry.Value.SpecName, currentSpec, StringComparison.OrdinalIgnoreCase)))
                 {
                     ImGui.Separator();
                     ImGui.TextDisabled("Other jobs:");
@@ -78,18 +78,21 @@ public sealed class QuickPickWindow : Window
             if (!isCurrentJob)
                 ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.55f, 0.55f, 0.55f, 1f));
 
+            var consumedSelection = false;
             if (ImGui.Selectable(selectableId))
             {
                 if (!isCurrentJob)
                     ImGui.PopStyleColor();
+                consumedSelection = true;
 
-                plugin.OverlayWindow.PrepareCombatPreview(timeline);
-                plugin.OverlayWindow.IsOpen = true;
-                IsOpen = false;
-                return;
+                if (plugin.EncounterTracker.TryLoadEncounterByTimelineKey(key))
+                {
+                    IsOpen = false;
+                    return;
+                }
             }
 
-            if (!isCurrentJob)
+            if (!isCurrentJob && !consumedSelection)
                 ImGui.PopStyleColor();
         }
     }
