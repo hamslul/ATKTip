@@ -98,22 +98,8 @@ public sealed class Configuration : IPluginConfiguration
     [JsonIgnore]
     public Dictionary<string, string> TimelineGroupAssignments { get; set; } = [];
 
-    [JsonIgnore]
-    public Dictionary<string, string> TimelineNextLinks { get; set; } = [];
-
     public void RemoveTimelineReferences(string key)
     {
         TimelineGroupAssignments.Remove(key);
-        TimelineNextLinks.Remove(key);
-
-        var sourceKeysToClear = new List<string>();
-        foreach (var (sourceKey, targetKey) in TimelineNextLinks)
-        {
-            if (string.Equals(targetKey, key, StringComparison.Ordinal))
-                sourceKeysToClear.Add(sourceKey);
-        }
-
-        foreach (var sourceKey in sourceKeysToClear)
-            TimelineNextLinks.Remove(sourceKey);
     }
 }

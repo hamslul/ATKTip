@@ -98,7 +98,7 @@ public sealed class Plugin : IDalamudPlugin
         // Windows
         ConfigWindow = new ConfigWindow(this);
         mainWindow = new MainWindow(this, log);
-        overlayWindow = new OverlayWindow(this, condition, dutyState, framework, log);
+        overlayWindow = new OverlayWindow(this, condition, dutyState, objectTable, framework, gameInterop, log);
         quickPickWindow = new QuickPickWindow(this);
 
         windowSystem.AddWindow(ConfigWindow);

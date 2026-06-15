@@ -300,6 +300,8 @@ public sealed class MainWindow : Window
     private int     riAutoSelectedEncounter = -1;
     private int     riAutoSelectedPhase = 0;
     private int     riAutoSelectedSpec = -1;
+    private string  riAutoPhaseStartSelectionKey = string.Empty;
+    private List<int> riAutoPhaseStartBossIndices = [];
     private bool    riFetching;
     private bool    riImporting;
     private CancellationTokenSource? riCts;
@@ -1104,44 +1106,6 @@ public sealed class MainWindow : Window
                                 InvalidateCustomTimelineListCache();
                             }
                         }
-                        ImGui.EndMenu();
-                    }
-
-                    if (ImGui.BeginMenu("Link Next Timeline"))
-                    {
-                        var currentLinkedKey = cfg.TimelineNextLinks.GetValueOrDefault(key, string.Empty);
-                        if (ImGui.MenuItem("None", string.Empty, string.IsNullOrWhiteSpace(currentLinkedKey)))
-                        {
-                            cfg.TimelineNextLinks.Remove(key);
-                            plugin.SaveTimelineUserState();
-                            plugin.EncounterTracker.RebuildZoneMappings();
-                            SetDebugStatus($"Cleared the next timeline link for {BuildTimelineLinkLabel(key, tl)}.");
-                        }
-
-                        var linkCandidates = GetLinkableCustomTimelineCandidates(key, tl).ToList();
-                        if (linkCandidates.Count > 0)
-                            ImGui.Separator();
-
-                        if (linkCandidates.Count == 0)
-                        {
-                            ImGui.BeginDisabled();
-                            ImGui.MenuItem("No compatible timelines");
-                            ImGui.EndDisabled();
-                        }
-                        else
-                        {
-                            foreach (var (candidateKey, candidateTimeline) in linkCandidates)
-                            {
-                                var isCurrent = string.Equals(currentLinkedKey, candidateKey, StringComparison.Ordinal);
-                                if (ImGui.MenuItem(BuildTimelineLinkLabel(candidateKey, candidateTimeline), string.Empty, isCurrent))
-                                {
-                                    SetCustomTimelineNextLink(key, candidateKey);
-                                    plugin.EncounterTracker.RebuildZoneMappings();
-                                    SetDebugStatus($"Linked {BuildTimelineLinkLabel(key, tl)} to {BuildTimelineLinkLabel(candidateKey, candidateTimeline)}.");
-                                }
-                            }
-                        }
-
                         ImGui.EndMenu();
                     }
 
@@ -8624,39 +8588,109 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         if (riAutoSelectedEncounter < 0 || riAutoSelectedEncounter >= autoEncounterNames.Count)
             riAutoSelectedEncounter = autoEncounterNames.Count > 0 ? 0 : -1;
 
-        ImGui.SetNextItemWidth(220);
-        if (autoEncounterNames.Count > 0)
+        if (ImGui.BeginTable("##riAutoCreateLayout", 2, ImGuiTableFlags.SizingStretchSame))
         {
-            if (ImGui.Combo("Fight##riAutoFight", ref riAutoSelectedEncounter, autoEncounterNames, -1))
+            ImGui.TableNextColumn();
+
+            ImGui.SetNextItemWidth(220);
+            if (autoEncounterNames.Count > 0)
+            {
+                if (ImGui.Combo("Fight##riAutoFight", ref riAutoSelectedEncounter, autoEncounterNames, -1))
+                {
+                    riAutoSelectedPhase = 0;
+                    riAutoPhaseStartSelectionKey = string.Empty;
+                    riAutoPhaseStartBossIndices.Clear();
+                }
+            }
+            else
+            {
+                var noEncounter = 0;
+                ImGui.Combo("Fight##riAutoFight", ref noEncounter, new List<string> { "(none)" }, -1);
+            }
+
+            var selectedAutoEncounter = riAutoSelectedEncounter >= 0 && riAutoSelectedEncounter < autoEncounters.Count
+                ? autoEncounters[riAutoSelectedEncounter]
+                : null;
+            var selectedAutoSpecName = riAutoSelectedSpec >= 0 && riAutoSelectedSpec < allSpecNames.Count
+                ? allSpecNames[riAutoSelectedSpec]
+                : string.Empty;
+            var fullSourceTimeline = selectedAutoEncounter != null && !string.IsNullOrWhiteSpace(selectedAutoSpecName)
+                ? plugin.TimelineStore.GetTimeline(selectedAutoEncounter.Id, selectedAutoSpecName)
+                : null;
+            var autoPhaseWindows = BuildEncounterPhaseWindows(fullSourceTimeline?.PhaseInfo);
+            var autoPhaseLabels = autoPhaseWindows.Count > 0
+                ? new List<string> { "Full Fight", "Per Phase" }
+                : new List<string> { "Full Fight" };
+            if (riAutoSelectedPhase < 0 || riAutoSelectedPhase >= autoPhaseLabels.Count)
                 riAutoSelectedPhase = 0;
-        }
-        else
-        {
-            var noEncounter = 0;
-            ImGui.Combo("Fight##riAutoFight", ref noEncounter, new List<string> { "(none)" }, -1);
-        }
+            ImGui.SetNextItemWidth(220);
+            if (ImGui.Combo("Phase##riAutoPhase", ref riAutoSelectedPhase, autoPhaseLabels, -1))
+            {
+                riAutoPhaseStartSelectionKey = string.Empty;
+                riAutoPhaseStartBossIndices.Clear();
+            }
 
-        var selectedAutoEncounter = riAutoSelectedEncounter >= 0 && riAutoSelectedEncounter < autoEncounters.Count
-            ? autoEncounters[riAutoSelectedEncounter]
-            : null;
-        var selectedAutoSpecName = riAutoSelectedSpec >= 0 && riAutoSelectedSpec < allSpecNames.Count
-            ? allSpecNames[riAutoSelectedSpec]
-            : string.Empty;
-        var fullSourceTimeline = selectedAutoEncounter != null && !string.IsNullOrWhiteSpace(selectedAutoSpecName)
-            ? plugin.TimelineStore.GetTimeline(selectedAutoEncounter.Id, selectedAutoSpecName)
-            : null;
-        var autoPhaseWindows = BuildEncounterPhaseWindows(fullSourceTimeline?.PhaseInfo);
-        var autoPhaseLabels = autoPhaseWindows.Count > 0
-            ? new List<string> { "Full Fight", "Per Phase" }
-            : new List<string> { "Full Fight" };
-        if (riAutoSelectedPhase < 0 || riAutoSelectedPhase >= autoPhaseLabels.Count)
-            riAutoSelectedPhase = 0;
-        ImGui.SetNextItemWidth(220);
-        ImGui.Combo("Phase##riAutoPhase", ref riAutoSelectedPhase, autoPhaseLabels, -1);
+            ImGui.SetNextItemWidth(220);
+            if (ImGui.Combo("Job##riAutoJob", ref riAutoSelectedSpec, allSpecNames, -1))
+            {
+                riAutoSelectedPhase = 0;
+                riAutoPhaseStartSelectionKey = string.Empty;
+                riAutoPhaseStartBossIndices.Clear();
+            }
 
-        ImGui.SetNextItemWidth(220);
-        if (ImGui.Combo("Job##riAutoJob", ref riAutoSelectedSpec, allSpecNames, -1))
-            riAutoSelectedPhase = 0;
+            var hasAutoSelectionForUi =
+                riAutoSelectedZone >= 0 && riAutoSelectedZone < zones.Count &&
+                riAutoSelectedEncounter >= 0 && riAutoSelectedEncounter < autoEncounters.Count &&
+                riAutoSelectedSpec >= 0 && riAutoSelectedSpec < allSpecNames.Count;
+            var autoEncounterIdForUi = hasAutoSelectionForUi ? autoEncounters[riAutoSelectedEncounter].Id : 0;
+            var autoSpecNameForUi = hasAutoSelectionForUi ? allSpecNames[riAutoSelectedSpec] : string.Empty;
+            var sourceTimelineForUi = hasAutoSelectionForUi
+                ? plugin.TimelineStore.GetTimeline(autoEncounterIdForUi, autoSpecNameForUi)
+                : null;
+            var createPerPhaseAutoTimelineForUi = riAutoSelectedPhase > 0 && autoPhaseWindows.Count > 0;
+            var bossPhaseStartEntries = GetAutoTimelineBossPhaseStartEntries(sourceTimelineForUi);
+            var bossPhaseStartOptions = BuildAutoTimelineBossPhaseStartOptions(bossPhaseStartEntries);
+
+            ImGui.TableNextColumn();
+
+            if (createPerPhaseAutoTimelineForUi)
+            {
+                if (bossPhaseStartOptions.Count > 0)
+                {
+                    EnsureAutoTimelineBossPhaseSelections(
+                        $"{autoEncounterIdForUi}_{autoSpecNameForUi}_{autoPhaseWindows.Count}_{bossPhaseStartOptions.Count}",
+                        autoPhaseWindows,
+                        bossPhaseStartEntries);
+
+                    ImGui.Text("Phase Starts");
+                    ImGui.TextDisabled("Choose the first boss attack shown in each split timeline after phase I.");
+
+                    for (var phaseIndex = 1; phaseIndex < autoPhaseWindows.Count; phaseIndex++)
+                    {
+                        var selectionIndex = phaseIndex - 1;
+                        var selectedBossIndex = selectionIndex < riAutoPhaseStartBossIndices.Count
+                            ? riAutoPhaseStartBossIndices[selectionIndex]
+                            : 0;
+                        selectedBossIndex = Math.Clamp(selectedBossIndex, 0, Math.Max(0, bossPhaseStartOptions.Count - 1));
+                        ImGui.SetNextItemWidth(340);
+                        if (ImGui.Combo(
+                                $"{autoPhaseWindows[phaseIndex].DisplayName}##riAutoPhaseStart{phaseIndex}",
+                                ref selectedBossIndex,
+                                bossPhaseStartOptions,
+                                -1))
+                        {
+                            riAutoPhaseStartBossIndices[selectionIndex] = selectedBossIndex;
+                        }
+                    }
+                }
+                else
+                {
+                    ImGui.TextDisabled("No boss attack markers are available yet. Per-phase auto timelines will fall back to the FFLogs phase windows.");
+                }
+            }
+
+            ImGui.EndTable();
+        }
 
         var hasAutoSelection =
             riAutoSelectedZone >= 0 && riAutoSelectedZone < zones.Count &&
@@ -8667,15 +8701,23 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         var sourceTimeline = hasAutoSelection
             ? plugin.TimelineStore.GetTimeline(autoEncounterId, autoSpecName)
             : null;
-        var createPerPhaseAutoTimeline = riAutoSelectedPhase > 0 && autoPhaseWindows.Count > 0;
+        var resolvedAutoPhaseWindows = BuildEncounterPhaseWindows(sourceTimeline?.PhaseInfo);
+        var createPerPhaseAutoTimeline = riAutoSelectedPhase > 0 && resolvedAutoPhaseWindows.Count > 0;
         var autoTimelineKey = hasAutoSelection
             ? TimelineDatabase.MakeKey(autoEncounterId, autoSpecName)
             : string.Empty;
         var autoTimelineFilterKey = hasAutoSelection ? TimelineDatabase.MakeKey(autoEncounterId, autoSpecName) : string.Empty;
+        var customAutoPhaseWindows = createPerPhaseAutoTimeline
+            ? BuildCustomAutoTimelinePhaseWindows(sourceTimeline, resolvedAutoPhaseWindows)
+            : null;
+        var autoPhaseConfigurationIsValid = !createPerPhaseAutoTimeline ||
+                                            customAutoPhaseWindows != null ||
+                                            sourceTimeline?.BossEntries.Count == 0;
         var canCreateAutoTimeline = hasAutoSelection &&
                                     !riFetching &&
                                     !riImporting &&
-                                    sourceTimeline != null;
+                                    sourceTimeline != null &&
+                                    autoPhaseConfigurationIsValid;
 
         if (hasAutoSelection && sourceTimeline != null)
         {
@@ -8739,10 +8781,13 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             RequestDeferredUiSettingsSave();
         }
 
+        if (createPerPhaseAutoTimeline && sourceTimeline != null && sourceTimeline.BossEntries.Count > 0 && customAutoPhaseWindows == null)
+            ImGui.TextColored(new Vector4(1f, 0.45f, 0.45f, 1f), "Phase starts must move forward in time with one boss attack per split.");
+
         if (!canCreateAutoTimeline)
             ImGui.BeginDisabled();
         if (ImGui.Button("Create Auto Timeline##riAutoCreate"))
-            CreateAutoTimelineFromFetchedLogs(autoEncounters[riAutoSelectedEncounter], autoSpecName, createPerPhaseAutoTimeline);
+            CreateAutoTimelineFromFetchedLogs(autoEncounters[riAutoSelectedEncounter], autoSpecName, createPerPhaseAutoTimeline, customAutoPhaseWindows);
         if (!canCreateAutoTimeline)
             ImGui.EndDisabled();
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
@@ -8940,7 +8985,8 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
     private void CreateAutoTimelineFromFetchedLogs(
         Encounter encounter,
         string specName,
-        bool createPerPhaseTimelines)
+        bool createPerPhaseTimelines,
+        IReadOnlyList<EncounterPhaseWindow>? customPhaseWindows)
     {
         var sourceTimeline = plugin.TimelineStore.GetTimeline(encounter.Id, specName);
         RefreshTimelineRuntimeMetadata(sourceTimeline);
@@ -8971,12 +9017,14 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         plugin.CustomTimelineStore.SaveTimeline(plugin.Configuration, fullTimelineKey, customTimeline);
         RemoveStoredCustomPhaseTimelines(encounter.Id, specName);
 
-        var phaseWindows = BuildEncounterPhaseWindows(sourceTimeline.PhaseInfo);
+        var phaseWindows = customPhaseWindows?.Count > 0
+            ? customPhaseWindows.ToList()
+            : BuildEncounterPhaseWindows(sourceTimeline.PhaseInfo);
         if (createPerPhaseTimelines)
         {
             foreach (var phaseWindow in phaseWindows)
             {
-                var phaseTimeline = BuildPhaseTimelineFromBuiltTimeline(customTimeline, phaseWindow);
+                var phaseTimeline = BuildPhaseTimelineFromBuiltTimeline(encounter.Id, customTimeline, phaseWindow);
                 if (phaseTimeline == null)
                     continue;
 
@@ -9091,6 +9139,115 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         public string DisplayName { get; set; } = string.Empty;
         public long StartMs { get; set; }
         public long EndMs { get; set; }
+    }
+
+    private static List<BossTimelineEntry> GetAutoTimelineBossPhaseStartEntries(AggregatedTimeline? sourceTimeline)
+    {
+        if (sourceTimeline == null)
+            return [];
+
+        return sourceTimeline.BossEntries
+            .Where(entry => !string.IsNullOrWhiteSpace(entry.AbilityName))
+            .OrderBy(entry => entry.CastStartSec)
+            .ThenBy(entry => entry.AbilityId)
+            .GroupBy(entry => $"{entry.AbilityId}:{entry.AbilityName}:{Math.Round(entry.CastStartSec, 3):F3}")
+            .Select(group => group.First())
+            .ToList();
+    }
+
+    private static List<string> BuildAutoTimelineBossPhaseStartOptions(IReadOnlyList<BossTimelineEntry> bossPhaseStartEntries)
+    {
+        return bossPhaseStartEntries
+            .Select(entry => $"{FormatCsvTime(entry.CastStartSec)}  {entry.AbilityName}")
+            .ToList();
+    }
+
+    private void EnsureAutoTimelineBossPhaseSelections(
+        string selectionKey,
+        IReadOnlyList<EncounterPhaseWindow> phaseWindows,
+        IReadOnlyList<BossTimelineEntry> bossPhaseStartEntries)
+    {
+        if (string.Equals(riAutoPhaseStartSelectionKey, selectionKey, StringComparison.Ordinal) &&
+            riAutoPhaseStartBossIndices.Count == Math.Max(0, phaseWindows.Count - 1))
+            return;
+
+        riAutoPhaseStartSelectionKey = selectionKey;
+        riAutoPhaseStartBossIndices.Clear();
+
+        if (bossPhaseStartEntries.Count == 0 || phaseWindows.Count <= 1)
+            return;
+
+        for (var phaseIndex = 1; phaseIndex < phaseWindows.Count; phaseIndex++)
+        {
+            var phaseWindow = phaseWindows[phaseIndex];
+            var defaultIndex = -1;
+            for (var bossIndex = 0; bossIndex < bossPhaseStartEntries.Count; bossIndex++)
+            {
+                var entryStartMs = bossPhaseStartEntries[bossIndex].CastStartSec * 1000.0;
+                if (entryStartMs >= phaseWindow.StartMs && entryStartMs < phaseWindow.EndMs)
+                {
+                    defaultIndex = bossIndex;
+                    break;
+                }
+            }
+            if (defaultIndex < 0)
+                defaultIndex = Math.Min(phaseIndex, bossPhaseStartEntries.Count - 1);
+            riAutoPhaseStartBossIndices.Add(defaultIndex);
+        }
+    }
+
+    private List<EncounterPhaseWindow>? BuildCustomAutoTimelinePhaseWindows(
+        AggregatedTimeline? sourceTimeline,
+        IReadOnlyList<EncounterPhaseWindow> fallbackPhaseWindows)
+    {
+        if (sourceTimeline == null || fallbackPhaseWindows.Count == 0)
+            return null;
+
+        var bossEntries = GetAutoTimelineBossPhaseStartEntries(sourceTimeline);
+        if (fallbackPhaseWindows.Count == 1)
+            return fallbackPhaseWindows.ToList();
+
+        if (bossEntries.Count == 0 || riAutoPhaseStartBossIndices.Count != fallbackPhaseWindows.Count - 1)
+            return null;
+
+        var fightDurationMs = Math.Max(
+            (long)Math.Round(sourceTimeline.AverageDurationMs),
+            (long)Math.Ceiling((bossEntries.LastOrDefault()?.CastEndSec ?? 0.0) * 1000.0));
+        var customWindows = new List<EncounterPhaseWindow>(fallbackPhaseWindows.Count);
+        var previousBossIndex = -1;
+
+        for (var phaseIndex = 0; phaseIndex < fallbackPhaseWindows.Count; phaseIndex++)
+        {
+            var startMs = phaseIndex == 0
+                ? 0L
+                : (long)Math.Round(bossEntries[riAutoPhaseStartBossIndices[phaseIndex - 1]].CastStartSec * 1000.0);
+            var endMs = phaseIndex + 1 < fallbackPhaseWindows.Count
+                ? (long)Math.Round(bossEntries[riAutoPhaseStartBossIndices[phaseIndex]].CastStartSec * 1000.0)
+                : fightDurationMs;
+            if (phaseIndex > 0)
+            {
+                var selectedBossIndex = riAutoPhaseStartBossIndices[phaseIndex - 1];
+                if (selectedBossIndex < 0 || selectedBossIndex >= bossEntries.Count || selectedBossIndex <= previousBossIndex)
+                    return null;
+                previousBossIndex = selectedBossIndex;
+            }
+
+            if (endMs <= startMs)
+                return null;
+
+            var fallbackWindow = fallbackPhaseWindows[phaseIndex];
+            customWindows.Add(new EncounterPhaseWindow
+            {
+                Ordinal = fallbackWindow.Ordinal,
+                PhaseId = fallbackWindow.PhaseId,
+                SourceName = fallbackWindow.SourceName,
+                DisplayName = fallbackWindow.DisplayName,
+                StartMs = startMs,
+                EndMs = endMs,
+            });
+        }
+
+        return customWindows;
     }
 
     private static FightPhaseInfo CreateFightPhaseInfo(ReportFight fight)
@@ -9425,6 +9582,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
     }
 
     private static AggregatedTimeline? BuildPhaseTimelineFromBuiltTimeline(
+        int baseEncounterId,
         AggregatedTimeline builtTimeline,
         EncounterPhaseWindow phaseWindow)
     {
@@ -9433,6 +9591,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             return null;
 
         var phaseTimeline = CloneTimeline(builtTimeline);
+        phaseTimeline.EncounterId = GetEncounterPhaseId(baseEncounterId, phaseWindow.Ordinal);
         phaseTimeline.EncounterName = $"{builtTimeline.EncounterName} {phaseWindow.DisplayName}";
         phaseTimeline.AverageDurationMs = phaseWindow.EndMs - phaseWindow.StartMs;
         phaseTimeline.Entries = phaseEntries;
@@ -9924,81 +10083,6 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
 
         baseEncounterId = encounterId;
         return encounterId > 0;
-    }
-
-    private IEnumerable<(string Key, AggregatedTimeline Timeline)> GetLinkableCustomTimelineCandidates(string sourceKey, AggregatedTimeline sourceTimeline)
-    {
-        if (!TryGetBaseEncounterIdFromPhaseEncounterId(sourceTimeline.EncounterId, out var sourceBaseEncounterId) ||
-            sourceBaseEncounterId <= 0)
-        {
-            yield break;
-        }
-
-        var candidates = plugin.Configuration.CustomTimelines
-            .Where(entry => !string.Equals(entry.Key, sourceKey, StringComparison.Ordinal))
-            .Where(entry => string.Equals(entry.Value.SpecName, sourceTimeline.SpecName, StringComparison.OrdinalIgnoreCase))
-            .Where(entry => TryGetBaseEncounterIdFromPhaseEncounterId(entry.Value.EncounterId, out var candidateBaseEncounterId) &&
-                            candidateBaseEncounterId == sourceBaseEncounterId)
-            .OrderBy(entry => BuildTimelineLinkLabel(entry.Key, entry.Value), StringComparer.OrdinalIgnoreCase);
-
-        foreach (var (candidateKey, candidateTimeline) in candidates)
-        {
-            if (!WouldCreateTimelineLinkCycle(sourceKey, candidateKey))
-                yield return (candidateKey, candidateTimeline);
-        }
-    }
-
-    private void SetCustomTimelineNextLink(string sourceKey, string targetKey)
-    {
-        var conflictingSources = plugin.Configuration.TimelineNextLinks
-            .Where(entry => !string.Equals(entry.Key, sourceKey, StringComparison.Ordinal) &&
-                            string.Equals(entry.Value, targetKey, StringComparison.Ordinal))
-            .Select(entry => entry.Key)
-            .ToList();
-
-        foreach (var conflictingSource in conflictingSources)
-            plugin.Configuration.TimelineNextLinks.Remove(conflictingSource);
-
-        plugin.Configuration.TimelineNextLinks[sourceKey] = targetKey;
-        plugin.SaveTimelineUserState();
-    }
-
-    private bool WouldCreateTimelineLinkCycle(string sourceKey, string targetKey)
-    {
-        if (string.Equals(sourceKey, targetKey, StringComparison.Ordinal))
-            return true;
-
-        var visited = new HashSet<string>(StringComparer.Ordinal);
-        var currentKey = targetKey;
-        while (!string.IsNullOrWhiteSpace(currentKey) && visited.Add(currentKey))
-        {
-            if (string.Equals(currentKey, sourceKey, StringComparison.Ordinal))
-                return true;
-
-            if (!plugin.Configuration.TimelineNextLinks.TryGetValue(currentKey, out currentKey!))
-                break;
-        }
-
-        return false;
-    }
-
-    private static string BuildTimelineLinkLabel(string key, AggregatedTimeline timeline)
-    {
-        if (TryGetBaseEncounterIdFromPhaseEncounterId(timeline.EncounterId, out var baseEncounterId) &&
-            TryGetPhaseOrdinalFromEncounterId(timeline.EncounterId, baseEncounterId, out var encounterPhaseOrdinal))
-        {
-            return $"{timeline.EncounterName} {GetRomanNumeral(encounterPhaseOrdinal)}";
-        }
-
-        var phaseMatch = Regex.Match(key, @"_p(?<phase>\d+)$", RegexOptions.IgnoreCase);
-        if (phaseMatch.Success &&
-            int.TryParse(phaseMatch.Groups["phase"].Value, out var keyPhaseOrdinal) &&
-            keyPhaseOrdinal > 0)
-        {
-            return $"{timeline.EncounterName} {GetRomanNumeral(keyPhaseOrdinal)}";
-        }
-
-        return $"{timeline.EncounterName} [{key}]";
     }
 
     private static bool TryGetPhaseOrdinalFromEncounterId(int encounterId, int baseEncounterId, out int phaseOrdinal)
