@@ -19,6 +19,10 @@
     <None Include="json.txt">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Include="ATKTip.BMR.encounters.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <EmbeddedResource Include="ATKTip.BMR.encounters.json" />
   </ItemGroup>
 
   <PropertyGroup>

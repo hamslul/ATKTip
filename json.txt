@@ -1,0 +1,19 @@
+{
+  "Author": "hamslul",
+  "Name": "ATKTip",
+  "InternalName": "ATKTip",
+  "AssemblyVersion": "1.0.0.0",
+  "Description": "FFLogs-powered rotation timelines for every fight and job.",
+  "ApplicableVersion": "any",
+  "RepoUrl": "https://github.com/hamslul/ATKTip",
+  "Punchline": "FFLogs-powered rotation timelines for every fight and job.",
+  "DalamudApiLevel": 15,
+  "Tags": [
+    "combat",
+    "timeline",
+    "fflogs",
+    "rotation",
+    "overlay",
+    "raid"
+  ]
+}

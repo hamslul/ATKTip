@@ -1218,7 +1218,6 @@ public sealed class MainWindow : Window
             ImGui.Text("Paste a CSV exported from an FFLogs report Events view.");
             ImGui.EndTooltip();
         }
-
         // Status banner
         if (!string.IsNullOrEmpty(eiStatus) && DateTime.UtcNow < eiStatusUntil)
         {
