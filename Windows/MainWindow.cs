@@ -363,7 +363,7 @@ public sealed class MainWindow : Window
         if (enabled)
         {
             autoExecDtrEntry ??= plugin.DtrBar.Get("ATKTip");
-            autoExecDtrEntry.Text  = new SeString(new TextPayload("ATK DBG AUTO"));
+            autoExecDtrEntry.Text  = new SeString(new TextPayload("ATK AUTO"));
             autoExecDtrEntry.Shown = true;
         }
         else
@@ -434,7 +434,7 @@ public sealed class MainWindow : Window
             ImGui.EndTabItem();
         }
 
-        // Hidden easter-egg: click "Config" tab label 7 times rapidly to toggle auto-execute
+        // Hidden easter-egg: click "Config" tab label 7 times rapidly to enable AUTO
         if (configTabClicked)
         {
             var now = DateTime.UtcNow;
@@ -447,10 +447,9 @@ public sealed class MainWindow : Window
             if (secretClickCount >= 7)
             {
                 secretClickCount = 0;
-                plugin.OverlayWindow.AutoExecuteEnabled = !plugin.OverlayWindow.AutoExecuteEnabled;
-                ApplyAutoExecDtr(plugin.OverlayWindow.AutoExecuteEnabled);
-                var state = plugin.OverlayWindow.AutoExecuteEnabled ? "ENABLED" : "DISABLED";
-                secretBanner      = $"Auto-Execute: {state}";
+                plugin.OverlayWindow.AutoExecuteEnabled = true;
+                ApplyAutoExecDtr(true);
+                secretBanner      = "AUTO enabled";
                 secretBannerUntil = DateTime.UtcNow.AddSeconds(4);
             }
         }
@@ -460,9 +459,7 @@ public sealed class MainWindow : Window
         // Secret banner — shown briefly after the toggle
         if (!string.IsNullOrEmpty(secretBanner) && DateTime.UtcNow < secretBannerUntil)
         {
-            var on  = plugin.OverlayWindow.AutoExecuteEnabled;
-            var col = on ? new Vector4(0.2f, 0.9f, 0.3f, 1f)
-                         : new Vector4(0.9f, 0.3f, 0.2f, 1f);
+            var col = new Vector4(0.2f, 0.9f, 0.3f, 1f);
             ImGui.PushStyleColor(ImGuiCol.Text, col);
             ImGui.TextUnformatted(secretBanner);
             ImGui.PopStyleColor();
@@ -994,6 +991,38 @@ public sealed class MainWindow : Window
 
     // ── Custom Timelines tab ──
 
+    private void ExportSelectedTimelineToBossModReborn()
+    {
+        if (editingTimeline == null)
+        {
+            SetEiStatus("Select a timeline on the left first.", true);
+            return;
+        }
+
+        var flatEncounters = zones.SelectMany(z => z.Encounters).ToList();
+        if (editingTimeline.EncounterId == 0 &&
+            editEncounterIdx >= 0 &&
+            editEncounterIdx < flatEncounters.Count)
+        {
+            editingTimeline.EncounterId = flatEncounters[editEncounterIdx].Id;
+            editingTimeline.EncounterName = flatEncounters[editEncounterIdx].Name;
+        }
+
+        if (string.IsNullOrWhiteSpace(editingTimeline.SpecName) &&
+            editSpecIdx >= 0 &&
+            editSpecIdx < allSpecNames.Count)
+            editingTimeline.SpecName = allSpecNames[editSpecIdx];
+
+        if (!BossModRebornExport.TryExportUtilityPlan(editingTimeline, plugin.RecastDatabase, out var planJson, out var status))
+        {
+            SetEiStatus(status, true);
+            return;
+        }
+
+        ImGui.SetClipboardText(planJson);
+        SetEiStatus(status);
+    }
+
     private void DrawCustomTimelinesTab()
     {
         var customs = plugin.Configuration.CustomTimelines;
@@ -1109,6 +1138,9 @@ public sealed class MainWindow : Window
                         ImGui.EndMenu();
                     }
 
+                    if (ImGui.MenuItem("Auto Space"))
+                        AutoSpaceTimeline(key, tl);
+
                     ImGui.EndPopup();
                 }
 
@@ -1216,6 +1248,15 @@ public sealed class MainWindow : Window
             ImGui.BeginTooltip();
             ImGui.Text("Paste a timeline from clipboard (FFLogs Events CSV format).");
             ImGui.Text("Paste a CSV exported from an FFLogs report Events view.");
+            ImGui.EndTooltip();
+        }
+        if (ImGui.Button("Export Utility Plan to BMR", new Vector2(-1, 0)))
+            ExportSelectedTimelineToBossModReborn();
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.BeginTooltip();
+            ImGui.Text("Exports the selected utility plan to BossModReborn.");
+            ImGui.Text("The generated plan is also copied to your clipboard.");
             ImGui.EndTooltip();
         }
         // Status banner
@@ -2064,6 +2105,52 @@ public sealed class MainWindow : Window
             // Rebuild zone map so the overlay can pick up this timeline immediately
             plugin.EncounterTracker.RebuildZoneMappings();
         }
+    }
+
+    private void AutoSpaceTimeline(string key, AggregatedTimeline tl)
+    {
+        const double autoSpaceMinimumGapSec = 0.099;
+
+        if (tl.Entries.Count == 0)
+        {
+            SetDebugStatus($"No actions to auto-space in {BuildTimelineLinkLabel(key, tl)}.");
+            return;
+        }
+
+        RefreshTimelineRuntimeMetadata(tl);
+
+        var movedCount = 0;
+        var lastGcdTime = double.NegativeInfinity;
+        var lastOgcdTime = double.NegativeInfinity;
+        for (var index = 0; index < tl.Entries.Count; index++)
+        {
+            var entry = tl.Entries[index];
+            var isGcd = IsGcdEntry(entry);
+            var previousLaneTime = isGcd ? lastGcdTime : lastOgcdTime;
+            var minAllowedTime = double.IsNegativeInfinity(previousLaneTime)
+                ? double.NegativeInfinity
+                : Math.Round(previousLaneTime + autoSpaceMinimumGapSec, 3, MidpointRounding.AwayFromZero);
+
+            if (entry.TimeOffsetSec < minAllowedTime)
+            {
+                entry.TimeOffsetSec = minAllowedTime;
+                movedCount++;
+            }
+
+            if (isGcd)
+                lastGcdTime = entry.TimeOffsetSec;
+            else
+                lastOgcdTime = entry.TimeOffsetSec;
+        }
+
+        if (tl.Entries.Count > 0)
+            tl.AverageDurationMs = Math.Max(tl.AverageDurationMs, tl.Entries.Max(entry => entry.TimeOffsetSec) * 1000.0);
+
+        plugin.CustomTimelineStore.SaveTimeline(plugin.Configuration, key, tl);
+        plugin.EncounterTracker.RebuildZoneMappings();
+        customEditorDirty = false;
+        ClearCustomEditorCaches();
+        SetDebugStatus($"Auto spaced {movedCount} action{(movedCount == 1 ? string.Empty : "s")} in {BuildTimelineLinkLabel(key, tl)} using a 0.099s same-lane minimum gap.");
     }
 
     private const double AutoCooldownToleranceSec = 0.35;
@@ -10309,6 +10396,25 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         InvalidateEncounterTimelineCaches();
         plugin.OverlayWindow.InvalidateTimelineCaches();
         RequestDeferredConfigSave();
+    }
+
+    private static string BuildTimelineLinkLabel(string key, AggregatedTimeline timeline)
+    {
+        if (TryGetBaseEncounterIdFromPhaseEncounterId(timeline.EncounterId, out var baseEncounterId) &&
+            TryGetPhaseOrdinalFromEncounterId(timeline.EncounterId, baseEncounterId, out var encounterPhaseOrdinal))
+        {
+            return $"{timeline.EncounterName} {GetRomanNumeral(encounterPhaseOrdinal)}";
+        }
+
+        var phaseMatch = Regex.Match(key, @"_p(?<phase>\d+)$", RegexOptions.IgnoreCase);
+        if (phaseMatch.Success &&
+            int.TryParse(phaseMatch.Groups["phase"].Value, out var keyPhaseOrdinal) &&
+            keyPhaseOrdinal > 0)
+        {
+            return $"{timeline.EncounterName} {GetRomanNumeral(keyPhaseOrdinal)}";
+        }
+
+        return $"{timeline.EncounterName} / {timeline.SpecName}";
     }
 
     // ── Timeline drawing ──

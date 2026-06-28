@@ -36,6 +36,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private readonly MainWindow mainWindow;
     private readonly OverlayWindow overlayWindow;
+    private readonly AutoModalWindow autoModalWindow;
     private readonly QuickPickWindow quickPickWindow;
     public  MainWindow MainWindow => mainWindow;
     private readonly EncounterTracker encounterTracker;
@@ -43,6 +44,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public ConfigWindow ConfigWindow { get; }
     public OverlayWindow OverlayWindow => overlayWindow;
+    public AutoModalWindow AutoModalWindow => autoModalWindow;
     public EncounterTracker EncounterTracker => encounterTracker;
 
     public ITextureProvider TextureProvider { get; }
@@ -99,11 +101,13 @@ public sealed class Plugin : IDalamudPlugin
         ConfigWindow = new ConfigWindow(this);
         mainWindow = new MainWindow(this, log);
         overlayWindow = new OverlayWindow(this, condition, dutyState, objectTable, framework, gameInterop, log);
+        autoModalWindow = new AutoModalWindow();
         quickPickWindow = new QuickPickWindow(this);
 
         windowSystem.AddWindow(ConfigWindow);
         windowSystem.AddWindow(mainWindow);
         windowSystem.AddWindow(overlayWindow);
+        windowSystem.AddWindow(autoModalWindow);
         windowSystem.AddWindow(quickPickWindow);
         overlayWindow.StopPreview();
 

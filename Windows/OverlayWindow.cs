@@ -12,7 +12,11 @@ using Dalamud.Interface.Windowing;
 using Dalamud.Interface.Textures;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.Game.Character;
+using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using ATKTip.Data;
+using GameObjectId = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObjectId;
+using static FFXIVClientStructs.FFXIV.Client.Game.Character.ActionEffectHandler;
 
 namespace ATKTip.Windows;
 
@@ -31,7 +35,7 @@ public sealed class OverlayWindow : Window, IDisposable
     private readonly IFramework framework;
     private readonly IPluginLog log;
     private readonly Hook<ActionManager.Delegates.UseAction>? useActionHook;
-
+    private readonly Hook<ReceiveActionEffectDelegate>? receiveActionEffectHook;
     // ── Auto-execute (hidden feature) ──
     /// <summary>
     /// When true, each timeline entry is automatically executed via
@@ -39,16 +43,11 @@ public sealed class OverlayWindow : Window, IDisposable
     /// Enabled by clicking the Config tab label 7 times in a row in the main window.
     /// </summary>
     public bool AutoExecuteEnabled { get; set; }
-    // Queue-based auto-execute state.
-    // autoExecQueue  – actions waiting to fire; one dequeued per frame when AnimationLock == 0.
-    //                  Tuple includes wall-clock enqueue time so stale entries can be purged.
-    // autoExecQueued – timeline keys already seen (enqueued OR window-expired); prevents re-enqueue.
-    private readonly Queue<(double scheduledAt, int abilityId, long enqueuedAtMs)> autoExecQueue  = new();
-    private readonly HashSet<(double timeSec, int abilityId)>                      autoExecQueued = [];
-    private double autoExecLastElapsed = -1.0;   // tracks previous frame's elapsed for backward-scrub detection
     private readonly Dictionary<ulong, uint> observedBossCastIds = [];
     private double autoScrubLastResolvedBossTimeSec = double.NegativeInfinity;
     private double autoScrubLastObservedElapsedSec = double.NegativeInfinity;
+    private double autoScrubLastSeekTimeSec = double.NaN;
+    private DateTime autoScrubLastSeekAtUtc = DateTime.MinValue;
 
     // ── ATR geometry constants (match ATR defaults exactly) ──
     // GCDHeightHigh / GCDHeightLow control the vertical extent of the GCD bar.
@@ -62,6 +61,12 @@ public sealed class OverlayWindow : Window, IDisposable
     // oGCD animlock window (shorter bar for oGCDs).
     private const float OGCDWindowSec  = BaseActionAnimationLockSec + AssumedAnimationLockLatencySec;
     private const double OverlayMinOgcdVisualGapSec = 0.8;
+    private const double AutoRetryIntervalSec = 0.10;
+    private const double AutoConflictToleranceSec = 0.099;
+    private const double AutoConflictComparisonEpsilonSec = 0.000001;
+    private const double AutoRebaseJumpThresholdSec = 0.50;
+    private const double AutoPendingResetGraceSec = 0.20;
+    private const double AutoAcceptedInstantRetrySec = 0.75;
     // Rounding radius for bars (matches ATR GCDRound default ~4).
     private const float BarRound       = 4.0f;
     // Gap between stacked icons in the same bucket.
@@ -167,6 +172,38 @@ public sealed class OverlayWindow : Window, IDisposable
         public bool IsPast { get; set; }
     }
 
+    private unsafe delegate void ReceiveActionEffectDelegate(
+        uint casterEntityId,
+        Character* casterPtr,
+        Vector3* targetPos,
+        Header* header,
+        TargetEffects* effects,
+        GameObjectId* targetEntityIds);
+
+    private sealed class AutoLaneState
+    {
+        public List<TimelineEntry> Entries { get; } = [];
+        public int NextIndex { get; set; }
+        public double DisplayTimeSec { get; set; }
+        public TimelineEntry? PendingEntry { get; set; }
+        public DateTime LastAttemptAtUtc { get; set; } = DateTime.MinValue;
+        public DateTime RequestAcceptedAtUtc { get; set; } = DateTime.MinValue;
+        public bool RequestAccepted { get; set; }
+        public bool RecastObserved { get; set; }
+        public bool CastObserved { get; set; }
+        public bool CompletionObserved { get; set; }
+    }
+
+    private readonly AutoLaneState autoGcdLane = new();
+    private readonly AutoLaneState autoOgcdLane = new();
+    private string autoTimelineKey = string.Empty;
+    private bool autoRuntimeInitialized;
+    private double autoBaseTimeSec = double.NaN;
+    private double autoLastObservedBaseTimeSec = double.NaN;
+    private DateTime autoLastObservedBaseAtUtc = DateTime.MinValue;
+    private double autoDisplayGcdTimeSec;
+    private double autoDisplayOgcdTimeSec;
+
     private sealed class ObservedBossCast
     {
         public uint AbilityId { get; init; }
@@ -193,12 +230,16 @@ public sealed class OverlayWindow : Window, IDisposable
         useActionHook   = gameInterop.HookFromAddress<ActionManager.Delegates.UseAction>(
             ActionManager.MemberFunctionPointers.UseAction,
             HandleUseAction);
+        receiveActionEffectHook = gameInterop.HookFromAddress<ReceiveActionEffectDelegate>(
+            Addresses.Receive.Value,
+            ReceiveActionEffectDetour);
 
         condition.ConditionChange += OnConditionChange;
         dutyState.DutyWiped      += OnDutyWiped;
         dutyState.DutyCompleted  += OnDutyCompleted;
         framework.Update         += OnFrameworkUpdate;
         useActionHook.Enable();
+        receiveActionEffectHook.Enable();
 
         RespectCloseHotkey = false;
         IsOpen = false;
@@ -250,9 +291,7 @@ public sealed class OverlayWindow : Window, IDisposable
         antsArmed         = false;
         skillVisibility.Clear();
         oGcdCache.Clear();
-        autoExecQueue.Clear();
-        autoExecQueued.Clear();
-        autoExecLastElapsed = -1.0;
+        ResetAutoRuntimeState();
         ResetAutoScrubState();
         InvalidateTimelineCaches();
 
@@ -374,7 +413,6 @@ public sealed class OverlayWindow : Window, IDisposable
             return;
 
         EnsureActiveFilteredEntriesCache();
-
         var elapsedBucket = (long)Math.Round(elapsed * 20.0);
         if (ReferenceEquals(cachedAntsTimeline, timeline) &&
             cachedAntsRevision == activeTimelineFilterRevision &&
@@ -443,9 +481,6 @@ public sealed class OverlayWindow : Window, IDisposable
         combatElapsedSec     = 0;
         isScrubbing          = false;
         awaitingManualPhaseStart = false;
-        autoExecQueue.Clear();
-        autoExecQueued.Clear();
-        autoExecLastElapsed  = -1.0;
         IsOpen               = true;
     }
 
@@ -468,9 +503,6 @@ public sealed class OverlayWindow : Window, IDisposable
         inCombat          = true;
         combatStartTime   = DateTime.UtcNow;
         combatElapsedSec  = 0;
-        autoExecQueue.Clear();
-        autoExecQueued.Clear();
-        autoExecLastElapsed = -1.0;
         IsOpen = preserveOpen && !overlayDismissed && Cfg.OverlayEnabled;
     }
 
@@ -583,6 +615,7 @@ public sealed class OverlayWindow : Window, IDisposable
         combatElapsedSec = 0;
         inCombat         = false;
         isScrubbing      = false;
+        awaitingManualPhaseStart = false;
         isEncounterZone  = false;
         IsOpen           = false;
     }
@@ -609,9 +642,6 @@ public sealed class OverlayWindow : Window, IDisposable
         combatElapsedSec     = 0;
         isScrubbing          = false;
         isEncounterZone      = true;    // loaded by EncounterTracker — respond to combat events
-        autoExecQueue.Clear();
-        autoExecQueued.Clear();
-        autoExecLastElapsed  = -1.0;
         IsOpen               = true;
     }
 
@@ -633,9 +663,6 @@ public sealed class OverlayWindow : Window, IDisposable
         awaitingManualPhaseStart = false;
         combatStartTime     = DateTime.UtcNow;
         combatElapsedSec    = 0;
-        autoExecQueue.Clear();
-        autoExecQueued.Clear();
-        autoExecLastElapsed = -1.0;
         IsOpen              = true;
     }
 
@@ -667,7 +694,22 @@ public sealed class OverlayWindow : Window, IDisposable
         observedBossCastIds.Clear();
         autoScrubLastResolvedBossTimeSec = double.NegativeInfinity;
         autoScrubLastObservedElapsedSec = double.NegativeInfinity;
+        autoScrubLastSeekTimeSec = double.NaN;
+        autoScrubLastSeekAtUtc = DateTime.MinValue;
     }
+
+    private static void WriteAutoDebug(string _) { }
+
+    private string GetAutoLaneName(AutoLaneState lane)
+        => ReferenceEquals(lane, autoOgcdLane) ? "oGCD" : "GCD";
+
+    private static string DescribeAutoEntry(TimelineEntry? entry)
+        => entry == null
+            ? "<none>"
+            : $"{entry.AbilityName}#{entry.AbilityId}@{entry.TimeOffsetSec:F3}";
+
+    private void WriteAutoLaneDebug(AutoLaneState lane, string message)
+        => WriteAutoDebug($"{GetAutoLaneName(lane)} | {message}");
 
     private void SeekTimelineToTime(double timeSec)
     {
@@ -703,19 +745,24 @@ public sealed class OverlayWindow : Window, IDisposable
         if (inCombat && combatViewPaused)
             return;
 
+        var currentElapsedSec = GetBaseTimelineElapsedSec();
+
         if (!double.IsNegativeInfinity(autoScrubLastObservedElapsedSec) &&
-            combatElapsedSec < autoScrubLastObservedElapsedSec - 5.0)
+            currentElapsedSec < autoScrubLastObservedElapsedSec - 5.0)
         {
             ResetAutoScrubState();
         }
 
-        autoScrubLastObservedElapsedSec = combatElapsedSec;
+        autoScrubLastObservedElapsedSec = currentElapsedSec;
 
         foreach (var cast in CollectObservedBossCastStarts())
         {
-            if (!TryResolveAutoScrubBossEntry((int)cast.AbilityId, combatElapsedSec, out var matchedEntry))
+            if (!TryResolveAutoScrubBossEntry((int)cast.AbilityId, currentElapsedSec, out var matchedEntry))
                 continue;
 
+            WriteAutoDebug($"SCRUB seek | bossAction={cast.AbilityId} | from={currentElapsedSec:F3} | to={matchedEntry.CastStartSec:F3}");
+            autoScrubLastSeekTimeSec = matchedEntry.CastStartSec;
+            autoScrubLastSeekAtUtc = DateTime.UtcNow;
             SeekTimelineToTime(matchedEntry.CastStartSec);
             autoScrubLastResolvedBossTimeSec = Math.Max(autoScrubLastResolvedBossTimeSec, matchedEntry.CastStartSec);
             return;
@@ -890,6 +937,14 @@ public sealed class OverlayWindow : Window, IDisposable
             ResumeCombatViewFromCurrentTime();
         }
 
+        if (result &&
+            !startedAreaTargeting &&
+            actionType == ActionType.Action)
+        {
+            WriteAutoDebug($"USE accepted | action={actionId} | target={targetId:X}");
+            ObservePendingAutoActionRequest(actionId);
+        }
+
         return result;
     }
 
@@ -964,6 +1019,9 @@ public sealed class OverlayWindow : Window, IDisposable
 
         if (value && !inCombat)
         {
+            var preserveAutoPlayback = AutoExecuteEnabled && isPreview && previewAutoplay;
+            var preservedElapsedSec = preserveAutoPlayback ? GetBaseTimelineElapsedSec() : 0.0;
+
             // Only start live tracking for timelines loaded by EncounterTracker
             // (i.e. the player is actually in a mapped encounter zone).
             // Ignoring combat from training dummies, open-world mobs, etc.
@@ -976,10 +1034,8 @@ public sealed class OverlayWindow : Window, IDisposable
             isScrubbing          = false;
             combatViewPaused     = false;
             awaitingManualPhaseStart = false;
-            combatStartTime      = DateTime.UtcNow;
-            combatElapsedSec     = 0;
-            autoExecQueue.Clear();
-            autoExecQueued.Clear();
+            combatElapsedSec     = preserveAutoPlayback ? preservedElapsedSec : 0.0;
+            combatStartTime      = DateTime.UtcNow - TimeSpan.FromSeconds(combatElapsedSec);
             ResetAutoScrubState();
 
             if (activeTimeline != null && Cfg.OverlayEnabled)
@@ -1017,8 +1073,6 @@ public sealed class OverlayWindow : Window, IDisposable
         inCombat = false;
         antsArmed = false;
         awaitingManualPhaseStart = false;
-        autoExecQueue.Clear();
-        autoExecQueued.Clear();
         ResetAutoScrubState();
 
         if (manualOverlayActive)
@@ -1139,6 +1193,11 @@ public sealed class OverlayWindow : Window, IDisposable
             combatElapsedSec = 0;
         }
 
+        var autoPlaybackActive = AutoExecuteEnabled && autoRuntimeInitialized && IsAutoTimelinePlaying();
+        var gcdElapsedSec = autoPlaybackActive ? autoDisplayGcdTimeSec : combatElapsedSec;
+        var ogcdElapsedSec = autoPlaybackActive ? autoDisplayOgcdTimeSec : combatElapsedSec;
+        var displayTimelineElapsedSec = autoPlaybackActive ? gcdElapsedSec : combatElapsedSec;
+
         var isActive   = inCombat || isPreview || manualOverlayActive;
         var drawList   = ImGui.GetWindowDrawList();
         var wPos       = ImGui.GetWindowPos();
@@ -1175,7 +1234,7 @@ public sealed class OverlayWindow : Window, IDisposable
             var trackR = closeX - btnGap;
             var trackW = MathF.Max(trackR - trackL, 1f);
 
-            var frac = (float)Math.Clamp(combatElapsedSec / fightDur, 0.0, 1.0);
+            var frac = (float)Math.Clamp(displayTimelineElapsedSec / fightDur, 0.0, 1.0);
 
             // Track background
             drawList.AddRectFilled(
@@ -1196,7 +1255,7 @@ public sealed class OverlayWindow : Window, IDisposable
                 5.0f, ImGui.GetColorU32(new Vector4(0.65f, 0.88f, 1.00f, 0.95f)));
 
             // Time label below track (right-aligned to track end)
-            var timeLabel = FormatTime(combatElapsedSec) + " / " + FormatTime(fightDur);
+            var timeLabel = FormatTime(displayTimelineElapsedSec) + " / " + FormatTime(fightDur);
             var labelSz   = ImGui.CalcTextSize(timeLabel);
             drawList.AddText(
                 new Vector2(trackR - labelSz.X, sTop + btnH + 1f),
@@ -1246,14 +1305,15 @@ public sealed class OverlayWindow : Window, IDisposable
                 if (inCombat)
                 {
                     // Toggle freeze — pause freezes the view, play re-syncs to live.
-                    combatViewPaused = !combatViewPaused;
-                    if (!combatViewPaused)
-                        combatElapsedSec = (DateTime.UtcNow - combatStartTime).TotalSeconds;
+                    if (combatViewPaused)
+                        ResumeCombatViewFromCurrentTime();
+                    else
+                        PauseCombatViewAtCurrentTime();
                 }
                 else if (previewAutoplay)
                 {
                     previewAutoplay      = false;
-                    previewManualTimeSec = combatElapsedSec;
+                    previewManualTimeSec = displayTimelineElapsedSec;
                 }
                 else
                 {
@@ -1347,6 +1407,7 @@ public sealed class OverlayWindow : Window, IDisposable
                 {
                     AutoExecuteEnabled = false;
                     plugin.MainWindow.ApplyAutoExecDtr(false);
+                    ResetAutoRuntimeState();
                 }
 
                 if (inCombat)
@@ -1453,8 +1514,8 @@ public sealed class OverlayWindow : Window, IDisposable
         var gcdBarTop = centerY + GCDHeightHigh * iconSize - iconSize / 2f;  // = centerY
         var gcdBarBot = centerY + GCDHeightLow  * iconSize - iconSize / 2f;  // = centerY + 0.3*iconSize
 
-        var visStart = combatElapsedSec - (nowX - tlLeft)  / pxPerSec;
-        var visEnd   = combatElapsedSec + (tlRight - nowX) / pxPerSec;
+        var visStart = Math.Min(gcdElapsedSec, ogcdElapsedSec) - (nowX - tlLeft)  / pxPerSec;
+        var visEnd   = Math.Max(gcdElapsedSec, ogcdElapsedSec) + (tlRight - nowX) / pxPerSec;
 
         // ── ATR DrawGrid ──────────────────────────────────────────────
         if (showGrid)
@@ -1462,7 +1523,7 @@ public sealed class OverlayWindow : Window, IDisposable
             for (var t = Math.Ceiling(visStart); t <= visEnd; t += 1.0)
             {
                 if (t < 0) continue;
-                var gx = nowX + (float)(t - combatElapsedSec) * pxPerSec;
+                var gx = nowX + (float)(t - gcdElapsedSec) * pxPerSec;
                 if (gx < tlLeft || gx > tlRight) continue;
 
                 var major = (int)t % 5 == 0;
@@ -1508,7 +1569,8 @@ public sealed class OverlayWindow : Window, IDisposable
         {
             // ── Collect and bucket visible entries ────────────────────
             EnsureActiveFilteredEntriesCache();
-            CollectEntriesInTimeWindow(cachedActiveFilteredEntries, visStart - 5, visEnd + 5, activeVisibleEntriesScratch);
+            var sourceEntries = autoPlaybackActive ? activeTimeline.Entries : cachedActiveFilteredEntries;
+            CollectEntriesInTimeWindow(sourceEntries, visStart - 5, visEnd + 5, activeVisibleEntriesScratch);
             var visibleEntries = activeVisibleEntriesScratch;
             var gcdWindowSec = GCDWindowSec;
             var gcdBuckets = visibleEntries
@@ -1517,14 +1579,14 @@ public sealed class OverlayWindow : Window, IDisposable
                 .OrderBy(g => g.Key)
                 .Select(g => new OverlayGcdBucket
                 {
-                    X = nowX + (float)(g.Key - combatElapsedSec) * pxPerSec,
-                    IsPast = g.Key < combatElapsedSec,
+                    X = nowX + (float)(g.Key - gcdElapsedSec) * pxPerSec,
+                    IsPast = g.Key < gcdElapsedSec,
                     Entries = g.OrderByDescending(e => e.Frequency).Take(maxStack).ToList(),
                 })
                 .ToList();
             var ogcdPlacements = BuildOverlayOgcdPlacements(
                 visibleEntries,
-                combatElapsedSec,
+                ogcdElapsedSec,
                 nowX,
                 pxPerSec,
                 maxStack);
@@ -1586,14 +1648,14 @@ public sealed class OverlayWindow : Window, IDisposable
                     var e   = bucket.Entries[i];
                     var cx  = bucket.X - i * (iconSize + IconGap);
                     var pos = new Vector2(cx - iconSize / 2f, centerY - iconSize / 2f);
-                    DrawIcon(drawList, e, pos, iconSize, bucket.IsPast, pastAlpha, combatElapsedSec);
+                    DrawIcon(drawList, e, pos, iconSize, bucket.IsPast, pastAlpha, gcdElapsedSec);
                 }
             }
 
             foreach (var placement in ogcdPlacements)
             {
                 var pos = new Vector2(placement.X - oGcdSize / 2f, oGcdCenterY - oGcdSize / 2f);
-                DrawIcon(drawList, placement.Entry, pos, oGcdSize, placement.IsPast, pastAlpha, combatElapsedSec);
+                DrawIcon(drawList, placement.Entry, pos, oGcdSize, placement.IsPast, pastAlpha, ogcdElapsedSec);
             }
         }
 
@@ -1625,14 +1687,14 @@ public sealed class OverlayWindow : Window, IDisposable
 
             foreach (var boss in activeTimeline.BossEntries)
             {
-                var startX = nowX + (float)(boss.CastStartSec - combatElapsedSec) * pxPerSec;
-                var endX   = nowX + (float)(boss.CastEndSec   - combatElapsedSec) * pxPerSec;
+                var startX = nowX + (float)(boss.CastStartSec - gcdElapsedSec) * pxPerSec;
+                var endX   = nowX + (float)(boss.CastEndSec   - gcdElapsedSec) * pxPerSec;
                 if (endX - startX < 3f) endX = startX + 3f;  // min width for instants
 
                 if (endX < tlLeft || startX > tlRight) continue;
                 var dL = MathF.Max(startX, tlLeft);
                 var dR = MathF.Min(endX,   tlRight);
-                var isPastBoss = boss.CastEndSec < combatElapsedSec;
+                var isPastBoss = boss.CastEndSec < gcdElapsedSec;
                 var bossAlpha = isPastBoss ? pastAlpha : 1.0f;
                 if (bossAlpha < 0.01f) continue;
 
@@ -2452,6 +2514,830 @@ public sealed class OverlayWindow : Window, IDisposable
         return ImGui.CalcTextSize(t).X <= maxWidth ? t : string.Empty;
     }
 
+    private void ResetAutoRuntimeState()
+    {
+        if (autoRuntimeInitialized ||
+            autoGcdLane.PendingEntry != null ||
+            autoOgcdLane.PendingEntry != null ||
+            autoGcdLane.NextIndex > 0 ||
+            autoOgcdLane.NextIndex > 0)
+        {
+            WriteAutoDebug(
+                $"RUNTIME reset | gcdNext={autoGcdLane.NextIndex}/{autoGcdLane.Entries.Count} pending={DescribeAutoEntry(autoGcdLane.PendingEntry)} | " +
+                $"ogcdNext={autoOgcdLane.NextIndex}/{autoOgcdLane.Entries.Count} pending={DescribeAutoEntry(autoOgcdLane.PendingEntry)}");
+        }
+
+        autoGcdLane.Entries.Clear();
+        autoGcdLane.NextIndex = 0;
+        autoGcdLane.DisplayTimeSec = 0;
+        autoGcdLane.PendingEntry = null;
+        autoGcdLane.LastAttemptAtUtc = DateTime.MinValue;
+        autoGcdLane.RequestAcceptedAtUtc = DateTime.MinValue;
+        autoGcdLane.RequestAccepted = false;
+        autoGcdLane.RecastObserved = false;
+        autoGcdLane.CastObserved = false;
+        autoGcdLane.CompletionObserved = false;
+
+        autoOgcdLane.Entries.Clear();
+        autoOgcdLane.NextIndex = 0;
+        autoOgcdLane.DisplayTimeSec = 0;
+        autoOgcdLane.PendingEntry = null;
+        autoOgcdLane.LastAttemptAtUtc = DateTime.MinValue;
+        autoOgcdLane.RequestAcceptedAtUtc = DateTime.MinValue;
+        autoOgcdLane.RequestAccepted = false;
+        autoOgcdLane.RecastObserved = false;
+        autoOgcdLane.CastObserved = false;
+        autoOgcdLane.CompletionObserved = false;
+
+        autoTimelineKey = string.Empty;
+        autoRuntimeInitialized = false;
+        autoBaseTimeSec = double.NaN;
+        autoLastObservedBaseTimeSec = double.NaN;
+        autoLastObservedBaseAtUtc = DateTime.MinValue;
+        autoDisplayGcdTimeSec = combatElapsedSec;
+        autoDisplayOgcdTimeSec = combatElapsedSec;
+    }
+
+    private double GetBaseTimelineElapsedSec()
+    {
+        var fightDur = activeTimeline?.AverageDurationMs / 1000.0 ?? 0.0;
+        if (isPreview)
+        {
+            if (previewAutoplay)
+            {
+                var elapsed = (DateTime.UtcNow - previewStartTime).TotalSeconds;
+                if (fightDur > 0 && elapsed > fightDur + 5.0)
+                {
+                    previewStartTime = DateTime.UtcNow;
+                    elapsed = 0.0;
+                }
+
+                previewManualTimeSec = elapsed;
+                return elapsed;
+            }
+
+            return previewManualTimeSec;
+        }
+
+        if (inCombat)
+            return combatViewPaused ? combatElapsedSec : Math.Max(0.0, (DateTime.UtcNow - combatStartTime).TotalSeconds);
+
+        return manualOverlayActive ? 0.0 : combatElapsedSec;
+    }
+
+    private bool IsAutoTimelinePlaying()
+        => (inCombat && !combatViewPaused) || (isPreview && previewAutoplay);
+
+    private void DisableAutoAndShowConflict(string message)
+    {
+        AutoExecuteEnabled = false;
+        plugin.MainWindow.ApplyAutoExecDtr(false);
+        ResetAutoRuntimeState();
+        antsArmed = false;
+        overlayDismissed = true;
+        IsOpen = false;
+        plugin.AutoModalWindow.Show(message);
+    }
+
+    private static string BuildAutoConflictMessage()
+        => "Conflicting actions detected. Ensure no 2 actions have the same timestamp before proceeding. Actions must be at least 0.099s apart from each other. Tip: use the timeline right-click Auto Space function to automatically fix same-lane conflicts.";
+
+    private bool InitializeAutoRuntime(double baseTimeSec)
+    {
+        WriteAutoDebug($"RUNTIME init begin | timeline={activeTimelineKey} | base={baseTimeSec:F3}");
+        ResetAutoRuntimeState();
+        if (activeTimeline == null)
+            return false;
+
+        autoTimelineKey = activeTimelineKey;
+        var previousGcdTime = double.NegativeInfinity;
+        var previousOgcdTime = double.NegativeInfinity;
+        for (var index = 0; index < activeTimeline.Entries.Count; index++)
+        {
+            var entry = activeTimeline.Entries[index];
+            entry.IsGcd = !IsOGCD(entry.AbilityId, entry.AbilityName);
+            if (entry.IsGcd)
+            {
+                if (!double.IsNegativeInfinity(previousGcdTime) &&
+                    entry.TimeOffsetSec + AutoConflictComparisonEpsilonSec < previousGcdTime + AutoConflictToleranceSec)
+                {
+                    DisableAutoAndShowConflict(BuildAutoConflictMessage());
+                    return false;
+                }
+
+                previousGcdTime = entry.TimeOffsetSec;
+                autoGcdLane.Entries.Add(entry);
+            }
+            else
+            {
+                if (!double.IsNegativeInfinity(previousOgcdTime) &&
+                    entry.TimeOffsetSec + AutoConflictComparisonEpsilonSec < previousOgcdTime + AutoConflictToleranceSec)
+                {
+                    DisableAutoAndShowConflict(BuildAutoConflictMessage());
+                    return false;
+                }
+
+                previousOgcdTime = entry.TimeOffsetSec;
+                autoOgcdLane.Entries.Add(entry);
+            }
+        }
+
+        autoGcdLane.NextIndex = autoGcdLane.Entries.FindIndex(entry => entry.TimeOffsetSec >= baseTimeSec - 0.0005);
+        if (autoGcdLane.NextIndex < 0)
+            autoGcdLane.NextIndex = autoGcdLane.Entries.Count;
+
+        autoOgcdLane.NextIndex = autoOgcdLane.Entries.FindIndex(entry => entry.TimeOffsetSec >= baseTimeSec - 0.0005);
+        if (autoOgcdLane.NextIndex < 0)
+            autoOgcdLane.NextIndex = autoOgcdLane.Entries.Count;
+
+        autoGcdLane.DisplayTimeSec = baseTimeSec;
+        autoOgcdLane.DisplayTimeSec = baseTimeSec;
+        autoDisplayGcdTimeSec = baseTimeSec;
+        autoDisplayOgcdTimeSec = baseTimeSec;
+        autoBaseTimeSec = baseTimeSec;
+        autoLastObservedBaseTimeSec = baseTimeSec;
+        autoLastObservedBaseAtUtc = DateTime.UtcNow;
+        autoRuntimeInitialized = true;
+        WriteAutoDebug(
+            $"RUNTIME init done | gcdEntries={autoGcdLane.Entries.Count} next={autoGcdLane.NextIndex} | " +
+            $"ogcdEntries={autoOgcdLane.Entries.Count} next={autoOgcdLane.NextIndex}");
+        return true;
+    }
+
+    private bool ShouldRebaseAutoRuntime(double baseTimeSec)
+    {
+        if (!autoRuntimeInitialized)
+        {
+            WriteAutoDebug($"REBASE reason=uninitialized | base={baseTimeSec:F3}");
+            return true;
+        }
+
+        if (!string.Equals(autoTimelineKey, activeTimelineKey, StringComparison.Ordinal))
+        {
+            WriteAutoDebug($"REBASE reason=timeline_changed | old={autoTimelineKey} | new={activeTimelineKey} | base={baseTimeSec:F3}");
+            return true;
+        }
+
+        if (!double.IsFinite(autoLastObservedBaseTimeSec) || autoLastObservedBaseAtUtc == DateTime.MinValue)
+        {
+            WriteAutoDebug($"REBASE reason=missing_base_history | base={baseTimeSec:F3}");
+            return true;
+        }
+
+        var now = DateTime.UtcNow;
+        var wallAdvanceSec = Math.Max(0.0, (now - autoLastObservedBaseAtUtc).TotalSeconds);
+        var observedAdvanceSec = baseTimeSec - autoLastObservedBaseTimeSec;
+
+        if (autoScrubLastSeekAtUtc != DateTime.MinValue &&
+            now <= autoScrubLastSeekAtUtc.AddSeconds(0.50) &&
+            double.IsFinite(autoScrubLastSeekTimeSec) &&
+            Math.Abs(baseTimeSec - autoScrubLastSeekTimeSec) <= 0.05)
+        {
+            WriteAutoDebug($"REBASE suppressed | reason=recent_auto_scrub | base={baseTimeSec:F3} | seek={autoScrubLastSeekTimeSec:F3}");
+            return false;
+        }
+
+        if (observedAdvanceSec < -AutoRebaseJumpThresholdSec)
+        {
+            WriteAutoDebug($"REBASE reason=backwards_jump | base={baseTimeSec:F3} | prev={autoLastObservedBaseTimeSec:F3} | observedDelta={observedAdvanceSec:F3}");
+            return true;
+        }
+
+        if (Math.Abs(observedAdvanceSec - wallAdvanceSec) > AutoRebaseJumpThresholdSec)
+        {
+            WriteAutoDebug(
+                $"REBASE reason=delta_mismatch | base={baseTimeSec:F3} | prev={autoLastObservedBaseTimeSec:F3} | " +
+                $"observedDelta={observedAdvanceSec:F3} | wallDelta={wallAdvanceSec:F3}");
+            return true;
+        }
+
+        return false;
+    }
+
+    private void ClearLanePending(AutoLaneState lane)
+    {
+        if (lane.PendingEntry != null || lane.RequestAccepted || lane.RecastObserved || lane.CastObserved || lane.CompletionObserved)
+        {
+            WriteAutoLaneDebug(
+                lane,
+                $"pending clear | entry={DescribeAutoEntry(lane.PendingEntry)} | accepted={lane.RequestAccepted} | recast={lane.RecastObserved} | cast={lane.CastObserved} | complete={lane.CompletionObserved}");
+        }
+
+        lane.PendingEntry = null;
+        lane.RequestAccepted = false;
+        lane.RecastObserved = false;
+        lane.CastObserved = false;
+        lane.CompletionObserved = false;
+        lane.RequestAcceptedAtUtc = DateTime.MinValue;
+        lane.LastAttemptAtUtc = DateTime.MinValue;
+    }
+
+    private void CompleteLaneEntry(AutoLaneState lane)
+    {
+        if (lane.PendingEntry != null)
+        {
+            WriteAutoLaneDebug(
+                lane,
+                $"complete | entry={DescribeAutoEntry(lane.PendingEntry)} | nextIndex={lane.NextIndex + 1}");
+            lane.NextIndex++;
+        }
+
+        ClearLanePending(lane);
+    }
+
+    private unsafe double GetActionCooldownRemainingSec(uint actionId)
+    {
+        var actionManager = ActionManager.Instance();
+        if (actionManager == null)
+            return 0.0;
+
+        var remaining = 0.0;
+        if (actionManager->IsRecastTimerActive(ActionType.Action, actionId))
+        {
+            remaining = Math.Max(
+                0.0,
+                actionManager->GetRecastTime(ActionType.Action, actionId) -
+                actionManager->GetRecastTimeElapsed(ActionType.Action, actionId));
+        }
+
+        var mainGroup = actionManager->GetRecastGroup((int)ActionType.Action, actionId);
+        var mainDetail = actionManager->GetRecastGroupDetail(mainGroup);
+        if (mainDetail != null && mainDetail->IsActive)
+        {
+            remaining = Math.Max(remaining, Math.Max(0.0, mainDetail->Total - mainDetail->Elapsed));
+            var charges = Math.Max(1, (int)ActionManager.GetMaxCharges(actionId, 0));
+            remaining = Math.Max(remaining, Math.Max(0.0, mainDetail->Total / charges - mainDetail->Elapsed));
+        }
+
+        var additionalGroup = actionManager->GetAdditionalRecastGroup(ActionType.Action, actionId);
+        var additionalDetail = actionManager->GetRecastGroupDetail(additionalGroup);
+        if (additionalDetail != null && additionalDetail->IsActive)
+            remaining = Math.Max(remaining, Math.Max(0.0, additionalDetail->Total - additionalDetail->Elapsed));
+
+        return remaining;
+    }
+
+    private uint ResolveAutoActionId(TimelineEntry entry)
+    {
+        var info = plugin.RecastDatabase.Lookup(entry.AbilityId, entry.AbilityName);
+        return GetAdjustedAutoActionId(info?.AbilityId ?? (uint)Math.Max(0, entry.AbilityId));
+    }
+
+    private uint ResolveAutoActionId(AutoLaneState lane)
+        => lane.PendingEntry == null ? 0u : ResolveAutoActionId(lane.PendingEntry);
+
+    private unsafe uint GetAdjustedAutoActionId(uint actionId)
+    {
+        if (actionId == 0)
+            return 0;
+
+        var actionManager = ActionManager.Instance();
+        if (actionManager == null)
+            return actionId;
+
+        var adjustedActionId = actionManager->GetAdjustedActionId(actionId);
+        return adjustedActionId != 0 ? adjustedActionId : actionId;
+    }
+
+    private bool LaneMatchesActionId(AutoLaneState lane, uint actionId)
+    {
+        if (lane.PendingEntry == null || actionId == 0)
+            return false;
+
+        var resolvedActionId = ResolveAutoActionId(lane);
+        if (resolvedActionId == 0)
+            return false;
+
+        var adjustedActionId = GetAdjustedAutoActionId(actionId);
+        return actionId == resolvedActionId ||
+               adjustedActionId == resolvedActionId ||
+               lane.PendingEntry.AbilityId == actionId ||
+               lane.PendingEntry.AbilityId == adjustedActionId;
+    }
+
+    private void ObservePendingAutoActionRequest(AutoLaneState lane, uint actionId)
+    {
+        if (!LaneMatchesActionId(lane, actionId))
+            return;
+
+        var now = DateTime.UtcNow;
+        WriteAutoLaneDebug(
+            lane,
+            $"request observed | requestedAction={actionId} | pending={DescribeAutoEntry(lane.PendingEntry)}");
+        lane.RequestAccepted = true;
+        lane.RequestAcceptedAtUtc = now;
+        lane.LastAttemptAtUtc = now;
+        lane.RecastObserved |= GetActionCooldownRemainingSec(ResolveAutoActionId(lane)) > 0.0;
+    }
+
+    private void ObservePendingAutoActionRequest(uint actionId)
+    {
+        ObservePendingAutoActionRequest(autoOgcdLane, actionId);
+        ObservePendingAutoActionRequest(autoGcdLane, actionId);
+    }
+
+    private bool IsGroundTargetedAction(uint actionId)
+    {
+        try
+        {
+            var sheet = plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Action>();
+            var row = sheet?.GetRowOrDefault(actionId);
+            return row.HasValue && row.Value.TargetArea;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private unsafe bool TryUseActionOnSelfGround(uint actionId)
+    {
+        var actionManager = ActionManager.Instance();
+        var localPlayer = objectTable.LocalPlayer;
+        if (actionManager == null || localPlayer == null)
+            return false;
+
+        var location = localPlayer.Position;
+        return actionManager->UseActionLocation(ActionType.Action, actionId, localPlayer.GameObjectId, &location, ActionManager.GetExtraParamForSummonAction(actionId));
+    }
+
+    private unsafe ulong ResolveAutoActionTargetId(uint actionId)
+    {
+        var targetSystem = TargetSystem.Instance();
+        if (targetSystem == null)
+            return 0;
+
+        try
+        {
+            var currentTarget = targetSystem->GetTargetObject();
+            if (currentTarget != null && ActionManager.CanUseActionOnTarget(actionId, currentTarget))
+                return currentTarget->GetGameObjectId();
+
+            var localPlayer = objectTable.LocalPlayer;
+            if (localPlayer == null)
+                return 0;
+
+            var actionSheet = plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Action>();
+            var actionRow = actionSheet?.GetRowOrDefault(actionId);
+            if (!actionRow.HasValue)
+                return 0;
+
+            if (!actionRow.Value.CanTargetSelf || actionRow.Value.CanTargetHostile)
+                return 0;
+
+            var selfTarget = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)localPlayer.Address;
+            if (selfTarget == null || !ActionManager.CanUseActionOnTarget(actionId, selfTarget))
+                return 0;
+
+            return selfTarget->GetGameObjectId();
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private unsafe bool TryIssueAutoAction(TimelineEntry entry)
+    {
+        var actionId = ResolveAutoActionId(entry);
+        if (actionId == 0)
+            return false;
+
+        if (IsGroundTargetedAction(actionId))
+            return TryUseActionOnSelfGround(actionId);
+
+        var actionManager = ActionManager.Instance();
+        if (actionManager == null)
+            return false;
+
+        var targetId = ResolveAutoActionTargetId(actionId);
+        return targetId != 0
+            ? actionManager->UseAction(ActionType.Action, actionId, targetId)
+            : actionManager->UseAction(ActionType.Action, actionId);
+    }
+
+    private bool HasPendingActionSelfStatus(AutoLaneState lane)
+    {
+        if (lane.PendingEntry == null)
+            return false;
+
+        var info = plugin.RecastDatabase.Lookup(lane.PendingEntry.AbilityId, lane.PendingEntry.AbilityName);
+        if (string.IsNullOrWhiteSpace(info?.SelfStatusName))
+            return false;
+
+        var localPlayer = objectTable.LocalPlayer;
+        if (localPlayer == null)
+            return false;
+
+        try
+        {
+            var actionSheet = plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Action>();
+            var resolvedActionId = ResolveAutoActionId(lane);
+            var actionRow = actionSheet?.GetRowOrDefault(resolvedActionId);
+            if (!actionRow.HasValue)
+                return false;
+
+            var selfStatusId = actionRow.Value.StatusGainSelf.RowId;
+            if (selfStatusId == 0)
+                return false;
+
+            foreach (var status in localPlayer.StatusList)
+            {
+                if (status.StatusId == selfStatusId)
+                {
+                    WriteAutoLaneDebug(
+                        lane,
+                        $"self status observed by id | entry={DescribeAutoEntry(lane.PendingEntry)} | statusId={selfStatusId}");
+                    return true;
+                }
+            }
+
+            var selfStatusName = info.SelfStatusName.Trim();
+            if (!string.IsNullOrWhiteSpace(selfStatusName))
+            {
+                var statusSheet = plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Status>();
+                foreach (var status in localPlayer.StatusList)
+                {
+                    var statusRow = statusSheet?.GetRowOrDefault(status.StatusId);
+                    if (!statusRow.HasValue)
+                        continue;
+
+                    var statusName = statusRow.Value.Name.ExtractText().Trim();
+                    if (string.Equals(statusName, selfStatusName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        WriteAutoLaneDebug(
+                            lane,
+                            $"self status observed by name | entry={DescribeAutoEntry(lane.PendingEntry)} | statusName={statusName} | statusId={status.StatusId}");
+                        return true;
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return false;
+    }
+
+    private HashSet<string> GetLocalPlayerStatusNames()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var localPlayer = objectTable.LocalPlayer;
+        if (localPlayer == null)
+            return names;
+
+        try
+        {
+            var statusSheet = plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Status>();
+            foreach (var status in localPlayer.StatusList)
+            {
+                var statusRow = statusSheet?.GetRowOrDefault(status.StatusId);
+                if (!statusRow.HasValue)
+                    continue;
+
+                var statusName = statusRow.Value.Name.ExtractText().Trim();
+                if (!string.IsNullOrWhiteSpace(statusName))
+                    names.Add(statusName);
+            }
+        }
+        catch
+        {
+        }
+
+        return names;
+    }
+
+    private static bool IsConsumableRequiredStateName(string stateName)
+    {
+        if (string.IsNullOrWhiteSpace(stateName))
+            return false;
+
+        if (stateName.StartsWith("Action Grant::", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var normalized = stateName.Trim().ToLowerInvariant();
+        return normalized.Contains(" ready", StringComparison.Ordinal) ||
+               normalized.EndsWith("ready", StringComparison.Ordinal) ||
+               normalized.Contains("dualcast", StringComparison.Ordinal) ||
+               normalized.Contains("hawk's eye", StringComparison.Ordinal) ||
+               normalized.Contains("flourishing ", StringComparison.Ordinal) ||
+               normalized.Contains("starstruck", StringComparison.Ordinal) ||
+               normalized.Contains("divine might", StringComparison.Ordinal) ||
+               normalized.Contains("aetherhues", StringComparison.Ordinal) ||
+               normalized.Contains("hyperphantasia", StringComparison.Ordinal) ||
+               normalized.Contains("monochrome tones", StringComparison.Ordinal) ||
+               normalized.Contains("subtractive palette", StringComparison.Ordinal) ||
+               normalized.Contains("rainbow bright", StringComparison.Ordinal) ||
+               normalized.Contains("hammer time", StringComparison.Ordinal) ||
+               normalized.Contains("tempera coat", StringComparison.Ordinal) ||
+               normalized.Contains("divining", StringComparison.Ordinal);
+    }
+
+    private bool HasPendingActionConsumedRequiredState(AutoLaneState lane)
+    {
+        if (lane.PendingEntry == null)
+            return false;
+
+        var actionRule = plugin.ActionStateDatabase.Lookup(
+            ResolveAutoActionId(lane) > 0 ? (int)ResolveAutoActionId(lane) : lane.PendingEntry.AbilityId,
+            lane.PendingEntry.AbilityName);
+        if (actionRule == null)
+            return false;
+
+        var requiredStateNames = actionRule.Effects
+            .Where(effect => effect.MinRequired > 0)
+            .Select(effect => effect.StateName.Trim())
+            .Where(stateName => !string.IsNullOrWhiteSpace(stateName))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (requiredStateNames.Count == 0)
+            return false;
+
+        var playerStatusNames = GetLocalPlayerStatusNames();
+        var consumableRequiredStateNames = requiredStateNames
+            .Where(IsConsumableRequiredStateName)
+            .ToList();
+        var completionStateNames = consumableRequiredStateNames.Count > 0
+            ? consumableRequiredStateNames
+            : requiredStateNames;
+
+        if (completionStateNames.Any(playerStatusNames.Contains))
+            return false;
+
+        WriteAutoLaneDebug(
+            lane,
+            $"required state consumed | entry={DescribeAutoEntry(lane.PendingEntry)} | states=[{string.Join(", ", completionStateNames)}]");
+        return true;
+    }
+
+    private bool ShouldSkipPendingOgcd(AutoLaneState lane)
+    {
+        if (lane.PendingEntry == null || lane.PendingEntry.IsGcd || lane.RequestAccepted)
+            return false;
+
+        var remaining = GetActionCooldownRemainingSec(ResolveAutoActionId(lane));
+        if (remaining > 0.0)
+        {
+            WriteAutoLaneDebug(
+                lane,
+                $"skip on cooldown | entry={DescribeAutoEntry(lane.PendingEntry)} | cooldownRemaining={remaining:F3}");
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool IsPendingActionInterrupted(AutoLaneState lane)
+    {
+        if (lane.PendingEntry == null || !lane.RequestAccepted || lane.CompletionObserved)
+            return false;
+
+        var localPlayer = objectTable.LocalPlayer;
+        if (localPlayer == null)
+            return false;
+
+        var resolvedActionId = ResolveAutoActionId(lane);
+        var info = plugin.RecastDatabase.Lookup(lane.PendingEntry.AbilityId, lane.PendingEntry.AbilityName);
+        if ((info?.CastTimeSec ?? 0.0) <= 0.0)
+            return false;
+
+        var stoppedCasting = !localPlayer.IsCasting || localPlayer.CastActionId != resolvedActionId;
+        if (!stoppedCasting)
+            return false;
+
+        if (GetActionCooldownRemainingSec(resolvedActionId) > 0.0)
+            return false;
+
+        var interrupted = DateTime.UtcNow >= lane.RequestAcceptedAtUtc.AddSeconds(AutoPendingResetGraceSec);
+        if (interrupted)
+        {
+            WriteAutoLaneDebug(
+                lane,
+                $"cast interrupted | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId}");
+        }
+
+        return interrupted;
+    }
+
+    private bool IsPendingActionSatisfied(AutoLaneState lane)
+    {
+        if (lane.PendingEntry == null || !lane.RequestAccepted)
+            return false;
+
+        if (lane.CompletionObserved)
+        {
+            WriteAutoLaneDebug(lane, $"satisfied by action effect | entry={DescribeAutoEntry(lane.PendingEntry)}");
+            return true;
+        }
+
+        var resolvedActionId = ResolveAutoActionId(lane);
+        var cooldownRemaining = GetActionCooldownRemainingSec(resolvedActionId);
+        if (!lane.RecastObserved && cooldownRemaining > 0.0)
+        {
+            lane.RecastObserved = true;
+            WriteAutoLaneDebug(
+                lane,
+                $"recast observed | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId} | cooldownRemaining={cooldownRemaining:F3}");
+        }
+
+        if (!lane.RecastObserved)
+        {
+            if (HasPendingActionSelfStatus(lane))
+                lane.RecastObserved = true;
+            else if (DateTime.UtcNow >= lane.RequestAcceptedAtUtc.AddSeconds(AutoPendingResetGraceSec) &&
+                     HasPendingActionConsumedRequiredState(lane))
+                lane.RecastObserved = true;
+            else
+                return false;
+        }
+
+        var info = plugin.RecastDatabase.Lookup(lane.PendingEntry.AbilityId, lane.PendingEntry.AbilityName);
+        var hasCastTime = (info?.CastTimeSec ?? 0.0) > 0.0;
+        if (!hasCastTime)
+        {
+            var satisfied = DateTime.UtcNow >= lane.RequestAcceptedAtUtc.AddSeconds(AutoPendingResetGraceSec);
+            if (satisfied)
+            {
+                WriteAutoLaneDebug(
+                    lane,
+                    $"instant satisfied after grace | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId}");
+            }
+
+            return satisfied;
+        }
+
+        var localPlayer = objectTable.LocalPlayer;
+        if (localPlayer == null)
+            return false;
+
+        if (localPlayer.IsCasting && localPlayer.CastActionId == resolvedActionId)
+        {
+            if (!lane.CastObserved)
+            {
+                lane.CastObserved = true;
+                WriteAutoLaneDebug(
+                    lane,
+                    $"cast observed | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId}");
+            }
+
+            return false;
+        }
+
+        if (!lane.CastObserved)
+            return false;
+
+        var castSatisfied = DateTime.UtcNow >= lane.RequestAcceptedAtUtc.AddSeconds(AutoPendingResetGraceSec);
+        if (castSatisfied)
+        {
+            WriteAutoLaneDebug(
+                lane,
+                $"cast satisfied after grace | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId}");
+        }
+
+        return castSatisfied;
+    }
+
+    private void AdvanceAutoLane(AutoLaneState lane, double baseTimeSec)
+    {
+        while (true)
+        {
+            if (lane.PendingEntry == null && lane.NextIndex >= lane.Entries.Count)
+            {
+                lane.DisplayTimeSec = baseTimeSec;
+                return;
+            }
+
+            if (lane.PendingEntry == null)
+            {
+                var nextEntry = lane.Entries[lane.NextIndex];
+                if (baseTimeSec < nextEntry.TimeOffsetSec)
+                {
+                    lane.DisplayTimeSec = baseTimeSec;
+                    return;
+                }
+
+                lane.PendingEntry = nextEntry;
+                lane.DisplayTimeSec = nextEntry.TimeOffsetSec;
+                WriteAutoLaneDebug(
+                    lane,
+                    $"pending set | entry={DescribeAutoEntry(nextEntry)} | base={baseTimeSec:F3} | nextIndex={lane.NextIndex}");
+            }
+
+            lane.DisplayTimeSec = lane.PendingEntry!.TimeOffsetSec;
+
+            if (ShouldSkipPendingOgcd(lane))
+            {
+                CompleteLaneEntry(lane);
+                continue;
+            }
+
+            if (IsPendingActionSatisfied(lane))
+            {
+                CompleteLaneEntry(lane);
+                continue;
+            }
+
+            if (lane.RequestAccepted)
+            {
+                var localPlayer = objectTable.LocalPlayer;
+                var resolvedActionId = ResolveAutoActionId(lane);
+                if (localPlayer != null &&
+                    localPlayer.IsCasting &&
+                    localPlayer.CastActionId == resolvedActionId)
+                {
+                    if (!lane.CastObserved)
+                    {
+                        lane.CastObserved = true;
+                        WriteAutoLaneDebug(
+                            lane,
+                            $"cast observed in update | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId}");
+                    }
+                }
+
+                if (IsPendingActionInterrupted(lane))
+                {
+                    ClearLanePending(lane);
+                    continue;
+                }
+
+                var info = plugin.RecastDatabase.Lookup(lane.PendingEntry.AbilityId, lane.PendingEntry.AbilityName);
+                var hasCastTime = (info?.CastTimeSec ?? 0.0) > 0.0;
+                if (!hasCastTime &&
+                    DateTime.UtcNow >= lane.RequestAcceptedAtUtc.AddSeconds(AutoAcceptedInstantRetrySec) &&
+                    !IsPendingActionSatisfied(lane))
+                {
+                    WriteAutoLaneDebug(
+                        lane,
+                        $"instant retry timeout | entry={DescribeAutoEntry(lane.PendingEntry)} | timeout={AutoAcceptedInstantRetrySec:F2}");
+                    ClearLanePending(lane);
+                    continue;
+                }
+
+                return;
+            }
+
+            if (DateTime.UtcNow < lane.LastAttemptAtUtc.AddSeconds(AutoRetryIntervalSec))
+                return;
+
+            lane.LastAttemptAtUtc = DateTime.UtcNow;
+            WriteAutoLaneDebug(
+                lane,
+                $"attempt use | entry={DescribeAutoEntry(lane.PendingEntry)} | resolvedAction={ResolveAutoActionId(lane)} | base={baseTimeSec:F3}");
+            if (!TryIssueAutoAction(lane.PendingEntry))
+            {
+                WriteAutoLaneDebug(
+                    lane,
+                    $"attempt failed | entry={DescribeAutoEntry(lane.PendingEntry)} | resolvedAction={ResolveAutoActionId(lane)}");
+                return;
+            }
+
+            lane.RequestAccepted = true;
+            lane.RequestAcceptedAtUtc = DateTime.UtcNow;
+            lane.RecastObserved = GetActionCooldownRemainingSec(ResolveAutoActionId(lane)) > 0.0;
+            WriteAutoLaneDebug(
+                lane,
+                $"attempt succeeded | entry={DescribeAutoEntry(lane.PendingEntry)} | resolvedAction={ResolveAutoActionId(lane)} | recastObserved={lane.RecastObserved}");
+            return;
+        }
+    }
+
+    private unsafe void ReceiveActionEffectDetour(
+        uint casterEntityId,
+        Character* casterPtr,
+        Vector3* targetPos,
+        Header* header,
+        TargetEffects* effects,
+        GameObjectId* targetEntityIds)
+    {
+        receiveActionEffectHook!.Original(casterEntityId, casterPtr, targetPos, header, effects, targetEntityIds);
+
+        try
+        {
+            var localPlayer = objectTable.LocalPlayer;
+            if (localPlayer == null || casterEntityId != localPlayer.EntityId)
+                return;
+
+            var actionId = header->ActionId;
+            if (LaneMatchesActionId(autoGcdLane, actionId))
+            {
+                autoGcdLane.CompletionObserved = true;
+                autoGcdLane.RecastObserved = true;
+                WriteAutoLaneDebug(autoGcdLane, $"action effect observed | actionId={actionId} | entry={DescribeAutoEntry(autoGcdLane.PendingEntry)}");
+            }
+
+            if (LaneMatchesActionId(autoOgcdLane, actionId))
+            {
+                autoOgcdLane.CompletionObserved = true;
+                autoOgcdLane.RecastObserved = true;
+                WriteAutoLaneDebug(autoOgcdLane, $"action effect observed | actionId={actionId} | entry={DescribeAutoEntry(autoOgcdLane.PendingEntry)}");
+            }
+        }
+        catch
+        {
+        }
+    }
+
     // ── Auto-execute framework update ───────────────────────────────────
 
     /// <summary>
@@ -2470,91 +3356,43 @@ public sealed class OverlayWindow : Window, IDisposable
     ///               Items that have sat in the queue > 5 s (implying a hung queue) are
     ///               discarded, but normally queued oGCDs will fire within a full GCD cycle.
     ///
-    /// Key fix vs. previous 350 ms staleness check: oGCDs enqueued simultaneously (e.g.
-    /// two oGCDs between the same pair of GCDs) now wait patiently in the queue while
-    /// AnimationLock drains (~600 ms per oGCD) before each fires.
+    /// Attempts to use the current action entry.
     /// </summary>
-    private unsafe void OnFrameworkUpdate(IFramework fw)
+    private unsafe void OnFrameworkUpdate(IFramework _)
     {
+        combatElapsedSec = GetBaseTimelineElapsedSec();
         ProcessAutoScrub();
 
-        if (!AutoExecuteEnabled) return;
-        if (activeTimeline == null) return;
-        if (overlayDismissed) return;
+        var baseTimeSec = GetBaseTimelineElapsedSec();
+        autoBaseTimeSec = baseTimeSec;
+        autoDisplayGcdTimeSec = baseTimeSec;
+        autoDisplayOgcdTimeSec = baseTimeSec;
 
-        // Active means either live combat or any preview mode (autoplay or manual scrub).
-        if (!inCombat && !isPreview) return;
-
-        // combatElapsedSec is the canonical "current time on the timeline" for all modes:
-        //   combat        → (UtcNow - combatStartTime).TotalSeconds   (set each Draw frame)
-        //   preview play  → (UtcNow - previewStartTime).TotalSeconds  (set each Draw frame)
-        //   preview scrub → previewManualTimeSec                       (set by scrub bar)
-        var elapsed = combatElapsedSec;
-
-        // ── Backward-scrub detection ──────────────────────────────────────────────────
-        // If time moved back by > 1 second (wipe, scrub), flush everything so entries
-        // can be re-enqueued from scratch.
-        if (elapsed < autoExecLastElapsed - 1.0)
+        if (!AutoExecuteEnabled || activeTimeline == null || overlayDismissed || (!inCombat && !isPreview))
         {
-            autoExecQueue.Clear();
-            autoExecQueued.Clear();
-        }
-        autoExecLastElapsed = elapsed;
-
-        // ── Phase 1: Enqueue entries entering their window ────────────────────────────
-        // Accept: scheduled time has passed AND we're within 350 ms of it.
-        // Reject (permanently skip): > 350 ms late and never enqueued — this prevents
-        //   firing obviously stale actions if auto-execute is toggled on mid-fight.
-        const double AcceptWindowSec = 0.350;
-
-        EnsureActiveFilteredEntriesCache();
-        foreach (var e in cachedActiveFilteredEntries)
-        {
-            var key   = (e.TimeOffsetSec, e.AbilityId);
-            var delta = elapsed - e.TimeOffsetSec;   // positive = we've passed the scheduled mark
-
-            if (delta < 0.0) continue;   // not yet time
-
-            if (delta > AcceptWindowSec)
-            {
-                // Past the accept window — add to the seen set so we never enqueue it
-                // in a future frame either.  (Add is a no-op if already present.)
-                autoExecQueued.Add(key);
-                continue;
-            }
-
-            // Within [0, AcceptWindowSec]: enqueue exactly once, stamped with wall-clock time.
-            if (autoExecQueued.Add(key))
-                autoExecQueue.Enqueue((e.TimeOffsetSec, e.AbilityId, Environment.TickCount64));
+            ResetAutoRuntimeState();
+            return;
         }
 
-        // ── Phase 2: Fire one action per frame when the game is ready ─────────────────
-        // WrathCombo rule: require AnimationLock == 0 before sending any ability.
-        // This prevents UseAction from overwriting the game's single native queue slot
-        // while a prior action is still in its 600 ms animation lock.
-        var animLock = ActionManager.Instance()->AnimationLock;
-        if (animLock > 0f) return;
-
-        // Drain any entries that are implausibly old (> 5 s in queue = fight ended, lag spike,
-        // or other anomaly), then fire the first healthy one and stop for this frame.
-        const long MaxQueueAgeMs = 5_000L;
-        var nowMs = Environment.TickCount64;
-
-        while (autoExecQueue.Count > 0)
+        if (!IsAutoTimelinePlaying())
         {
-            var (_, abilityId, enqueuedAtMs) = autoExecQueue.Peek();
-
-            if (nowMs - enqueuedAtMs > MaxQueueAgeMs)
-            {
-                autoExecQueue.Dequeue();   // stale — silently discard
-                continue;
-            }
-
-            // Fire this action and stop for this frame.
-            autoExecQueue.Dequeue();
-            ActionManager.Instance()->UseAction(ActionType.Action, (uint)abilityId);
-            break;
+            ResetAutoRuntimeState();
+            return;
         }
+
+        if (ShouldRebaseAutoRuntime(baseTimeSec))
+        {
+            if (!InitializeAutoRuntime(baseTimeSec))
+                return;
+        }
+
+        AdvanceAutoLane(autoOgcdLane, baseTimeSec);
+        AdvanceAutoLane(autoGcdLane, baseTimeSec);
+
+        autoLastObservedBaseTimeSec = baseTimeSec;
+        autoLastObservedBaseAtUtc = DateTime.UtcNow;
+        autoDisplayGcdTimeSec = autoGcdLane.DisplayTimeSec;
+        autoDisplayOgcdTimeSec = autoOgcdLane.DisplayTimeSec;
     }
 
     public void Dispose()
@@ -2563,6 +3401,8 @@ public sealed class OverlayWindow : Window, IDisposable
         condition.ConditionChange -= OnConditionChange;
         dutyState.DutyWiped      -= OnDutyWiped;
         dutyState.DutyCompleted  -= OnDutyCompleted;
+        receiveActionEffectHook?.Disable();
+        receiveActionEffectHook?.Dispose();
         useActionHook?.Disable();
         useActionHook?.Dispose();
     }
