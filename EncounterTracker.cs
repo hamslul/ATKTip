@@ -814,7 +814,7 @@ public sealed unsafe class EncounterTracker : IDisposable
         if (!canAdvanceByBossChange && !canAdvanceByFallbackTime)
             return;
 
-        plugin.OverlayWindow.SwitchCombatTimelinePaused(timelineCandidate.Timeline, timelineCandidate.Key);
+        plugin.OverlayWindow.SwitchCombatTimeline(timelineCandidate.Timeline, timelineCandidate.Key);
         activePhaseOrdinal = nextPhaseOrdinal;
         activePhasePrimaryBossDataId = currentBossDataId != 0 ? currentBossDataId : activePhasePrimaryBossDataId;
         pendingPhasePrimaryBossDataId = 0;
@@ -1063,6 +1063,7 @@ public sealed unsafe class EncounterTracker : IDisposable
 
         var phaseTimelines = new Dictionary<int, PhaseTimelineCandidate>();
         PhaseTimelineCandidate? fullTimeline = null;
+        var linkedPhaseOrdinals = BuildLinkedPhaseOrdinals(matchingCustoms);
 
         PhaseTimelineCandidate CreatePhaseTimelineCandidate(string key, AggregatedTimeline timeline, int phaseOrdinal)
             => new()
@@ -1076,6 +1077,12 @@ public sealed unsafe class EncounterTracker : IDisposable
 
         foreach (var (key, timeline) in matchingCustoms)
         {
+            if (linkedPhaseOrdinals.TryGetValue(key, out var linkedPhaseOrdinal))
+            {
+                phaseTimelines[linkedPhaseOrdinal] = CreatePhaseTimelineCandidate(key, timeline, linkedPhaseOrdinal);
+                continue;
+            }
+
             if (TryResolvePhaseOrdinal(key, timeline, encounterId, baseKey, out var phaseOrdinal))
             {
                 phaseTimelines[phaseOrdinal] = CreatePhaseTimelineCandidate(key, timeline, phaseOrdinal);
@@ -1111,6 +1118,51 @@ public sealed unsafe class EncounterTracker : IDisposable
             PhaseMarkers = phaseMarkers,
             FullTimeline = fullTimeline,
         };
+    }
+
+    private Dictionary<string, int> BuildLinkedPhaseOrdinals(IReadOnlyList<KeyValuePair<string, AggregatedTimeline>> matchingCustoms)
+    {
+        var timelineKeys = matchingCustoms
+            .Select(entry => entry.Key)
+            .ToHashSet(StringComparer.Ordinal);
+        var nextLinks = plugin.Configuration.TimelineNextLinks
+            .Where(entry => timelineKeys.Contains(entry.Key) &&
+                            timelineKeys.Contains(entry.Value) &&
+                            !string.Equals(entry.Key, entry.Value, StringComparison.Ordinal))
+            .ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.Ordinal);
+        if (nextLinks.Count == 0)
+            return [];
+
+        var inboundCounts = timelineKeys.ToDictionary(key => key, _ => 0, StringComparer.Ordinal);
+        foreach (var targetKey in nextLinks.Values)
+            inboundCounts[targetKey] = inboundCounts.GetValueOrDefault(targetKey) + 1;
+
+        var rootKeys = nextLinks.Keys
+            .Where(sourceKey => inboundCounts.GetValueOrDefault(sourceKey) == 0)
+            .OrderBy(sourceKey => sourceKey, StringComparer.Ordinal)
+            .ToList();
+        if (rootKeys.Count == 0)
+            return [];
+
+        var linkedOrdinals = new Dictionary<string, int>(StringComparer.Ordinal);
+        var nextPhaseOrdinal = 1;
+
+        foreach (var rootKey in rootKeys)
+        {
+            var currentKey = rootKey;
+            var visitedKeys = new HashSet<string>(StringComparer.Ordinal);
+            while (!string.IsNullOrWhiteSpace(currentKey) &&
+                   timelineKeys.Contains(currentKey) &&
+                   visitedKeys.Add(currentKey) &&
+                   !linkedOrdinals.ContainsKey(currentKey))
+            {
+                linkedOrdinals[currentKey] = nextPhaseOrdinal++;
+                if (!nextLinks.TryGetValue(currentKey, out currentKey!))
+                    break;
+            }
+        }
+
+        return linkedOrdinals;
     }
 
     private static PhaseTimelineCandidate? ResolveInitialPhaseTimelineCandidate(PhaseTimelineSet phaseTimelineSet)
@@ -1645,7 +1697,7 @@ public sealed unsafe class EncounterTracker : IDisposable
             return false;
         }
 
-        plugin.OverlayWindow.SwitchCombatTimeline(timelineCandidate.Timeline, timelineCandidate.Key);
+        plugin.OverlayWindow.SwitchCombatTimelinePaused(timelineCandidate.Timeline, timelineCandidate.Key);
         activePhaseOrdinal = timelineCandidate.PhaseOrdinal;
         activePhasePrimaryBossDataId = 0;
         pendingPhasePrimaryBossDataId = 0;

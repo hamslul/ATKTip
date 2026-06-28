@@ -268,6 +268,7 @@ public sealed class MainWindow : Window
     private string debugStatus = string.Empty;
     private bool debugStatusIsError;
     private DateTime debugStatusUntil = DateTime.MinValue;
+    private int trackerDebugSelectedOption = -1;
 
     // Group management state
     private string newGroupNameBuf = string.Empty;
@@ -424,6 +425,12 @@ public sealed class MainWindow : Window
             ImGui.EndTabItem();
         }
 
+        if (ImGui.BeginTabItem("Tracker Debug"))
+        {
+            DrawTrackerDebugTab();
+            ImGui.EndTabItem();
+        }
+
         var configFlags = focusConfigTab ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
         focusConfigTab = false;
         var configTabOpen    = ImGui.BeginTabItem("Config", configFlags);
@@ -434,7 +441,7 @@ public sealed class MainWindow : Window
             ImGui.EndTabItem();
         }
 
-        // Hidden easter-egg: click "Config" tab label 7 times rapidly to enable AUTO
+        // Hidden easter-egg: click "Config" tab label 7 times rapidly to toggle auto-execute
         if (configTabClicked)
         {
             var now = DateTime.UtcNow;
@@ -735,6 +742,128 @@ public sealed class MainWindow : Window
         DrawSkillFilters();
         ImGui.Separator();
         DrawTimeline();
+    }
+
+    private void DrawTrackerDebugTab()
+    {
+            ImGui.TextWrapped("Offline tracker harness for ATKTip. Load a saved encounter/spec pair as if auto-detection had triggered, then preview and commit phase swaps without entering the instance.");
+        ImGui.Spacing();
+
+        var options = plugin.EncounterTracker.GetTrackerDebugEncounterOptions();
+        var state = plugin.EncounterTracker.GetTrackerDebugState();
+
+        if (!string.IsNullOrEmpty(debugStatus) && DateTime.UtcNow < debugStatusUntil)
+        {
+            var color = debugStatusIsError
+                ? new Vector4(1f, 0.45f, 0.45f, 1f)
+                : new Vector4(0.45f, 0.9f, 1f, 1f);
+            ImGui.TextColored(color, debugStatus);
+            ImGui.Spacing();
+        }
+
+        if (options.Count == 0)
+        {
+            ImGui.TextDisabled("No saved custom timelines with mapped encounter IDs are available yet.");
+            ImGui.TextDisabled("Create or save a custom encounter timeline first, then use this tab to test its phase routing.");
+            return;
+        }
+
+        if (trackerDebugSelectedOption < 0 || trackerDebugSelectedOption >= options.Count)
+            trackerDebugSelectedOption = 0;
+
+        var optionLabels = options
+            .Select(option =>
+            {
+                var phaseInfo = option.PhaseCount > 0
+                    ? $"{option.PhaseCount} phase{(option.PhaseCount == 1 ? string.Empty : "s")}"
+                    : "single timeline";
+                var fullInfo = option.HasFullTimeline ? " + full" : string.Empty;
+                return $"{option.EncounterName} [{option.SpecName}]  ({phaseInfo}{fullInfo})";
+            })
+            .ToList();
+
+        ImGui.SetNextItemWidth(520f);
+        ImGui.Combo("Saved Encounter", ref trackerDebugSelectedOption, optionLabels, optionLabels.Count);
+
+        var selectedOption = options[trackerDebugSelectedOption];
+        ImGui.TextDisabled($"Encounter ID: {selectedOption.EncounterId}");
+        ImGui.TextDisabled($"Saved phase timelines: {selectedOption.PhaseCount}{(selectedOption.HasFullTimeline ? " | Full timeline present" : string.Empty)}");
+        ImGui.Spacing();
+
+        if (ImGui.Button("Load Initial Debug Encounter"))
+        {
+            if (plugin.EncounterTracker.DebugLoadEncounter(selectedOption.EncounterId, selectedOption.SpecName, out var message))
+                SetDebugStatus(message);
+            else
+                SetDebugStatus(message, true);
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Reset Loaded Encounter"))
+        {
+            if (plugin.EncounterTracker.DebugResetEncounter(out var message))
+                SetDebugStatus(message);
+            else
+                SetDebugStatus(message, true);
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Clear Debug State"))
+        {
+            plugin.EncounterTracker.DebugClearEncounter();
+            SetDebugStatus("Cleared the offline tracker debug state.");
+        }
+
+        ImGui.Spacing();
+
+        var hasActiveEncounter = state.HasActiveEncounter;
+        var nextPhaseLabel = state.ActivePhaseOrdinal > 0
+            ? (state.ActivePhaseOrdinal + 1).ToString()
+            : "1";
+
+        if (!hasActiveEncounter)
+            ImGui.BeginDisabled();
+        if (ImGui.Button($"Preview Next Phase ({nextPhaseLabel})"))
+        {
+            if (plugin.EncounterTracker.DebugPreviewNextPhase(out var message))
+                SetDebugStatus(message);
+            else
+                SetDebugStatus(message, true);
+        }
+        if (!hasActiveEncounter)
+            ImGui.EndDisabled();
+
+        ImGui.SameLine();
+
+        if (!hasActiveEncounter)
+            ImGui.BeginDisabled();
+        if (ImGui.Button($"Commit Next Phase ({nextPhaseLabel})"))
+        {
+            if (plugin.EncounterTracker.DebugCommitNextPhase(out var message))
+                SetDebugStatus(message);
+            else
+                SetDebugStatus(message, true);
+        }
+        if (!hasActiveEncounter)
+            ImGui.EndDisabled();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+
+        ImGui.TextUnformatted("Current Tracker State");
+        if (!state.HasActiveEncounter)
+        {
+            ImGui.TextDisabled("No offline debug encounter is currently loaded.");
+            return;
+        }
+
+        ImGui.Text($"Encounter: {state.EncounterName} [{state.SpecName}]");
+        ImGui.Text($"Encounter ID: {state.EncounterId}");
+        ImGui.Text($"Active phase: {(state.ActivePhaseOrdinal > 0 ? state.ActivePhaseOrdinal : 0)} / {state.AvailablePhaseCount}");
+        ImGui.Text($"Pending preview phase: {(state.PendingPreviewPhaseOrdinal > 0 ? state.PendingPreviewPhaseOrdinal : 0)}");
+        ImGui.Text($"Next phase available: {(state.HasNextPhase ? "yes" : "no")}");
+        ImGui.Spacing();
+        ImGui.TextDisabled("Use Preview Next Phase to force the exact clear-and-preview path, then Commit Next Phase to apply the swap as if the tracker had resolved it live.");
     }
 
     private void HideEmbeddedTimelinePreview()
@@ -1138,6 +1267,44 @@ public sealed class MainWindow : Window
                         ImGui.EndMenu();
                     }
 
+                    if (ImGui.BeginMenu("Link Next Timeline"))
+                    {
+                        var currentLinkedKey = cfg.TimelineNextLinks.GetValueOrDefault(key, string.Empty);
+                        if (ImGui.MenuItem("None", string.Empty, string.IsNullOrWhiteSpace(currentLinkedKey)))
+                        {
+                            cfg.TimelineNextLinks.Remove(key);
+                            plugin.SaveTimelineUserState();
+                            plugin.EncounterTracker.RebuildZoneMappings();
+                            SetDebugStatus($"Cleared the next timeline link for {BuildTimelineLinkLabel(key, tl)}.");
+                        }
+
+                        var linkCandidates = GetLinkableCustomTimelineCandidates(key, tl).ToList();
+                        if (linkCandidates.Count > 0)
+                            ImGui.Separator();
+
+                        if (linkCandidates.Count == 0)
+                        {
+                            ImGui.BeginDisabled();
+                            ImGui.MenuItem("No compatible timelines");
+                            ImGui.EndDisabled();
+                        }
+                        else
+                        {
+                            foreach (var (candidateKey, candidateTimeline) in linkCandidates)
+                            {
+                                var isCurrent = string.Equals(currentLinkedKey, candidateKey, StringComparison.Ordinal);
+                                if (ImGui.MenuItem(BuildTimelineLinkLabel(candidateKey, candidateTimeline), string.Empty, isCurrent))
+                                {
+                                    SetCustomTimelineNextLink(key, candidateKey);
+                                    plugin.EncounterTracker.RebuildZoneMappings();
+                                    SetDebugStatus($"Linked {BuildTimelineLinkLabel(key, tl)} to {BuildTimelineLinkLabel(candidateKey, candidateTimeline)}.");
+                                }
+                            }
+                        }
+
+                        ImGui.EndMenu();
+                    }
+
                     if (ImGui.MenuItem("Auto Space"))
                         AutoSpaceTimeline(key, tl);
 
@@ -1255,18 +1422,27 @@ public sealed class MainWindow : Window
         if (ImGui.IsItemHovered())
         {
             ImGui.BeginTooltip();
-            ImGui.Text("Exports the selected utility plan to BossModReborn.");
+            ImGui.Text("Exports the selected full-timeline healer utility plan to BossModReborn.");
             ImGui.Text("The generated plan is also copied to your clipboard.");
             ImGui.EndTooltip();
         }
+
         // Status banner
         if (!string.IsNullOrEmpty(eiStatus) && DateTime.UtcNow < eiStatusUntil)
         {
             ImGui.Spacing();
-            if (eiIsError)
-                ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), eiStatus);
-            else
-                ImGui.TextColored(new Vector4(0.4f, 1f, 0.6f, 1f), eiStatus);
+            ImGui.PushStyleColor(ImGuiCol.Text, eiIsError
+                ? new Vector4(1f, 0.4f, 0.4f, 1f)
+                : new Vector4(0.4f, 1f, 0.6f, 1f));
+            ImGui.TextWrapped(eiStatus);
+            ImGui.PopStyleColor();
+
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.BeginTooltip();
+                ImGui.TextUnformatted(eiStatus);
+                ImGui.EndTooltip();
+            }
         }
 
         ImGui.EndChild();
@@ -2560,6 +2736,8 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             selectedOgcdEntries = ApplyScholarDissipationSelectionRules(ogcdEntries, selectedOgcdEntries, openerBuffer, debug);
             selectedOgcdEntries = RebaseMovedOgcdCooldownChains(ogcdEntries, selectedOgcdEntries, debug);
         }
+        selectedGcdEntries = TrimAutoTimelineEntriesToFightDuration(selectedGcdEntries, fightDurationSec, "GCD", debug);
+        selectedOgcdEntries = TrimAutoTimelineEntriesToFightDuration(selectedOgcdEntries, fightDurationSec, "oGCD", debug);
         var finalEntries = BuildAutoTimelineWithFixedGcds(
             selectedGcdEntries,
             selectedOgcdEntries,
@@ -2567,6 +2745,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             rawAbilityNames,
             openerBuffer,
             debug);
+        finalEntries = TrimAutoTimelineEntriesToFightDuration(finalEntries, fightDurationSec, "scheduled", debug);
 
         debug?.Add();
         debug?.Add($"Final selected GCDs: {selectedGcdEntries.Count}");
@@ -2578,6 +2757,31 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             Entries = finalEntries,
             DebugReport = debug?.Build() ?? string.Empty,
         };
+    }
+
+    private static List<TimelineEntry> TrimAutoTimelineEntriesToFightDuration(
+        IEnumerable<TimelineEntry> entries,
+        double fightDurationSec,
+        string debugLabel,
+        AutoTimelineDebugRecorder? debug)
+    {
+        var orderedEntries = entries
+            .OrderBy(entry => entry.TimeOffsetSec)
+            .ThenByDescending(entry => entry.Frequency)
+            .ToList();
+        if (fightDurationSec <= 0.0 || orderedEntries.Count == 0)
+            return orderedEntries;
+
+        var keptEntries = orderedEntries
+            .Where(entry => entry.TimeOffsetSec <= fightDurationSec + AutoCooldownToleranceSec)
+            .ToList();
+        var trimmedCount = orderedEntries.Count - keptEntries.Count;
+        if (trimmedCount > 0)
+        {
+            debug?.Add($"  duration clamp | trimmed {trimmedCount} {debugLabel} entr{(trimmedCount == 1 ? "y" : "ies")} beyond fight end {FormatTime(fightDurationSec)}");
+        }
+
+        return keptEntries;
     }
 
     private List<TimelineEntry> SelectAutoGcdEntries(
@@ -4015,16 +4219,12 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 var windowAboveThresholdCandidates = windowCandidates
                     .Where(candidate => candidate.Frequency >= AutoStateDrivenOgcdMinFrequency)
                     .ToList();
-                var selectedWindowPool = windowAboveThresholdCandidates.Count > 0
-                    ? windowAboveThresholdCandidates
-                    : windowCandidates;
-                var chosenCandidate = selectedWindowPool
-                    .OrderByDescending(candidate => candidate.Frequency)
-                    .ThenBy(candidate => candidate.TimeOffsetSec)
-                    .First();
+                var usedFallback = windowAboveThresholdCandidates.Count == 0;
+                var chosenCandidate = previousKeptCandidate == null
+                    ? ChooseCooldownBaselineCandidate(windowCandidates, windowAboveThresholdCandidates)
+                    : ChooseNextReadyCooldownCandidate(windowCandidates, windowAboveThresholdCandidates, nextReadyTimeSec);
                 var chosenKey = GetAutoEntryIdentityKey(chosenCandidate);
                 var windowText = $"{FormatTime(currentWindowStartSec)}-{FormatTime(currentWindowEndSec)}";
-                var usedFallback = windowAboveThresholdCandidates.Count == 0;
 
                 cooldownKeptEntries.Add(chosenCandidate);
 
@@ -4040,8 +4240,8 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 {
                     var keepReasonPrefix = $"cooldown reopened after {FormatTime(nextReadyTimeSec)} from prior keep {FormatAutoDebugEntry(previousKeptCandidate)}";
                     var keepReason = usedFallback
-                        ? $"{keepReasonPrefix} | fallback highest instance within cooldown window {windowText}; no candidate met {thresholdText} in this window"
-                        : $"{keepReasonPrefix} | strongest instance within cooldown window {windowText}";
+                        ? $"{keepReasonPrefix} | fallback strongest near-ready instance within cooldown window {windowText}; no candidate met {thresholdText} in this window"
+                        : $"{keepReasonPrefix} | strongest near-ready above-threshold instance within cooldown window {windowText}";
                     nextReadyTimeSec = chosenCandidate.TimeOffsetSec + recastSec;
                     debug?.Add($"    keep | {FormatAutoDebugEntry(chosenCandidate)} | {keepReason} | next ready {FormatTime(nextReadyTimeSec)}");
                 }
@@ -4052,8 +4252,8 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                         continue;
 
                     var pruneReason = usedFallback
-                        ? $"cooldown window {windowText} fell back to stronger keep {FormatAutoDebugEntry(chosenCandidate)} because no candidate met {thresholdText}"
-                        : $"cooldown window {windowText} already committed to stronger keep {FormatAutoDebugEntry(chosenCandidate)}";
+                        ? $"cooldown window {windowText} fell back to earliest keep {FormatAutoDebugEntry(chosenCandidate)} because no candidate met {thresholdText}"
+                        : $"cooldown window {windowText} already committed to next ready keep {FormatAutoDebugEntry(chosenCandidate)}";
                     debug?.Add($"    prune | {FormatAutoDebugEntry(candidate)} | {pruneReason}");
                 }
 
@@ -4325,6 +4525,80 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         return result;
     }
 
+    private sealed class ScholarOpenerDissipationSequencePlan
+    {
+        public required TimelineEntry Dissipation { get; init; }
+        public required List<TimelineEntry> EnergyDrains { get; init; }
+        public required TimelineEntry ReplacementAetherflow { get; init; }
+        public required double SequenceEndTimeSec { get; init; }
+    }
+
+    private ScholarOpenerDissipationSequencePlan? TryBuildScholarOpenerDissipationSequencePlan(
+        TimelineEntry openerDissipation,
+        IReadOnlyList<TimelineEntry> sourceOgcdEntries,
+        IReadOnlyList<TimelineEntry> selectedOgcdEntries,
+        double openerWindowEndSec,
+        AutoTimelineDebugRecorder? debug)
+    {
+        var openerChainStratagem = selectedOgcdEntries.FirstOrDefault(entry =>
+            string.Equals(entry.AbilityName, "Chain Stratagem", StringComparison.OrdinalIgnoreCase) &&
+            entry.TimeOffsetSec > openerDissipation.TimeOffsetSec + AutoCooldownToleranceSec);
+        var energyDrainStartSec = openerChainStratagem?.TimeOffsetSec ?? openerDissipation.TimeOffsetSec;
+        var gcdRecastSec = GetConfiguredAutoTimelineGcdRecastSec();
+        var localSearchEndSec = Math.Max(
+            openerWindowEndSec + gcdRecastSec * 1.5,
+            openerDissipation.TimeOffsetSec + gcdRecastSec * 6.0);
+
+        var openerEnergyDrainCandidates = sourceOgcdEntries
+            .Where(entry =>
+                string.Equals(entry.AbilityName, "Energy Drain", StringComparison.OrdinalIgnoreCase) &&
+                entry.TimeOffsetSec > energyDrainStartSec + AutoCooldownToleranceSec &&
+                entry.TimeOffsetSec <= localSearchEndSec + AutoCooldownToleranceSec)
+            .OrderBy(entry => entry.TimeOffsetSec)
+            .ThenByDescending(entry => entry.Frequency)
+            .ToList();
+        var uniqueEnergyDrainCandidates = openerEnergyDrainCandidates
+            .GroupBy(entry => Math.Round(entry.TimeOffsetSec, 3))
+            .Select(group => group.OrderByDescending(entry => entry.Frequency).ThenBy(entry => entry.TimeOffsetSec).First())
+            .OrderBy(entry => entry.TimeOffsetSec)
+            .ToList();
+        var chosenEnergyDrains = new List<TimelineEntry>(3);
+        foreach (var candidate in uniqueEnergyDrainCandidates)
+        {
+            if (chosenEnergyDrains.Count > 0 &&
+                candidate.TimeOffsetSec < chosenEnergyDrains[^1].TimeOffsetSec + gcdRecastSec - AutoCooldownToleranceSec)
+            {
+                debug?.Add($"    prune | {FormatAutoDebugEntry(candidate)} | Dissipation opener rule only allows Energy Drain in the first oGCD slot after each weave window");
+                continue;
+            }
+
+            chosenEnergyDrains.Add(candidate);
+            if (chosenEnergyDrains.Count >= 3)
+                break;
+        }
+        if (chosenEnergyDrains.Count < 3)
+            return null;
+
+        var replacementAetherflow = sourceOgcdEntries
+            .Where(entry =>
+                string.Equals(entry.AbilityName, "Aetherflow", StringComparison.OrdinalIgnoreCase) &&
+                entry.TimeOffsetSec >= chosenEnergyDrains[^1].TimeOffsetSec + gcdRecastSec - AutoCooldownToleranceSec &&
+                entry.TimeOffsetSec <= localSearchEndSec + AutoCooldownToleranceSec)
+            .OrderBy(entry => entry.TimeOffsetSec)
+            .ThenByDescending(entry => entry.Frequency)
+            .FirstOrDefault();
+        if (replacementAetherflow == null)
+            return null;
+
+        return new ScholarOpenerDissipationSequencePlan
+        {
+            Dissipation = openerDissipation,
+            EnergyDrains = chosenEnergyDrains,
+            ReplacementAetherflow = replacementAetherflow,
+            SequenceEndTimeSec = replacementAetherflow.TimeOffsetSec,
+        };
+    }
+
     private List<TimelineEntry> ApplyScholarOpenerDissipationSequence(
         List<TimelineEntry> sourceOgcdEntries,
         List<TimelineEntry> selectedOgcdEntries,
@@ -4341,55 +4615,34 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
 
         debug?.Add("  scholar opener dissipation");
 
-        var openerChainStratagem = result.FirstOrDefault(entry =>
-            string.Equals(entry.AbilityName, "Chain Stratagem", StringComparison.OrdinalIgnoreCase) &&
-            entry.TimeOffsetSec > openerDissipation.TimeOffsetSec + AutoCooldownToleranceSec);
-        var energyDrainStartSec = openerChainStratagem?.TimeOffsetSec ?? openerDissipation.TimeOffsetSec;
-        var openerEnergyDrainCandidates = sourceOgcdEntries
-            .Where(entry =>
-                string.Equals(entry.AbilityName, "Energy Drain", StringComparison.OrdinalIgnoreCase) &&
-                entry.TimeOffsetSec > energyDrainStartSec + AutoCooldownToleranceSec)
+        var openerWindowEndSec = result
+            .Where(entry => entry.IsGcd)
             .OrderBy(entry => entry.TimeOffsetSec)
-            .ThenByDescending(entry => entry.Frequency)
-            .ToList();
-        var uniqueEnergyDrainCandidates = openerEnergyDrainCandidates
-            .GroupBy(entry => Math.Round(entry.TimeOffsetSec, 3))
-            .Select(group => group.OrderByDescending(entry => entry.Frequency).ThenBy(entry => entry.TimeOffsetSec).First())
-            .OrderBy(entry => entry.TimeOffsetSec)
-            .ToList();
-        var chosenEnergyDrains = new List<TimelineEntry>(3);
-        foreach (var candidate in uniqueEnergyDrainCandidates)
+            .Take(12)
+            .Select(entry => entry.TimeOffsetSec)
+            .DefaultIfEmpty(openerDissipation.TimeOffsetSec + GetConfiguredAutoTimelineGcdRecastSec() * 10.0)
+            .Max();
+        var openerSequencePlan = TryBuildScholarOpenerDissipationSequencePlan(
+            openerDissipation,
+            sourceOgcdEntries,
+            result,
+            openerWindowEndSec,
+            debug);
+        if (openerSequencePlan == null)
         {
-            if (chosenEnergyDrains.Count > 0 &&
-                candidate.TimeOffsetSec < chosenEnergyDrains[^1].TimeOffsetSec + GetConfiguredAutoTimelineGcdRecastSec() - AutoCooldownToleranceSec)
-            {
-                debug?.Add($"    prune | {FormatAutoDebugEntry(candidate)} | Dissipation opener rule only allows Energy Drain in the first oGCD slot after each weave window");
-                continue;
-            }
-
-            chosenEnergyDrains.Add(candidate);
-            if (chosenEnergyDrains.Count >= 3)
-                break;
-        }
-        if (chosenEnergyDrains.Count < 3)
+            result.Remove(openerDissipation);
+            debug?.Add($"    prune | {FormatAutoDebugEntry(openerDissipation)} | Dissipation opener rule could not find a local three-Energy-Drain sequence and immediate replacement Aetherflow");
             return result;
+        }
 
-        var replacementAetherflow = sourceOgcdEntries
-            .Where(entry =>
-                string.Equals(entry.AbilityName, "Aetherflow", StringComparison.OrdinalIgnoreCase) &&
-                entry.TimeOffsetSec >= chosenEnergyDrains[^1].TimeOffsetSec + GetConfiguredAutoTimelineGcdRecastSec() - AutoCooldownToleranceSec)
-            .OrderBy(entry => entry.TimeOffsetSec)
-            .ThenByDescending(entry => entry.Frequency)
-            .FirstOrDefault();
-        var openerSequenceEndSec = replacementAetherflow?.TimeOffsetSec ?? chosenEnergyDrains[^1].TimeOffsetSec;
-        var chosenEnergyDrainKeys = chosenEnergyDrains
+        var chosenEnergyDrainKeys = openerSequencePlan.EnergyDrains
             .Select(GetAutoEntryIdentityKey)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         foreach (var prunedEntry in result
                      .Where(entry =>
                          entry.TimeOffsetSec >= openerDissipation.TimeOffsetSec - AutoCooldownToleranceSec &&
-                         entry.TimeOffsetSec <= openerSequenceEndSec + AutoCooldownToleranceSec &&
+                         entry.TimeOffsetSec <= openerSequencePlan.SequenceEndTimeSec + AutoCooldownToleranceSec &&
                          (string.Equals(entry.AbilityName, "Aetherflow", StringComparison.OrdinalIgnoreCase) ||
                           IsScholarAetherflowSpender(entry.AbilityName)) &&
                          !(string.Equals(entry.AbilityName, "Energy Drain", StringComparison.OrdinalIgnoreCase) &&
@@ -4403,7 +4656,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             debug?.Add($"    prune | {FormatAutoDebugEntry(prunedEntry)} | {pruneReason}");
         }
 
-        foreach (var energyDrain in chosenEnergyDrains)
+        foreach (var energyDrain in openerSequencePlan.EnergyDrains)
         {
             if (result.Any(existing => string.Equals(GetAutoEntryIdentityKey(existing), GetAutoEntryIdentityKey(energyDrain), StringComparison.OrdinalIgnoreCase)))
                 continue;
@@ -4411,68 +4664,57 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             result.Add(energyDrain);
             debug?.Add($"    keep | {FormatAutoDebugEntry(energyDrain)} | Dissipation opener rule forced this Energy Drain as one of three opener gauge spends");
         }
-        if (replacementAetherflow != null &&
-            result.All(existing => !string.Equals(GetAutoEntryIdentityKey(existing), GetAutoEntryIdentityKey(replacementAetherflow), StringComparison.OrdinalIgnoreCase)))
+        if (result.All(existing => !string.Equals(GetAutoEntryIdentityKey(existing), GetAutoEntryIdentityKey(openerSequencePlan.ReplacementAetherflow), StringComparison.OrdinalIgnoreCase)))
         {
-            result.Add(replacementAetherflow);
-            debug?.Add($"    keep | {FormatAutoDebugEntry(replacementAetherflow)} | Dissipation opener rule reopened Aetherflow immediately after the third opener Energy Drain");
+            result.Add(openerSequencePlan.ReplacementAetherflow);
+            debug?.Add($"    keep | {FormatAutoDebugEntry(openerSequencePlan.ReplacementAetherflow)} | Dissipation opener rule reopened Aetherflow immediately after the third opener Energy Drain");
         }
 
-        if (replacementAetherflow != null)
+        var aetherflowInfo = plugin.RecastDatabase.Lookup(openerSequencePlan.ReplacementAetherflow.AbilityId, openerSequencePlan.ReplacementAetherflow.AbilityName);
+        var aetherflowRecastSec = Math.Max(0.1, aetherflowInfo?.RecastSec ?? 60.0);
+        var aetherflowCandidates = sourceOgcdEntries
+            .Where(entry =>
+                string.Equals(entry.AbilityName, "Aetherflow", StringComparison.OrdinalIgnoreCase) &&
+                entry.TimeOffsetSec > openerSequencePlan.ReplacementAetherflow.TimeOffsetSec + AutoCooldownToleranceSec)
+            .OrderBy(entry => entry.TimeOffsetSec)
+            .ThenByDescending(entry => entry.Frequency)
+            .ToList();
+
+        foreach (var prunedAetherflow in result
+                     .Where(entry =>
+                         string.Equals(entry.AbilityName, "Aetherflow", StringComparison.OrdinalIgnoreCase) &&
+                         entry.TimeOffsetSec > openerSequencePlan.ReplacementAetherflow.TimeOffsetSec + AutoCooldownToleranceSec)
+                     .ToList())
         {
-            var aetherflowInfo = plugin.RecastDatabase.Lookup(replacementAetherflow.AbilityId, replacementAetherflow.AbilityName);
-            var aetherflowRecastSec = Math.Max(0.1, aetherflowInfo?.RecastSec ?? 60.0);
-            var aetherflowCandidates = sourceOgcdEntries
-                .Where(entry =>
-                    string.Equals(entry.AbilityName, "Aetherflow", StringComparison.OrdinalIgnoreCase) &&
-                    entry.TimeOffsetSec > replacementAetherflow.TimeOffsetSec + AutoCooldownToleranceSec)
-                .OrderBy(entry => entry.TimeOffsetSec)
-                .ThenByDescending(entry => entry.Frequency)
+            result.Remove(prunedAetherflow);
+            debug?.Add($"    prune | {FormatAutoDebugEntry(prunedAetherflow)} | Scholar opener rebased the Aetherflow cooldown chain from the corrected first post-opener Aetherflow");
+        }
+
+        var nextReadyTimeSec = openerSequencePlan.ReplacementAetherflow.TimeOffsetSec + aetherflowRecastSec;
+        while (aetherflowCandidates.Count > 0)
+        {
+            if (!TryFindCooldownWindowCandidate(
+                    aetherflowCandidates,
+                    nextReadyTimeSec,
+                    aetherflowRecastSec,
+                    AutoStateDrivenOgcdMinFrequency,
+                    useBaselineSelection: false,
+                    out var chosenCandidate,
+                    out _,
+                    out _,
+                    out _))
+            {
+                break;
+            }
+            result.Add(chosenCandidate);
+            debug?.Add($"    keep | {FormatAutoDebugEntry(chosenCandidate)} | Scholar opener rebased later Aetherflow windows from {FormatAutoDebugEntry(openerSequencePlan.ReplacementAetherflow)}");
+
+            nextReadyTimeSec = chosenCandidate.TimeOffsetSec + aetherflowRecastSec;
+            aetherflowCandidates = aetherflowCandidates
+                .Where(candidate =>
+                    !string.Equals(GetAutoEntryIdentityKey(candidate), GetAutoEntryIdentityKey(chosenCandidate), StringComparison.OrdinalIgnoreCase) &&
+                    candidate.TimeOffsetSec > chosenCandidate.TimeOffsetSec + AutoCooldownToleranceSec)
                 .ToList();
-
-            foreach (var prunedAetherflow in result
-                         .Where(entry =>
-                             string.Equals(entry.AbilityName, "Aetherflow", StringComparison.OrdinalIgnoreCase) &&
-                             entry.TimeOffsetSec > replacementAetherflow.TimeOffsetSec + AutoCooldownToleranceSec)
-                         .ToList())
-            {
-                result.Remove(prunedAetherflow);
-                debug?.Add($"    prune | {FormatAutoDebugEntry(prunedAetherflow)} | Scholar opener rebased the Aetherflow cooldown chain from the corrected first post-opener Aetherflow");
-            }
-
-            var nextReadyTimeSec = replacementAetherflow.TimeOffsetSec + aetherflowRecastSec;
-            while (aetherflowCandidates.Count > 0)
-            {
-                var windowStartSec = nextReadyTimeSec - AutoCooldownToleranceSec;
-                var windowEndSec = windowStartSec + aetherflowRecastSec;
-                var windowCandidates = aetherflowCandidates
-                    .Where(candidate =>
-                        candidate.TimeOffsetSec >= windowStartSec - 0.001 &&
-                        candidate.TimeOffsetSec < windowEndSec - AutoCooldownToleranceSec)
-                    .ToList();
-                if (windowCandidates.Count == 0)
-                    break;
-
-                var aboveThresholdWindowCandidates = windowCandidates
-                    .Where(candidate => candidate.Frequency >= AutoStateDrivenOgcdMinFrequency)
-                    .ToList();
-                var selectedWindowPool = aboveThresholdWindowCandidates.Count > 0
-                    ? aboveThresholdWindowCandidates
-                    : windowCandidates;
-                var chosenCandidate = selectedWindowPool
-                    .OrderByDescending(candidate => candidate.Frequency)
-                    .ThenBy(candidate => candidate.TimeOffsetSec)
-                    .First();
-                result.Add(chosenCandidate);
-                debug?.Add($"    keep | {FormatAutoDebugEntry(chosenCandidate)} | Scholar opener rebased later Aetherflow windows from {FormatAutoDebugEntry(replacementAetherflow)}");
-
-                nextReadyTimeSec = chosenCandidate.TimeOffsetSec + aetherflowRecastSec;
-                aetherflowCandidates = aetherflowCandidates
-                    .Where(candidate =>
-                        !string.Equals(GetAutoEntryIdentityKey(candidate), GetAutoEntryIdentityKey(chosenCandidate), StringComparison.OrdinalIgnoreCase) &&
-                        candidate.TimeOffsetSec > chosenCandidate.TimeOffsetSec + AutoCooldownToleranceSec)
-                    .ToList();
-            }
         }
 
         return result
@@ -4649,11 +4891,22 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                     continue;
                 }
 
-                var replacement = sourceCandidates.FirstOrDefault(candidate =>
-                    !usedCandidateKeys.Contains(GetAutoEntryIdentityKey(candidate)) &&
-                    candidate.TimeOffsetSec >= readyTimeSec - AutoCooldownToleranceSec);
-                if (replacement == null)
+                var replacementCandidates = sourceCandidates
+                    .Where(candidate => !usedCandidateKeys.Contains(GetAutoEntryIdentityKey(candidate)))
+                    .ToList();
+                if (!TryFindCooldownWindowCandidate(
+                        replacementCandidates,
+                        readyTimeSec,
+                        recastInfo.RecastSec,
+                        AutoStateDrivenOgcdMinFrequency,
+                        useBaselineSelection: false,
+                        out var replacement,
+                        out _,
+                        out _,
+                        out _))
+                {
                     continue;
+                }
 
                 var replacementClone = CloneTimelineEntry(replacement);
                 rebasedEntries[currentItem.Index] = replacementClone;
@@ -4821,26 +5074,23 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             TimelineEntry? chosenCandidate = null;
             foreach (var candidate in orderedWindowCandidates)
             {
-                if (chosenDissipationEntries.Count > 0)
+                var rejectionReason = GetScholarDissipationCandidateRestrictionReason(
+                    candidate,
+                    nonDissipationEntries,
+                    chosenDissipationEntries,
+                    gaugeRules,
+                    grantedRules,
+                    availableAbilityNames,
+                    openerBuffer);
+                if (rejectionReason != null)
                 {
-                    var rejectionReason = GetScholarDissipationCandidateRestrictionReason(
-                        candidate,
-                        nonDissipationEntries,
-                        chosenDissipationEntries,
-                        gaugeRules,
-                        grantedRules,
-                        availableAbilityNames,
-                        openerBuffer);
-                    if (rejectionReason != null)
-                    {
-                        debug?.Add($"    prune | {FormatAutoDebugEntry(candidate)} | {rejectionReason}");
-                        continue;
-                    }
+                    debug?.Add($"    prune | {FormatAutoDebugEntry(candidate)} | {rejectionReason}");
+                    continue;
                 }
 
                 chosenCandidate = candidate;
-                if (chosenDissipationEntries.Count == 0)
-                    debug?.Add($"    keep | {FormatAutoDebugEntry(candidate)} | first Dissipation is exempt from Scholar Dissipation timing rules in cooldown window {FormatTime(currentWindowStartSec)}-{FormatTime(currentWindowEndSec)}");
+                if (IsWithinAutoOpenerBuffer(openerBuffer, candidate.TimeOffsetSec))
+                    debug?.Add($"    keep | {FormatAutoDebugEntry(candidate)} | opener buffer waived Scholar Dissipation timing checks in cooldown window {FormatTime(currentWindowStartSec)}-{FormatTime(currentWindowEndSec)}");
                 else
                     debug?.Add($"    keep | {FormatAutoDebugEntry(candidate)} | Scholar Dissipation timing rule satisfied in cooldown window {FormatTime(currentWindowStartSec)}-{FormatTime(currentWindowEndSec)}");
                 break;
@@ -7308,6 +7558,93 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             entry.Frequency,
             entry.AverageUses);
 
+    private static TimelineEntry ChooseCooldownBaselineCandidate(
+        IReadOnlyList<TimelineEntry> windowCandidates,
+        IReadOnlyList<TimelineEntry> windowAboveThresholdCandidates)
+    {
+        var selectedWindowPool = windowAboveThresholdCandidates.Count > 0
+            ? windowAboveThresholdCandidates
+            : windowCandidates;
+        return selectedWindowPool
+            .OrderByDescending(candidate => candidate.Frequency)
+            .ThenBy(candidate => candidate.TimeOffsetSec)
+            .First();
+    }
+
+    private static TimelineEntry ChooseNextReadyCooldownCandidate(
+        IReadOnlyList<TimelineEntry> windowCandidates,
+        IReadOnlyList<TimelineEntry> windowAboveThresholdCandidates,
+        double nextReadyTimeSec)
+    {
+        var selectedWindowPool = windowAboveThresholdCandidates.Count > 0
+            ? windowAboveThresholdCandidates
+            : windowCandidates;
+        var nearReadyCandidates = selectedWindowPool
+            .Where(candidate => candidate.TimeOffsetSec <= nextReadyTimeSec + 6.0 + AutoCooldownToleranceSec)
+            .ToList();
+        if (nearReadyCandidates.Count > 0)
+        {
+            return nearReadyCandidates
+                .OrderByDescending(candidate => candidate.Frequency)
+                .ThenBy(candidate => candidate.TimeOffsetSec)
+                .First();
+        }
+
+        return selectedWindowPool
+            .OrderBy(candidate => candidate.TimeOffsetSec)
+            .ThenByDescending(candidate => candidate.Frequency)
+            .First();
+    }
+
+    private static bool TryFindCooldownWindowCandidate(
+        IReadOnlyList<TimelineEntry> orderedCandidates,
+        double nextReadyTimeSec,
+        double recastSec,
+        double minimumFrequency,
+        bool useBaselineSelection,
+        out TimelineEntry chosenCandidate,
+        out List<TimelineEntry> windowCandidates,
+        out double windowStartSec,
+        out double windowEndSec)
+    {
+        chosenCandidate = null!;
+        windowCandidates = [];
+        windowStartSec = nextReadyTimeSec - AutoCooldownToleranceSec;
+        windowEndSec = windowStartSec;
+        if (orderedCandidates.Count == 0)
+            return false;
+
+        var currentWindowStartSec = nextReadyTimeSec - AutoCooldownToleranceSec;
+        var finalCandidateTimeSec = orderedCandidates[^1].TimeOffsetSec;
+        while (currentWindowStartSec <= finalCandidateTimeSec + AutoCooldownToleranceSec)
+        {
+            var currentWindowEndSec = currentWindowStartSec + recastSec;
+            var currentWindowCandidates = orderedCandidates
+                .Where(candidate =>
+                    candidate.TimeOffsetSec >= currentWindowStartSec - 0.001 &&
+                    candidate.TimeOffsetSec < currentWindowEndSec - AutoCooldownToleranceSec)
+                .ToList();
+            if (currentWindowCandidates.Count == 0)
+            {
+                currentWindowStartSec += recastSec;
+                continue;
+            }
+
+            var currentWindowAboveThresholdCandidates = currentWindowCandidates
+                .Where(candidate => candidate.Frequency >= minimumFrequency)
+                .ToList();
+            chosenCandidate = useBaselineSelection
+                ? ChooseCooldownBaselineCandidate(currentWindowCandidates, currentWindowAboveThresholdCandidates)
+                : ChooseNextReadyCooldownCandidate(currentWindowCandidates, currentWindowAboveThresholdCandidates, nextReadyTimeSec);
+            windowCandidates = currentWindowCandidates;
+            windowStartSec = currentWindowStartSec;
+            windowEndSec = currentWindowEndSec;
+            return true;
+        }
+
+        return false;
+    }
+
     private static bool MatchesCastRule(
         GrantedActionDatabase.InstantCastRule rule,
         string abilityName,
@@ -7574,9 +7911,6 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         ISet<string> availableAbilityNames,
         AutoOpenerBufferInfo openerBuffer)
     {
-        if (IsWithinAutoOpenerBuffer(openerBuffer, candidate.TimeOffsetSec))
-            return null;
-
         var state = CreateAutoTimelineState("Scholar", gaugeRules, grantedRules, availableAbilityNames);
         var replayEntries = selectedNonDissipationEntries
             .Concat(priorChosenDissipationEntries)
@@ -7622,6 +7956,9 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             string.Equals(entry.AbilityName, "Chain Stratagem", StringComparison.OrdinalIgnoreCase) &&
             entry.TimeOffsetSec >= candidate.TimeOffsetSec - AutoCooldownToleranceSec &&
             entry.TimeOffsetSec <= candidate.TimeOffsetSec + 6.0 + AutoCooldownToleranceSec);
+        if (IsWithinAutoOpenerBuffer(openerBuffer, candidate.TimeOffsetSec))
+            return null;
+
         return chainStartsSoon
             ? null
             : "Scholar Dissipation requires Chain Stratagem to be active or to begin within the next 6.0s";
@@ -8660,13 +8997,6 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             riAutoSelectedSpec = Math.Clamp(selectedSpec, 0, Math.Max(0, allSpecNames.Count - 1));
 
         var autoZones = zones.Select(zone => zone.Name).ToList();
-        ImGui.SetNextItemWidth(220);
-        if (ImGui.Combo("Zone##riAutoZone", ref riAutoSelectedZone, autoZones, -1))
-        {
-            riAutoSelectedEncounter = 0;
-            riAutoSelectedPhase = 0;
-        }
-
         var autoEncounters = riAutoSelectedZone >= 0 && riAutoSelectedZone < zones.Count
             ? zones[riAutoSelectedZone].Encounters
             : [];
@@ -8674,9 +9004,28 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         if (riAutoSelectedEncounter < 0 || riAutoSelectedEncounter >= autoEncounterNames.Count)
             riAutoSelectedEncounter = autoEncounterNames.Count > 0 ? 0 : -1;
 
-        if (ImGui.BeginTable("##riAutoCreateLayout", 2, ImGuiTableFlags.SizingStretchSame))
+        if (ImGui.BeginTable("##riAutoSelectors", 2, ImGuiTableFlags.SizingFixedFit))
         {
+            ImGui.TableSetupColumn("left", ImGuiTableColumnFlags.WidthFixed, 280f);
+            ImGui.TableSetupColumn("right", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableNextRow();
             ImGui.TableNextColumn();
+
+            ImGui.SetNextItemWidth(220);
+            if (ImGui.Combo("Zone##riAutoZone", ref riAutoSelectedZone, autoZones, -1))
+            {
+                riAutoSelectedEncounter = 0;
+                riAutoSelectedPhase = 0;
+                riAutoPhaseStartSelectionKey = string.Empty;
+                riAutoPhaseStartBossIndices.Clear();
+            }
+
+            autoEncounters = riAutoSelectedZone >= 0 && riAutoSelectedZone < zones.Count
+                ? zones[riAutoSelectedZone].Encounters
+                : [];
+            autoEncounterNames = autoEncounters.Select(encounter => encounter.Name).ToList();
+            if (riAutoSelectedEncounter < 0 || riAutoSelectedEncounter >= autoEncounterNames.Count)
+                riAutoSelectedEncounter = autoEncounterNames.Count > 0 ? 0 : -1;
 
             ImGui.SetNextItemWidth(220);
             if (autoEncounterNames.Count > 0)
@@ -9331,6 +9680,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 StartMs = startMs,
                 EndMs = endMs,
             });
+
         }
 
         return customWindows;
@@ -10171,6 +10521,81 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         return encounterId > 0;
     }
 
+    private IEnumerable<(string Key, AggregatedTimeline Timeline)> GetLinkableCustomTimelineCandidates(string sourceKey, AggregatedTimeline sourceTimeline)
+    {
+        if (!TryGetBaseEncounterIdFromPhaseEncounterId(sourceTimeline.EncounterId, out var sourceBaseEncounterId) ||
+            sourceBaseEncounterId <= 0)
+        {
+            yield break;
+        }
+
+        var candidates = plugin.Configuration.CustomTimelines
+            .Where(entry => !string.Equals(entry.Key, sourceKey, StringComparison.Ordinal))
+            .Where(entry => string.Equals(entry.Value.SpecName, sourceTimeline.SpecName, StringComparison.OrdinalIgnoreCase))
+            .Where(entry => TryGetBaseEncounterIdFromPhaseEncounterId(entry.Value.EncounterId, out var candidateBaseEncounterId) &&
+                            candidateBaseEncounterId == sourceBaseEncounterId)
+            .OrderBy(entry => BuildTimelineLinkLabel(entry.Key, entry.Value), StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (candidateKey, candidateTimeline) in candidates)
+        {
+            if (!WouldCreateTimelineLinkCycle(sourceKey, candidateKey))
+                yield return (candidateKey, candidateTimeline);
+        }
+    }
+
+    private void SetCustomTimelineNextLink(string sourceKey, string targetKey)
+    {
+        var conflictingSources = plugin.Configuration.TimelineNextLinks
+            .Where(entry => !string.Equals(entry.Key, sourceKey, StringComparison.Ordinal) &&
+                            string.Equals(entry.Value, targetKey, StringComparison.Ordinal))
+            .Select(entry => entry.Key)
+            .ToList();
+
+        foreach (var conflictingSource in conflictingSources)
+            plugin.Configuration.TimelineNextLinks.Remove(conflictingSource);
+
+        plugin.Configuration.TimelineNextLinks[sourceKey] = targetKey;
+        plugin.SaveTimelineUserState();
+    }
+
+    private bool WouldCreateTimelineLinkCycle(string sourceKey, string targetKey)
+    {
+        if (string.Equals(sourceKey, targetKey, StringComparison.Ordinal))
+            return true;
+
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        var currentKey = targetKey;
+        while (!string.IsNullOrWhiteSpace(currentKey) && visited.Add(currentKey))
+        {
+            if (string.Equals(currentKey, sourceKey, StringComparison.Ordinal))
+                return true;
+
+            if (!plugin.Configuration.TimelineNextLinks.TryGetValue(currentKey, out currentKey!))
+                break;
+        }
+
+        return false;
+    }
+
+    private static string BuildTimelineLinkLabel(string key, AggregatedTimeline timeline)
+    {
+        if (TryGetBaseEncounterIdFromPhaseEncounterId(timeline.EncounterId, out var baseEncounterId) &&
+            TryGetPhaseOrdinalFromEncounterId(timeline.EncounterId, baseEncounterId, out var encounterPhaseOrdinal))
+        {
+            return $"{timeline.EncounterName} {GetRomanNumeral(encounterPhaseOrdinal)}";
+        }
+
+        var phaseMatch = Regex.Match(key, @"_p(?<phase>\d+)$", RegexOptions.IgnoreCase);
+        if (phaseMatch.Success &&
+            int.TryParse(phaseMatch.Groups["phase"].Value, out var keyPhaseOrdinal) &&
+            keyPhaseOrdinal > 0)
+        {
+            return $"{timeline.EncounterName} {GetRomanNumeral(keyPhaseOrdinal)}";
+        }
+
+        return $"{timeline.EncounterName} [{key}]";
+    }
+
     private static bool TryGetPhaseOrdinalFromEncounterId(int encounterId, int baseEncounterId, out int phaseOrdinal)
     {
         phaseOrdinal = 0;
@@ -10396,25 +10821,6 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         InvalidateEncounterTimelineCaches();
         plugin.OverlayWindow.InvalidateTimelineCaches();
         RequestDeferredConfigSave();
-    }
-
-    private static string BuildTimelineLinkLabel(string key, AggregatedTimeline timeline)
-    {
-        if (TryGetBaseEncounterIdFromPhaseEncounterId(timeline.EncounterId, out var baseEncounterId) &&
-            TryGetPhaseOrdinalFromEncounterId(timeline.EncounterId, baseEncounterId, out var encounterPhaseOrdinal))
-        {
-            return $"{timeline.EncounterName} {GetRomanNumeral(encounterPhaseOrdinal)}";
-        }
-
-        var phaseMatch = Regex.Match(key, @"_p(?<phase>\d+)$", RegexOptions.IgnoreCase);
-        if (phaseMatch.Success &&
-            int.TryParse(phaseMatch.Groups["phase"].Value, out var keyPhaseOrdinal) &&
-            keyPhaseOrdinal > 0)
-        {
-            return $"{timeline.EncounterName} {GetRomanNumeral(keyPhaseOrdinal)}";
-        }
-
-        return $"{timeline.EncounterName} / {timeline.SpecName}";
     }
 
     // ── Timeline drawing ──
@@ -11432,7 +11838,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         ImGui.Spacing(); ImGui.Spacing();
         DrawCfgResetSection();
         ImGui.Spacing(); ImGui.Spacing();
-        ImGui.TextDisabled("ATKTip v0.1.0");
+        ImGui.TextDisabled("ATKTip v1.2.2");
         ImGui.TextDisabled("Timeline data sourced from FFLogs top parses.");
     }
 

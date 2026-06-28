@@ -33,6 +33,7 @@ public sealed class TimelineUserStateStore
             cfg.AbilityFreqThresholds = data.AbilityFreqThresholds ?? [];
             cfg.TimelineGroups = data.TimelineGroups ?? [];
             cfg.TimelineGroupAssignments = data.TimelineGroupAssignments ?? [];
+            cfg.TimelineNextLinks = data.TimelineNextLinks ?? [];
         }
         catch (Exception ex)
         {
@@ -51,6 +52,7 @@ public sealed class TimelineUserStateStore
                 AbilityFreqThresholds = cfg.AbilityFreqThresholds,
                 TimelineGroups = cfg.TimelineGroups,
                 TimelineGroupAssignments = cfg.TimelineGroupAssignments,
+                TimelineNextLinks = cfg.TimelineNextLinks,
             }, Formatting.Indented);
             File.WriteAllText(path, json);
         }
@@ -66,5 +68,6 @@ public sealed class TimelineUserStateStore
         public Dictionary<string, Dictionary<int, float>> AbilityFreqThresholds { get; set; } = [];
         public List<string> TimelineGroups { get; set; } = [];
         public Dictionary<string, string> TimelineGroupAssignments { get; set; } = [];
+        public Dictionary<string, string> TimelineNextLinks { get; set; } = [];
     }
 }

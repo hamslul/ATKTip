@@ -154,9 +154,7 @@ public sealed class Plugin : IDalamudPlugin
                 overlayWindow.Toggle();
                 break;
             case "preview":
-                // Try auto-preview by zone name match. If ambiguous or no match, open quick-pick.
-                if (!encounterTracker.TryManualPreview())
-                    quickPickWindow.Toggle();
+                quickPickWindow.Toggle();
                 break;
             default:
                 mainWindow.Toggle();
