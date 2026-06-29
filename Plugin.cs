@@ -42,7 +42,6 @@ public sealed class Plugin : IDalamudPlugin
     private readonly EncounterTracker encounterTracker;
     private readonly AntsController antsController;
 
-    public ConfigWindow ConfigWindow { get; }
     public OverlayWindow OverlayWindow => overlayWindow;
     public AutoModalWindow AutoModalWindow => autoModalWindow;
     public EncounterTracker EncounterTracker => encounterTracker;
@@ -77,6 +76,7 @@ public sealed class Plugin : IDalamudPlugin
 
         // Load or create config
         Configuration = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        var hadLegacySerializedRuntimeState = PurgeLegacySerializedRuntimeState(Configuration);
         ConfigDirectory = pluginInterface.GetPluginConfigDirectory();
 
         // Data layer
@@ -92,19 +92,19 @@ public sealed class Plugin : IDalamudPlugin
         TimelineUserStateStore.LoadInto(Configuration);
         CustomTimelineStore.LoadInto(Configuration);
         TimelineUserStateStore.SaveFrom(Configuration);
+        if (hadLegacySerializedRuntimeState)
+            SaveConfig();
         FFLogsClient   = new FFLogsClient(Configuration, log);
         RecastDatabase = new Data.RecastDatabase(dataManager, log);
         ActionStateDatabase = new ActionStateDatabase(RecastDatabase);
         Aggregator     = new TimelineAggregator(log, RecastDatabase);
 
         // Windows
-        ConfigWindow = new ConfigWindow(this);
         mainWindow = new MainWindow(this, log);
         overlayWindow = new OverlayWindow(this, condition, dutyState, objectTable, framework, gameInterop, log);
         autoModalWindow = new AutoModalWindow();
         quickPickWindow = new QuickPickWindow(this);
 
-        windowSystem.AddWindow(ConfigWindow);
         windowSystem.AddWindow(mainWindow);
         windowSystem.AddWindow(overlayWindow);
         windowSystem.AddWindow(autoModalWindow);
@@ -180,6 +180,30 @@ public sealed class Plugin : IDalamudPlugin
     private void OnLogin()
     {
         framework.RunOnFrameworkThread(() => RecastDatabase.RefreshFromLive(log));
+    }
+
+    private static bool PurgeLegacySerializedRuntimeState(Configuration configuration)
+    {
+        var hadLegacyState =
+            configuration.HiddenAbilities.Count > 0 ||
+            configuration.AbilityFreqThresholds.Count > 0 ||
+            configuration.AutoTimelineDisabledAbilities.Count > 0 ||
+            configuration.CustomTimelines.Count > 0 ||
+            configuration.TimelineGroups.Count > 0 ||
+            configuration.TimelineGroupAssignments.Count > 0 ||
+            configuration.TimelineNextLinks.Count > 0;
+
+        if (!hadLegacyState)
+            return false;
+
+        configuration.HiddenAbilities = [];
+        configuration.AbilityFreqThresholds = [];
+        configuration.AutoTimelineDisabledAbilities = [];
+        configuration.CustomTimelines = [];
+        configuration.TimelineGroups = [];
+        configuration.TimelineGroupAssignments = [];
+        configuration.TimelineNextLinks = [];
+        return true;
     }
 
     public void Dispose()

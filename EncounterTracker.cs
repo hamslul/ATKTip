@@ -24,27 +24,6 @@ namespace ATKTip;
 /// </summary>
 public sealed unsafe class EncounterTracker : IDisposable
 {
-    public sealed class TrackerDebugEncounterOption
-    {
-        public required int EncounterId { get; init; }
-        public required string EncounterName { get; init; }
-        public required string SpecName { get; init; }
-        public int PhaseCount { get; init; }
-        public bool HasFullTimeline { get; init; }
-    }
-
-    public sealed class TrackerDebugState
-    {
-        public bool HasActiveEncounter { get; init; }
-        public int EncounterId { get; init; }
-        public string EncounterName { get; init; } = string.Empty;
-        public string SpecName { get; init; } = string.Empty;
-        public int ActivePhaseOrdinal { get; init; }
-        public int AvailablePhaseCount { get; init; }
-        public int PendingPreviewPhaseOrdinal { get; init; }
-        public bool HasNextPhase { get; init; }
-    }
-
     private sealed class ManualPreviewCandidate
     {
         public required string Key { get; init; }
@@ -241,8 +220,6 @@ public sealed unsafe class EncounterTracker : IDisposable
     private DateTime pendingPhasePrimaryBossSeenUtc;
     private uint pendingExpectedPhaseBossDataId;
     private DateTime pendingExpectedPhaseBossSeenUtc;
-    private int pendingPreviewPhaseOrdinal;
-    private bool phaseTransitionClearedTimeline;
     private const double LivePhaseBossChangeStableSec = 1.5;
     private const double LivePhaseFallbackDelaySec = 30.0;
     private const double LivePhaseNamedBossStableSec = 0.75;
@@ -506,8 +483,6 @@ public sealed unsafe class EncounterTracker : IDisposable
             pendingPhasePrimaryBossSeenUtc = default;
             pendingExpectedPhaseBossDataId = 0;
             pendingExpectedPhaseBossSeenUtc = default;
-            pendingPreviewPhaseOrdinal = 0;
-            phaseTransitionClearedTimeline = false;
 
             int encounterId;
             bool mapped = false;
@@ -622,8 +597,6 @@ public sealed unsafe class EncounterTracker : IDisposable
             pendingPhasePrimaryBossSeenUtc = default;
             pendingExpectedPhaseBossDataId = 0;
             pendingExpectedPhaseBossSeenUtc = default;
-            pendingPreviewPhaseOrdinal = 0;
-            phaseTransitionClearedTimeline = false;
             return true;    // conclusive — nothing to load for this job
         }
 
@@ -637,9 +610,6 @@ public sealed unsafe class EncounterTracker : IDisposable
         pendingPhasePrimaryBossSeenUtc = default;
         pendingExpectedPhaseBossDataId = 0;
         pendingExpectedPhaseBossSeenUtc = default;
-        pendingPreviewPhaseOrdinal = 0;
-        phaseTransitionClearedTimeline = false;
-
         log.Info("EncounterTracker: loaded [{0}/{1}] (encounter {2}), overlay ready (paused at t=0).",
             timelineCandidate.Timeline.EncounterName, timelineCandidate.Timeline.SpecName, encounterId);
         return true;
@@ -653,9 +623,6 @@ public sealed unsafe class EncounterTracker : IDisposable
         pendingPhasePrimaryBossSeenUtc = default;
         pendingExpectedPhaseBossDataId = 0;
         pendingExpectedPhaseBossSeenUtc = default;
-        pendingPreviewPhaseOrdinal = 0;
-        phaseTransitionClearedTimeline = false;
-
         if (activePhaseTimelineSet != null)
         {
             var initialCandidate = ResolveInitialPhaseTimelineCandidate(activePhaseTimelineSet);
@@ -680,8 +647,6 @@ public sealed unsafe class EncounterTracker : IDisposable
         pendingPhasePrimaryBossSeenUtc = default;
         pendingExpectedPhaseBossDataId = 0;
         pendingExpectedPhaseBossSeenUtc = default;
-        pendingPreviewPhaseOrdinal = 0;
-        phaseTransitionClearedTimeline = false;
     }
 
     private void TryAdvanceCombatPhase()
@@ -710,8 +675,6 @@ public sealed unsafe class EncounterTracker : IDisposable
         {
             pendingExpectedPhaseBossDataId = 0;
             pendingExpectedPhaseBossSeenUtc = default;
-            pendingPreviewPhaseOrdinal = 0;
-            phaseTransitionClearedTimeline = false;
             return;
         }
 
@@ -733,8 +696,6 @@ public sealed unsafe class EncounterTracker : IDisposable
                     pendingPhasePrimaryBossSeenUtc = default;
                     pendingExpectedPhaseBossDataId = 0;
                     pendingExpectedPhaseBossSeenUtc = default;
-                    pendingPreviewPhaseOrdinal = 0;
-                    phaseTransitionClearedTimeline = false;
                     log.Info("EncounterTracker: advanced to phase {0} for encounter {1} / {2} via targetable phase actor 0x{3:X}.",
                         nextPhaseOrdinal,
                         activePhaseTimelineSet.EncounterId,
@@ -767,8 +728,6 @@ public sealed unsafe class EncounterTracker : IDisposable
                     pendingPhasePrimaryBossSeenUtc = default;
                     pendingExpectedPhaseBossDataId = 0;
                     pendingExpectedPhaseBossSeenUtc = default;
-                    pendingPreviewPhaseOrdinal = 0;
-                    phaseTransitionClearedTimeline = false;
                     log.Info("EncounterTracker: advanced to phase {0} for encounter {1} / {2} via targetable phase boss {3} (0x{4:X}).",
                         nextPhaseOrdinal,
                         activePhaseTimelineSet.EncounterId,
@@ -1228,18 +1187,6 @@ public sealed unsafe class EncounterTracker : IDisposable
         return TryGetPhaseOrdinalFromCustomKey(key, baseKey, out phaseOrdinal);
     }
 
-    private bool TryGetDebugNextPhaseCandidate(out PhaseTimelineCandidate timelineCandidate)
-    {
-        timelineCandidate = null!;
-        if (activePhaseTimelineSet == null || activePhaseTimelineSet.PhaseTimelines.Count == 0)
-            return false;
-
-        var nextPhaseOrdinal = pendingPreviewPhaseOrdinal > 0
-            ? pendingPreviewPhaseOrdinal
-            : activePhaseOrdinal > 0 ? activePhaseOrdinal + 1 : 1;
-        return activePhaseTimelineSet.PhaseTimelines.TryGetValue(nextPhaseOrdinal, out timelineCandidate!);
-    }
-
     private static bool TimelineMatchesEncounter(string key, AggregatedTimeline timeline, int encounterId, string encounterName)
     {
         if (timeline.EncounterId > 0 &&
@@ -1537,68 +1484,6 @@ public sealed unsafe class EncounterTracker : IDisposable
     /// </summary>
     public string? GetCurrentSpecNamePublic() => GetCurrentSpecName();
 
-    public IReadOnlyList<TrackerDebugEncounterOption> GetTrackerDebugEncounterOptions()
-    {
-        var options = plugin.Configuration.CustomTimelines
-            .Where(entry => !string.IsNullOrWhiteSpace(entry.Value.SpecName))
-            .Select(entry =>
-            {
-                TryGetBaseEncounterIdFromPhaseEncounterId(entry.Value.EncounterId, out var baseEncounterId);
-                var encounterName = GetTimelineBaseEncounterName(entry.Value);
-                return new
-                {
-                    entry.Key,
-                    Timeline = entry.Value,
-                    BaseEncounterId = baseEncounterId,
-                    EncounterName = encounterName,
-                };
-            })
-            .Where(entry => entry.BaseEncounterId > 0 && !string.IsNullOrWhiteSpace(entry.EncounterName))
-            .GroupBy(entry => (entry.BaseEncounterId, entry.Timeline.SpecName), entry => entry)
-            .Select(group =>
-            {
-                var representativeName = group
-                    .Select(entry => entry.EncounterName)
-                    .Aggregate(string.Empty, ChooseCanonicalEncounterName);
-                var resolvedPhaseSet = BuildPhaseTimelineSet(group.Key.BaseEncounterId, group.Key.SpecName, representativeName);
-                var baseKey = TimelineDatabase.MakeKey(group.Key.BaseEncounterId, group.Key.SpecName);
-                return new TrackerDebugEncounterOption
-                {
-                    EncounterId = group.Key.BaseEncounterId,
-                    EncounterName = representativeName,
-                    SpecName = group.Key.SpecName,
-                    PhaseCount = resolvedPhaseSet?.PhaseTimelines.Count ?? 0,
-                    HasFullTimeline = resolvedPhaseSet?.FullTimeline != null ||
-                                      group.Any(entry => IsFullTimelineCandidate(entry.Key, entry.Timeline, group.Key.BaseEncounterId, baseKey)),
-                };
-            })
-            .OrderBy(option => option.EncounterName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(option => option.SpecName, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        return options;
-    }
-
-    public TrackerDebugState GetTrackerDebugState()
-    {
-        var phaseCount = activePhaseTimelineSet?.PhaseTimelines.Count ?? 0;
-        var nextPhaseOrdinal = activePhaseOrdinal > 0 ? activePhaseOrdinal + 1 : 1;
-        return new TrackerDebugState
-        {
-            HasActiveEncounter = activePhaseTimelineSet != null,
-            EncounterId = loadedEncounterId,
-            EncounterName = loadedEncounterId != 0
-                ? encounterIdToName.GetValueOrDefault(loadedEncounterId, string.Empty)
-                : string.Empty,
-            SpecName = loadedSpecName,
-            ActivePhaseOrdinal = activePhaseOrdinal,
-            AvailablePhaseCount = phaseCount,
-            PendingPreviewPhaseOrdinal = pendingPreviewPhaseOrdinal,
-            HasNextPhase = activePhaseTimelineSet != null &&
-                           activePhaseTimelineSet.PhaseTimelines.ContainsKey(nextPhaseOrdinal),
-        };
-    }
-
     public bool TryLoadEncounterByTimelineKey(string key)
     {
         if (!plugin.Configuration.CustomTimelines.TryGetValue(key, out var timeline))
@@ -1633,125 +1518,8 @@ public sealed unsafe class EncounterTracker : IDisposable
         pendingPhasePrimaryBossSeenUtc = default;
         pendingExpectedPhaseBossDataId = 0;
         pendingExpectedPhaseBossSeenUtc = default;
-        pendingPreviewPhaseOrdinal = 0;
-        phaseTransitionClearedTimeline = false;
         log.Info("EncounterTracker: manual fallback load → [{0}/{1}] via key {2}.", timeline.EncounterName, timeline.SpecName, key);
         return true;
-    }
-
-    public bool DebugLoadEncounter(int encounterId, string specName, out string message)
-    {
-        var encounterName = encounterIdToName.GetValueOrDefault(encounterId, string.Empty);
-        if (string.IsNullOrWhiteSpace(encounterName))
-        {
-            encounterName = plugin.Configuration.CustomTimelines.Values
-                .Where(timeline => string.Equals(timeline.SpecName, specName, StringComparison.OrdinalIgnoreCase))
-                .Where(timeline => TryGetBaseEncounterIdFromPhaseEncounterId(timeline.EncounterId, out var baseEncounterId) &&
-                                   baseEncounterId == encounterId)
-                .Select(GetTimelineBaseEncounterName)
-                .Aggregate(string.Empty, ChooseCanonicalEncounterName);
-        }
-
-        if (string.IsNullOrWhiteSpace(encounterName))
-        {
-            message = $"No saved custom timeline is mapped to encounter {encounterId} / {specName}.";
-            return false;
-        }
-
-        var phaseTimelineSet = BuildPhaseTimelineSet(encounterId, specName, encounterName);
-        var timelineCandidate = ResolveInitialTimelineCandidate(phaseTimelineSet, encounterId, specName, encounterName);
-        if (timelineCandidate == null)
-        {
-            message = $"No initial timeline could be resolved for {encounterName} / {specName}.";
-            return false;
-        }
-
-        ApplyLoadedEncounterState(encounterId, specName, phaseTimelineSet, timelineCandidate);
-        message = $"Loaded debug encounter {encounterName} / {specName} at {(timelineCandidate.PhaseOrdinal > 0 ? $"phase {timelineCandidate.PhaseOrdinal}" : "the full timeline")}.";
-        return true;
-    }
-
-    public bool DebugPreviewNextPhase(out string message)
-    {
-        if (!TryGetDebugNextPhaseCandidate(out var timelineCandidate))
-        {
-            message = "No next phase is available for the current debug encounter.";
-            return false;
-        }
-
-        plugin.OverlayWindow.ClearForPhaseTransition();
-        plugin.OverlayWindow.PrepareCombatPreview(timelineCandidate.Timeline, timelineCandidate.Key);
-        pendingPreviewPhaseOrdinal = timelineCandidate.PhaseOrdinal;
-        pendingExpectedPhaseBossDataId = 0;
-        pendingExpectedPhaseBossSeenUtc = default;
-        phaseTransitionClearedTimeline = true;
-        message = $"Previewing phase {timelineCandidate.PhaseOrdinal} for debug validation.";
-        return true;
-    }
-
-    public bool DebugCommitNextPhase(out string message)
-    {
-        if (!TryGetDebugNextPhaseCandidate(out var timelineCandidate))
-        {
-            message = "No next phase is available to commit.";
-            return false;
-        }
-
-        plugin.OverlayWindow.SwitchCombatTimelinePaused(timelineCandidate.Timeline, timelineCandidate.Key);
-        activePhaseOrdinal = timelineCandidate.PhaseOrdinal;
-        activePhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossSeenUtc = default;
-        pendingExpectedPhaseBossDataId = 0;
-        pendingExpectedPhaseBossSeenUtc = default;
-        pendingPreviewPhaseOrdinal = 0;
-        phaseTransitionClearedTimeline = false;
-        message = $"Committed debug swap to phase {timelineCandidate.PhaseOrdinal} in paused state.";
-        return true;
-    }
-
-    public bool DebugResetEncounter(out string message)
-    {
-        if (activePhaseTimelineSet == null)
-        {
-            message = "No debug encounter is currently loaded.";
-            return false;
-        }
-
-        var initialCandidate = ResolveInitialPhaseTimelineCandidate(activePhaseTimelineSet) ?? activePhaseTimelineSet.FullTimeline;
-        if (initialCandidate == null)
-        {
-            message = "The loaded debug encounter has no initial timeline to reset to.";
-            return false;
-        }
-
-        plugin.OverlayWindow.PrepareCombatPreview(initialCandidate.Timeline, initialCandidate.Key);
-        activePhaseOrdinal = initialCandidate.PhaseOrdinal;
-        activePhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossSeenUtc = default;
-        pendingExpectedPhaseBossDataId = 0;
-        pendingExpectedPhaseBossSeenUtc = default;
-        pendingPreviewPhaseOrdinal = 0;
-        phaseTransitionClearedTimeline = false;
-        message = $"Reset debug encounter to {(initialCandidate.PhaseOrdinal > 0 ? $"phase {initialCandidate.PhaseOrdinal}" : "the initial timeline")}.";
-        return true;
-    }
-
-    public void DebugClearEncounter()
-    {
-        loadedEncounterId = 0;
-        loadedSpecName = string.Empty;
-        activePhaseTimelineSet = null;
-        activePhaseOrdinal = 0;
-        activePhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossSeenUtc = default;
-        pendingExpectedPhaseBossDataId = 0;
-        pendingExpectedPhaseBossSeenUtc = default;
-        pendingPreviewPhaseOrdinal = 0;
-        phaseTransitionClearedTimeline = false;
-        plugin.OverlayWindow.ClearForZoneChange();
     }
 
     private void ApplyLoadedEncounterState(
@@ -1771,8 +1539,6 @@ public sealed unsafe class EncounterTracker : IDisposable
         pendingPhasePrimaryBossSeenUtc = default;
         pendingExpectedPhaseBossDataId = 0;
         pendingExpectedPhaseBossSeenUtc = default;
-        pendingPreviewPhaseOrdinal = 0;
-        phaseTransitionClearedTimeline = false;
     }
 
     /// <summary>

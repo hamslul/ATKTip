@@ -208,8 +208,8 @@ public sealed class MainWindow : Window
 
     /// <summary>Max concurrent FFLogs API requests when fetching parse events.</summary>
     private const int MaxConcurrency = 10;
-    private const string DebugArtifactsDirectoryName = "debug";
     private const int SyntheticPhaseEncounterIdBase = 1_000_000;
+    private const string DebugArtifactsDirectoryName = "debug";
     private static readonly IReadOnlyDictionary<int, IReadOnlyDictionary<int, int>> LegacyGeneratedEncounterPhaseIds =
         new Dictionary<int, IReadOnlyDictionary<int, int>>
         {
@@ -263,12 +263,11 @@ public sealed class MainWindow : Window
     private int   editEntryAbilityIdx = 0;
     private List<string> editEntryAbilityOptions = [];
     private bool customEditorDirty;
-    private string lastAutoTimelineDebugReport = string.Empty;
+    private readonly Dictionary<string, string> lastAutoTimelineDebugReportsBySpec = new(StringComparer.OrdinalIgnoreCase);
     private string lastConflictDebugReport = string.Empty;
     private string debugStatus = string.Empty;
     private bool debugStatusIsError;
     private DateTime debugStatusUntil = DateTime.MinValue;
-    private int trackerDebugSelectedOption = -1;
 
     // Group management state
     private string newGroupNameBuf = string.Empty;
@@ -307,7 +306,7 @@ public sealed class MainWindow : Window
     private bool    riImporting;
     private CancellationTokenSource? riCts;
 
-    // Config tab state (mirrors former ConfigWindow fields)
+    // Config tab state
     private string cfgClientId     = string.Empty;
     private string cfgClientSecret = string.Empty;
     private bool   cfgInitialized;
@@ -422,12 +421,6 @@ public sealed class MainWindow : Window
         if (ImGui.BeginTabItem("Custom Timelines"))
         {
             DrawCustomTimelinesTab();
-            ImGui.EndTabItem();
-        }
-
-        if (ImGui.BeginTabItem("Tracker Debug"))
-        {
-            DrawTrackerDebugTab();
             ImGui.EndTabItem();
         }
 
@@ -744,128 +737,6 @@ public sealed class MainWindow : Window
         DrawTimeline();
     }
 
-    private void DrawTrackerDebugTab()
-    {
-            ImGui.TextWrapped("Offline tracker harness for ATKTip. Load a saved encounter/spec pair as if auto-detection had triggered, then preview and commit phase swaps without entering the instance.");
-        ImGui.Spacing();
-
-        var options = plugin.EncounterTracker.GetTrackerDebugEncounterOptions();
-        var state = plugin.EncounterTracker.GetTrackerDebugState();
-
-        if (!string.IsNullOrEmpty(debugStatus) && DateTime.UtcNow < debugStatusUntil)
-        {
-            var color = debugStatusIsError
-                ? new Vector4(1f, 0.45f, 0.45f, 1f)
-                : new Vector4(0.45f, 0.9f, 1f, 1f);
-            ImGui.TextColored(color, debugStatus);
-            ImGui.Spacing();
-        }
-
-        if (options.Count == 0)
-        {
-            ImGui.TextDisabled("No saved custom timelines with mapped encounter IDs are available yet.");
-            ImGui.TextDisabled("Create or save a custom encounter timeline first, then use this tab to test its phase routing.");
-            return;
-        }
-
-        if (trackerDebugSelectedOption < 0 || trackerDebugSelectedOption >= options.Count)
-            trackerDebugSelectedOption = 0;
-
-        var optionLabels = options
-            .Select(option =>
-            {
-                var phaseInfo = option.PhaseCount > 0
-                    ? $"{option.PhaseCount} phase{(option.PhaseCount == 1 ? string.Empty : "s")}"
-                    : "single timeline";
-                var fullInfo = option.HasFullTimeline ? " + full" : string.Empty;
-                return $"{option.EncounterName} [{option.SpecName}]  ({phaseInfo}{fullInfo})";
-            })
-            .ToList();
-
-        ImGui.SetNextItemWidth(520f);
-        ImGui.Combo("Saved Encounter", ref trackerDebugSelectedOption, optionLabels, optionLabels.Count);
-
-        var selectedOption = options[trackerDebugSelectedOption];
-        ImGui.TextDisabled($"Encounter ID: {selectedOption.EncounterId}");
-        ImGui.TextDisabled($"Saved phase timelines: {selectedOption.PhaseCount}{(selectedOption.HasFullTimeline ? " | Full timeline present" : string.Empty)}");
-        ImGui.Spacing();
-
-        if (ImGui.Button("Load Initial Debug Encounter"))
-        {
-            if (plugin.EncounterTracker.DebugLoadEncounter(selectedOption.EncounterId, selectedOption.SpecName, out var message))
-                SetDebugStatus(message);
-            else
-                SetDebugStatus(message, true);
-        }
-
-        ImGui.SameLine();
-        if (ImGui.Button("Reset Loaded Encounter"))
-        {
-            if (plugin.EncounterTracker.DebugResetEncounter(out var message))
-                SetDebugStatus(message);
-            else
-                SetDebugStatus(message, true);
-        }
-
-        ImGui.SameLine();
-        if (ImGui.Button("Clear Debug State"))
-        {
-            plugin.EncounterTracker.DebugClearEncounter();
-            SetDebugStatus("Cleared the offline tracker debug state.");
-        }
-
-        ImGui.Spacing();
-
-        var hasActiveEncounter = state.HasActiveEncounter;
-        var nextPhaseLabel = state.ActivePhaseOrdinal > 0
-            ? (state.ActivePhaseOrdinal + 1).ToString()
-            : "1";
-
-        if (!hasActiveEncounter)
-            ImGui.BeginDisabled();
-        if (ImGui.Button($"Preview Next Phase ({nextPhaseLabel})"))
-        {
-            if (plugin.EncounterTracker.DebugPreviewNextPhase(out var message))
-                SetDebugStatus(message);
-            else
-                SetDebugStatus(message, true);
-        }
-        if (!hasActiveEncounter)
-            ImGui.EndDisabled();
-
-        ImGui.SameLine();
-
-        if (!hasActiveEncounter)
-            ImGui.BeginDisabled();
-        if (ImGui.Button($"Commit Next Phase ({nextPhaseLabel})"))
-        {
-            if (plugin.EncounterTracker.DebugCommitNextPhase(out var message))
-                SetDebugStatus(message);
-            else
-                SetDebugStatus(message, true);
-        }
-        if (!hasActiveEncounter)
-            ImGui.EndDisabled();
-
-        ImGui.Spacing();
-        ImGui.Separator();
-
-        ImGui.TextUnformatted("Current Tracker State");
-        if (!state.HasActiveEncounter)
-        {
-            ImGui.TextDisabled("No offline debug encounter is currently loaded.");
-            return;
-        }
-
-        ImGui.Text($"Encounter: {state.EncounterName} [{state.SpecName}]");
-        ImGui.Text($"Encounter ID: {state.EncounterId}");
-        ImGui.Text($"Active phase: {(state.ActivePhaseOrdinal > 0 ? state.ActivePhaseOrdinal : 0)} / {state.AvailablePhaseCount}");
-        ImGui.Text($"Pending preview phase: {(state.PendingPreviewPhaseOrdinal > 0 ? state.PendingPreviewPhaseOrdinal : 0)}");
-        ImGui.Text($"Next phase available: {(state.HasNextPhase ? "yes" : "no")}");
-        ImGui.Spacing();
-        ImGui.TextDisabled("Use Preview Next Phase to force the exact clear-and-preview path, then Commit Next Phase to apply the swap as if the tracker had resolved it live.");
-    }
-
     private void HideEmbeddedTimelinePreview()
     {
         showEmbeddedTimelinePreview = false;
@@ -907,14 +778,7 @@ public sealed class MainWindow : Window
         }
         try
         {
-            // Derive a display name for the source player.
             var source = editingTimeline.SpecName;
-            if (selectedCustomKey.StartsWith("report_", StringComparison.OrdinalIgnoreCase))
-            {
-                var parts = selectedCustomKey.Split('_');
-                if (parts.Length >= 4)
-                    source = string.Join("_", parts[3..]);   // everything after "report_{code}_{fightId}_"
-            }
 
             var sb = new System.Text.StringBuilder();
 
@@ -928,13 +792,29 @@ public sealed class MainWindow : Window
             sb.AppendLine($"# ATKTip {meta}");
 
             // ── Standard FFLogs CSV ───────────────────────────────────────────
-            sb.AppendLine("\"Time\",\"Event\",\"\"");
+            sb.AppendLine("\"Time\",\"Type\",\"Ability\",\"Source → Target\",\"\"");
 
-            foreach (var entry in editingTimeline.Entries.OrderBy(e => e.TimeOffsetSec))
+            IEnumerable<(double TimeSec, int SortIsBoss, TimelineEntry? PlayerEntry, BossTimelineEntry? BossEntry)> combinedRows = editingTimeline.Entries
+                .Select(entry => (TimeSec: entry.TimeOffsetSec, SortIsBoss: 1, PlayerEntry: (TimelineEntry?)entry, BossEntry: (BossTimelineEntry?)null))
+                .Concat(editingTimeline.BossEntries.Select(entry => (TimeSec: entry.CastStartSec, SortIsBoss: 0, PlayerEntry: (TimelineEntry?)null, BossEntry: (BossTimelineEntry?)entry)))
+                .OrderBy(row => row.TimeSec)
+                .ThenBy(row => row.SortIsBoss);
+
+            foreach (var row in combinedRows)
             {
-                var timeCsv = FormatCsvTime(entry.TimeOffsetSec);
-                var evtCsv  = $"{source} casts  {entry.AbilityName}";
-                sb.AppendLine($"\"{timeCsv}\",\"{evtCsv}\",\"\"");
+                if (row.PlayerEntry != null)
+                {
+                    var timeCsv = FormatCsvTime(row.PlayerEntry.TimeOffsetSec);
+                    sb.AppendLine($"\"{timeCsv}\",\"Cast\",\"{row.PlayerEntry.AbilityName}\",\"{source}\",\"\"");
+                    continue;
+                }
+
+                if (row.BossEntry == null)
+                    continue;
+
+                var bossTimeCsv = FormatCsvTime(row.BossEntry.CastStartSec);
+                var bossAbilityCsv = BuildBossExportAbilityName(row.BossEntry);
+                sb.AppendLine($"\"{bossTimeCsv}\",\"Boss Cast\",\"{bossAbilityCsv}\",\"Boss\",\"\"");
             }
 
             ImGui.SetClipboardText(sb.ToString().TrimEnd());
@@ -951,6 +831,14 @@ public sealed class MainWindow : Window
         var mm  = (int)(abs / 60);
         var ss  = abs - mm * 60.0;
         return $"{(neg ? "-" : "")}{mm:D2}:{ss:00.000}";
+    }
+
+    private static string BuildBossExportAbilityName(BossTimelineEntry entry)
+    {
+        var castDurationSec = Math.Max(0.0, entry.CastEndSec - entry.CastStartSec);
+        return castDurationSec > 0.0005
+            ? $"{entry.AbilityName} {castDurationSec:0.00} sec"
+            : entry.AbilityName;
     }
 
     /// <summary>
@@ -997,34 +885,26 @@ public sealed class MainWindow : Window
                 lineIdx++;
 
             // ── Parse cast rows ───────────────────────────────────────────────
-            var entries = new List<TimelineEntry>();
+            var entries        = new List<TimelineEntry>();
+            var bossEntries    = new List<BossTimelineEntry>();
+            var importedSource = string.Empty;
             foreach (var rawLine in lines.Skip(lineIdx))
             {
                 var line = rawLine.Trim();
                 if (string.IsNullOrEmpty(line)) continue;
 
                 var cols = SplitCsvLine(line);
-                if (cols.Count < 2) continue;
-
-                var timeSec = ParseCsvTime(cols[0]);
-                if (double.IsNaN(timeSec)) continue;
-
-                // Extract ability name: "{source} casts  {ability}[ on {target}]"
-                var evt      = cols[1];
-                var castsIdx = evt.IndexOf(" casts  ", StringComparison.OrdinalIgnoreCase);
-                string abilityName;
-                if (castsIdx >= 0)
+                if (TryParseImportedBossCsvRow(cols, out var bossEntry))
                 {
-                    var afterCasts = evt[(castsIdx + 8)..];
-                    var onIdx      = afterCasts.IndexOf(" on ", StringComparison.OrdinalIgnoreCase);
-                    abilityName    = onIdx >= 0 ? afterCasts[..onIdx].Trim() : afterCasts.Trim();
-                }
-                else
-                {
-                    abilityName = evt.Trim();
+                    bossEntries.Add(bossEntry);
+                    continue;
                 }
 
-                if (string.IsNullOrEmpty(abilityName)) continue;
+                if (!TryParseImportedCsvRow(cols, out var timeSec, out var abilityName, out var rowSourceName))
+                    continue;
+
+                if (string.IsNullOrEmpty(importedSource) && !string.IsNullOrEmpty(rowSourceName))
+                    importedSource = rowSourceName;
 
                 // Resolve ability ID from game data so icons and recast detection work.
                 var recastInfo = plugin.RecastDatabase.Lookup(0, abilityName);
@@ -1040,7 +920,11 @@ public sealed class MainWindow : Window
                 });
             }
 
-            if (entries.Count == 0) { SetEiStatus("No valid cast entries found in clipboard.", true); return; }
+            if (entries.Count == 0 && bossEntries.Count == 0)
+            {
+                SetEiStatus("No valid actions or boss attacks found in clipboard.", true);
+                return;
+            }
 
             // ── Resolve encounter / spec names ────────────────────────────────
             // Prefer ATKTip metadata; fall back to inferring from the first cast row.
@@ -1049,21 +933,15 @@ public sealed class MainWindow : Window
 
             if (string.IsNullOrEmpty(sourceName))
             {
-                // Infer from first data line: "{source} casts  {ability}"
-                var firstDataLine = lines.Skip(lineIdx).FirstOrDefault(l => !string.IsNullOrWhiteSpace(l)) ?? string.Empty;
-                var firstCols     = SplitCsvLine(firstDataLine);
-                sourceName = "Imported";
-                if (firstCols.Count >= 2)
-                {
-                    var ci = firstCols[1].IndexOf(" casts  ", StringComparison.OrdinalIgnoreCase);
-                    if (ci > 0) sourceName = firstCols[1][..ci].Trim();
-                }
+                sourceName = string.IsNullOrEmpty(importedSource) ? "Imported" : importedSource;
             }
 
             if (string.IsNullOrEmpty(encName))
                 encName = "Imported Timeline";
 
-            var durationSec = entries.Max(e => e.TimeOffsetSec);
+            var durationSec = Math.Max(
+                entries.Select(e => e.TimeOffsetSec).DefaultIfEmpty(0.0).Max(),
+                bossEntries.Select(e => Math.Max(e.CastStartSec, e.CastEndSec)).DefaultIfEmpty(0.0).Max());
             var key         = $"csv_import_{DateTime.UtcNow:yyyyMMddHHmmss}";
 
             var timeline = new AggregatedTimeline
@@ -1074,7 +952,7 @@ public sealed class MainWindow : Window
                 AverageDurationMs = durationSec * 1000.0,
                 ParseCount        = 1,
                 Entries           = entries,
-                BossEntries       = [],
+                BossEntries       = bossEntries,
             };
 
             plugin.CustomTimelineStore.SaveTimeline(plugin.Configuration, key, timeline);
@@ -1082,12 +960,147 @@ public sealed class MainWindow : Window
             plugin.EncounterTracker.RebuildZoneMappings();
 
             var encounterHint = metaEncounterId != 0 ? $" (encounter {encName})" : string.Empty;
-            SetEiStatus($"Imported {entries.Count} casts from clipboard{encounterHint}.");
+            SetEiStatus($"Imported {entries.Count} action{(entries.Count == 1 ? string.Empty : "s")} and {bossEntries.Count} boss attack{(bossEntries.Count == 1 ? string.Empty : "s")} from clipboard{encounterHint}.");
         }
         catch (Exception ex) { SetEiStatus($"Import failed: {ex.Message}", true); }
     }
 
     /// <summary>Parse an FFLogs CSV time string ("[−]MM:SS.mmm") to seconds.</summary>
+    private static bool TryParseImportedCsvRow(List<string> cols, out double timeSec, out string abilityName, out string sourceName)
+    {
+        timeSec     = double.NaN;
+        abilityName = string.Empty;
+        sourceName  = string.Empty;
+
+        if (cols.Count < 2)
+            return false;
+
+        timeSec = ParseCsvTime(cols[0]);
+        if (double.IsNaN(timeSec))
+            return false;
+
+        if (cols.Count >= 4)
+        {
+            var type = cols[1].Trim();
+            if (!type.Equals("Cast", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            abilityName = NormalizeImportedAbilityName(cols[2]);
+            sourceName  = ExtractImportedSourceName(cols[3]);
+            return !string.IsNullOrEmpty(abilityName);
+        }
+
+        var evt      = cols[1];
+        var castsIdx = evt.IndexOf(" casts  ", StringComparison.OrdinalIgnoreCase);
+        if (castsIdx >= 0)
+        {
+            sourceName = evt[..castsIdx].Trim();
+
+            var afterCasts = evt[(castsIdx + 8)..];
+            var onIdx      = afterCasts.IndexOf(" on ", StringComparison.OrdinalIgnoreCase);
+            abilityName    = onIdx >= 0 ? afterCasts[..onIdx].Trim() : afterCasts.Trim();
+        }
+        else
+        {
+            abilityName = evt.Trim();
+        }
+
+        abilityName = NormalizeImportedAbilityName(abilityName);
+        return !string.IsNullOrEmpty(abilityName);
+    }
+
+    private bool TryParseImportedBossCsvRow(List<string> cols, out BossTimelineEntry bossEntry, bool allowPlainCastRows = false)
+    {
+        bossEntry = new BossTimelineEntry();
+
+        if (cols.Count < 4)
+            return false;
+
+        var type = cols[1].Trim();
+        var isBossCastRow = type.Equals("Boss Cast", StringComparison.OrdinalIgnoreCase);
+        var isPlainCastRow = type.Equals("Cast", StringComparison.OrdinalIgnoreCase);
+        if (!isBossCastRow && !(allowPlainCastRows && isPlainCastRow))
+            return false;
+
+        var timeSec = ParseCsvTime(cols[0]);
+        if (double.IsNaN(timeSec))
+            return false;
+
+        var rawAbilityName = cols[2].Trim();
+        var abilityName = NormalizeImportedAbilityName(rawAbilityName);
+        if (string.IsNullOrWhiteSpace(abilityName))
+            return false;
+
+        var castDurationSec = ExtractImportedCastDurationSec(rawAbilityName);
+        var abilityInfo = plugin.RecastDatabase.Lookup(0, abilityName);
+
+        bossEntry = new BossTimelineEntry
+        {
+            AbilityId = abilityInfo != null ? (int)abilityInfo.AbilityId : 0,
+            AbilityName = abilityName,
+            CastStartSec = timeSec,
+            CastEndSec = castDurationSec > 0.0
+                ? Math.Round(timeSec + castDurationSec, 3, MidpointRounding.AwayFromZero)
+                : timeSec,
+        };
+        return true;
+    }
+
+    private static string ExtractImportedSourceName(string sourceTarget)
+    {
+        var trimmed = sourceTarget.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+            return string.Empty;
+
+        var arrowIdx = trimmed.IndexOf('→');
+        if (arrowIdx < 0)
+            arrowIdx = trimmed.IndexOf("->", StringComparison.Ordinal);
+
+        return arrowIdx > 0 ? trimmed[..arrowIdx].Trim() : trimmed;
+    }
+
+    private static string NormalizeImportedAbilityName(string rawAbilityName)
+    {
+        var abilityName = rawAbilityName.Trim();
+        if (string.IsNullOrEmpty(abilityName))
+            return string.Empty;
+
+        abilityName = Regex.Replace(abilityName, @"\s+Canceled$", string.Empty, RegexOptions.IgnoreCase);
+        abilityName = Regex.Replace(
+            abilityName,
+            @"\s+\d+(?:\.\d+)?\s*sec(?:\s*\+\d+% (?:damage|healing))?$",
+            string.Empty,
+            RegexOptions.IgnoreCase);
+        abilityName = Regex.Replace(
+            abilityName,
+            @"\s+\+\d+% (?:damage|healing)$",
+            string.Empty,
+            RegexOptions.IgnoreCase);
+
+        return abilityName.Trim();
+    }
+
+    private static double ExtractImportedCastDurationSec(string rawAbilityName)
+    {
+        if (string.IsNullOrWhiteSpace(rawAbilityName))
+            return 0.0;
+
+        var match = Regex.Match(
+            rawAbilityName,
+            @"\s+(?<cast>\d+(?:\.\d+)?)\s*sec(?:\s*\+\d+% (?:damage|healing))?$",
+            RegexOptions.IgnoreCase);
+        if (!match.Success)
+            return 0.0;
+
+        return double.TryParse(
+            match.Groups["cast"].Value,
+            System.Globalization.NumberStyles.Any,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var castDurationSec)
+            ? castDurationSec
+            : 0.0;
+    }
+
     private static double ParseCsvTime(string s)
     {
         s = s.Trim().Trim('"');
@@ -1275,7 +1288,7 @@ public sealed class MainWindow : Window
                             cfg.TimelineNextLinks.Remove(key);
                             plugin.SaveTimelineUserState();
                             plugin.EncounterTracker.RebuildZoneMappings();
-                            SetDebugStatus($"Cleared the next timeline link for {BuildTimelineLinkLabel(key, tl)}.");
+            SetEiStatus($"Cleared the next timeline link for {BuildTimelineLinkLabel(key, tl)}.");
                         }
 
                         var linkCandidates = GetLinkableCustomTimelineCandidates(key, tl).ToList();
@@ -1297,7 +1310,7 @@ public sealed class MainWindow : Window
                                 {
                                     SetCustomTimelineNextLink(key, candidateKey);
                                     plugin.EncounterTracker.RebuildZoneMappings();
-                                    SetDebugStatus($"Linked {BuildTimelineLinkLabel(key, tl)} to {BuildTimelineLinkLabel(candidateKey, candidateTimeline)}.");
+            SetEiStatus($"Linked {BuildTimelineLinkLabel(key, tl)} to {BuildTimelineLinkLabel(candidateKey, candidateTimeline)}.");
                                 }
                             }
                         }
@@ -1307,6 +1320,9 @@ public sealed class MainWindow : Window
 
                     if (ImGui.MenuItem("Auto Space"))
                         AutoSpaceTimeline(key, tl);
+
+                    if (plugin.Configuration.DebugEnabled && ImGui.MenuItem("Auto Align"))
+                        AutoAlignTimeline(key, tl);
 
                     ImGui.EndPopup();
                 }
@@ -1405,7 +1421,7 @@ public sealed class MainWindow : Window
         {
             ImGui.BeginTooltip();
             ImGui.Text("Copy the selected custom timeline to clipboard as CSV.");
-            ImGui.Text("Format matches the FFLogs Events CSV export.");
+            ImGui.Text("ATKTip exports include both actions and boss attacks.");
             ImGui.EndTooltip();
         }
         if (ImGui.Button("Import from Clipboard", new Vector2(-1, 0)))
@@ -1414,7 +1430,7 @@ public sealed class MainWindow : Window
         {
             ImGui.BeginTooltip();
             ImGui.Text("Paste a timeline from clipboard (FFLogs Events CSV format).");
-            ImGui.Text("Paste a CSV exported from an FFLogs report Events view.");
+            ImGui.Text("ATKTip clipboard exports can include both actions and boss attacks.");
             ImGui.EndTooltip();
         }
         if (ImGui.Button("Export Utility Plan to BMR", new Vector2(-1, 0)))
@@ -1487,68 +1503,6 @@ public sealed class MainWindow : Window
         ImGui.PopStyleColor();
 
         // Guard: if Delete was just pressed editingTimeline is now null — bail out cleanly
-        ImGui.SameLine();
-        var hasAutoDebugReport = !string.IsNullOrWhiteSpace(lastAutoTimelineDebugReport);
-        if (!hasAutoDebugReport)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Copy Auto Debug"))
-        {
-            ImGui.SetClipboardText(lastAutoTimelineDebugReport);
-            SetDebugStatus("Copied the latest Auto Timeline debug report to clipboard.");
-        }
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.BeginTooltip();
-            ImGui.Text("Copy the last Auto Timeline reasoning report captured by this debug build.");
-            ImGui.EndTooltip();
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Save Auto Debug"))
-            SaveAutoTimelineDebugReport(editingTimeline!);
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.BeginTooltip();
-            ImGui.Text("Write the last Auto Timeline reasoning report to the debug artifact folder.");
-            ImGui.EndTooltip();
-        }
-        if (!hasAutoDebugReport)
-            ImGui.EndDisabled();
-
-        if (ImGui.Button("Copy Conflict Debug"))
-            CopyConflictDebugReport(editingTimeline!);
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.BeginTooltip();
-            ImGui.Text("Copy a chronological conflict report for the current edited timeline.");
-            ImGui.EndTooltip();
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Save Conflict Debug"))
-            SaveConflictDebugReport(editingTimeline!);
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.BeginTooltip();
-            ImGui.Text("Write a conflict report for the current edited timeline to the debug artifact folder.");
-            ImGui.EndTooltip();
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Save Timeline Snapshot"))
-            SaveTimelineSnapshot(editingTimeline!, "manual_snapshot");
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.BeginTooltip();
-            ImGui.Text("Write the current edited timeline as indented JSON to the debug artifact folder.");
-            ImGui.EndTooltip();
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Open Debug Folder"))
-            OpenDebugArtifactsDirectory();
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.BeginTooltip();
-            ImGui.Text("Open the ATKTip artifact folder used for reports and timeline snapshots.");
-            ImGui.EndTooltip();
-        }
 
         if (editingTimeline == null)
         {
@@ -1556,15 +1510,82 @@ public sealed class MainWindow : Window
             return;
         }
 
-        if (!string.IsNullOrEmpty(debugStatus) && DateTime.UtcNow < debugStatusUntil)
+        if (plugin.Configuration.DebugEnabled)
         {
-            if (debugStatusIsError)
-                ImGui.TextColored(new Vector4(1f, 0.45f, 0.45f, 1f), debugStatus);
-            else
-                ImGui.TextColored(new Vector4(0.45f, 0.9f, 1f, 1f), debugStatus);
-        }
+            ImGui.SameLine();
+            var currentAutoDebugReport = GetLatestAutoTimelineDebugReport(editingTimeline.SpecName);
+            var hasAutoDebugReport = !string.IsNullOrWhiteSpace(currentAutoDebugReport);
+            if (!hasAutoDebugReport)
+                ImGui.BeginDisabled();
+            if (ImGui.Button("Copy Auto Debug"))
+            {
+                ImGui.SetClipboardText(currentAutoDebugReport);
+                SetDebugStatus($"Copied the latest {editingTimeline.SpecName} Auto Timeline debug report to clipboard.");
+            }
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.BeginTooltip();
+                ImGui.Text("Copy the latest Auto Timeline reasoning report captured for this job.");
+                ImGui.EndTooltip();
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("Save Auto Debug"))
+                SaveAutoTimelineDebugReport(editingTimeline);
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.BeginTooltip();
+                ImGui.Text("Write the latest Auto Timeline reasoning report for this job to the debug artifact folder.");
+                ImGui.EndTooltip();
+            }
+            if (!hasAutoDebugReport)
+                ImGui.EndDisabled();
 
-        ImGui.Separator();
+            if (ImGui.Button("Copy Conflict Debug"))
+                CopyConflictDebugReport(editingTimeline);
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.BeginTooltip();
+                ImGui.Text("Copy a chronological conflict report for the current edited timeline.");
+                ImGui.EndTooltip();
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("Save Conflict Debug"))
+                SaveConflictDebugReport(editingTimeline);
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.BeginTooltip();
+                ImGui.Text("Write a conflict report for the current edited timeline to the debug artifact folder.");
+                ImGui.EndTooltip();
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("Save Timeline Snapshot"))
+                SaveTimelineSnapshot(editingTimeline, "manual_snapshot");
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.BeginTooltip();
+                ImGui.Text("Write the current edited timeline as indented JSON to the debug artifact folder.");
+                ImGui.EndTooltip();
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("Open Debug Folder"))
+                OpenDebugArtifactsDirectory();
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.BeginTooltip();
+                ImGui.Text("Open the ATKTip artifact folder used for reports and timeline snapshots.");
+                ImGui.EndTooltip();
+            }
+
+            if (!string.IsNullOrEmpty(debugStatus) && DateTime.UtcNow < debugStatusUntil)
+            {
+                if (debugStatusIsError)
+                    ImGui.TextColored(new Vector4(1f, 0.45f, 0.45f, 1f), debugStatus);
+                else
+                    ImGui.TextColored(new Vector4(0.45f, 0.9f, 1f, 1f), debugStatus);
+            }
+
+            ImGui.Separator();
+        }
 
         // Metadata fields
         var flatEncounters = zones.SelectMany(z => z.Encounters).ToList();
@@ -1618,6 +1639,9 @@ public sealed class MainWindow : Window
         ImGui.Separator();
 
         EnsureCustomEditorCaches(editingTimeline);
+        var fetchedBossSourceTimeline = GetFetchedBossAttackSourceTimeline(editingTimeline);
+        var canGenerateBossAttacks = fetchedBossSourceTimeline != null;
+        var timelineStructureChanged = false;
 
         ImGui.Text($"Player: {editingTimeline.Entries.Count}  |  Boss: {editingTimeline.BossEntries.Count}");
         ImGui.SameLine();
@@ -1632,6 +1656,7 @@ public sealed class MainWindow : Window
                 AverageUses   = 1.0,
             });
             MarkCustomEditorModified();
+            timelineStructureChanged = true;
         }
         ImGui.SameLine();
         if (ImGui.SmallButton("+ Boss"))
@@ -1644,7 +1669,58 @@ public sealed class MainWindow : Window
                 CastEndSec   = 0.0,
             });
             MarkCustomEditorModified();
+            timelineStructureChanged = true;
         }
+        ImGui.SameLine();
+        if (!canGenerateBossAttacks)
+            ImGui.BeginDisabled();
+        if (ImGui.SmallButton("Generate Boss Attacks"))
+        {
+            GenerateBossAttacksFromFetchedLogs(editingTimeline, fetchedBossSourceTimeline!);
+            timelineStructureChanged = true;
+        }
+        if (!canGenerateBossAttacks)
+            ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.BeginTooltip();
+            if (fetchedBossSourceTimeline == null)
+                ImGui.TextUnformatted("Fetch this fight from FFLogs first to cache boss attacks for this encounter and job.");
+            else
+                ImGui.TextUnformatted("Append cached boss attacks from fetched FFLogs data without removing current custom timeline entries.");
+            ImGui.EndTooltip();
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Import Boss Attacks"))
+        {
+            ImportBossAttacksFromCsvClipboard(editingTimeline);
+            timelineStructureChanged = true;
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.BeginTooltip();
+            ImGui.TextUnformatted("Append boss attacks from clipboard using the FFLogs Events CSV format.");
+            ImGui.EndTooltip();
+        }
+        ImGui.SameLine();
+        if (editingTimeline.BossEntries.Count == 0)
+            ImGui.BeginDisabled();
+        if (ImGui.SmallButton("Remove Boss Attacks"))
+        {
+            RemoveAllBossAttacks(editingTimeline);
+            timelineStructureChanged = true;
+        }
+        if (editingTimeline.BossEntries.Count == 0)
+            ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.BeginTooltip();
+            ImGui.TextUnformatted("Remove every boss attack from this custom timeline.");
+            ImGui.EndTooltip();
+        }
+
+        if (timelineStructureChanged)
+            EnsureCustomEditorCaches(editingTimeline);
 
         if (conflictedPlayerIndices.Count > 0)
         {
@@ -2289,7 +2365,7 @@ public sealed class MainWindow : Window
 
         if (tl.Entries.Count == 0)
         {
-            SetDebugStatus($"No actions to auto-space in {BuildTimelineLinkLabel(key, tl)}.");
+            SetEiStatus($"No actions to auto-space in {BuildTimelineLinkLabel(key, tl)}.");
             return;
         }
 
@@ -2326,8 +2402,93 @@ public sealed class MainWindow : Window
         plugin.EncounterTracker.RebuildZoneMappings();
         customEditorDirty = false;
         ClearCustomEditorCaches();
-        SetDebugStatus($"Auto spaced {movedCount} action{(movedCount == 1 ? string.Empty : "s")} in {BuildTimelineLinkLabel(key, tl)} using a 0.099s same-lane minimum gap.");
+        SetEiStatus($"Auto spaced {movedCount} action{(movedCount == 1 ? string.Empty : "s")} in {BuildTimelineLinkLabel(key, tl)} using a 0.099s same-lane minimum gap.");
     }
+
+    private void AutoAlignTimeline(string key, AggregatedTimeline tl)
+    {
+        if (tl.Entries.Count == 0)
+        {
+            SetDebugStatus($"No actions to auto-align in {BuildTimelineLinkLabel(key, tl)}.");
+            return;
+        }
+
+        RefreshTimelineRuntimeMetadata(tl);
+
+        var gcdSlotSpacingSec = AutoTimelineSourceBuilder.NormalizeGcdSlotSpacingSec(GetConfiguredAutoTimelineGcdRecastSec());
+        var orderedEntries = tl.Entries
+            .Select((entry, index) => new OrderedTimelineEntry(entry, index))
+            .OrderBy(item => item.Entry.TimeOffsetSec)
+            .ThenBy(item => item.Index)
+            .ToList();
+
+        int? nextGcdSlotIndex = null;
+        int? nextOgcdSlotOrdinal = null;
+        var movedCount = 0;
+
+        foreach (var item in orderedEntries)
+        {
+            var entry = item.Entry;
+            if (IsGcdEntry(entry))
+            {
+                var desiredSlotIndex = AutoTimelineSourceBuilder.ResolveGcdSlotIndex(entry.TimeOffsetSec, gcdSlotSpacingSec);
+                var resolvedSlotIndex = nextGcdSlotIndex.HasValue
+                    ? Math.Max(nextGcdSlotIndex.Value + 1, desiredSlotIndex)
+                    : desiredSlotIndex;
+                var alignedTimeSec = Math.Round(
+                    AutoTimelineSourceBuilder.GetGcdSlotTimeSec(resolvedSlotIndex, gcdSlotSpacingSec),
+                    3,
+                    MidpointRounding.AwayFromZero);
+
+                if (Math.Abs(entry.TimeOffsetSec - alignedTimeSec) > 0.0005)
+                {
+                    entry.TimeOffsetSec = alignedTimeSec;
+                    movedCount++;
+                }
+
+                nextGcdSlotIndex = resolvedSlotIndex;
+                continue;
+            }
+
+            var (cycleIndex, subslotIndex) = AutoTimelineSourceBuilder.ResolveOgcdSlotKey(entry.TimeOffsetSec, gcdSlotSpacingSec);
+            var desiredSlotOrdinal = cycleIndex * 2 + Math.Clamp(subslotIndex, 0, 1);
+            var resolvedSlotOrdinal = nextOgcdSlotOrdinal.HasValue
+                ? Math.Max(nextOgcdSlotOrdinal.Value + 1, desiredSlotOrdinal)
+                : desiredSlotOrdinal;
+            var resolvedCycleIndex = (int)Math.Floor(resolvedSlotOrdinal / 2.0);
+            var resolvedSubslotIndex = resolvedSlotOrdinal - resolvedCycleIndex * 2;
+            var alignedOgcdTimeSec = Math.Round(
+                AutoTimelineSourceBuilder.GetOgcdSlotTimeSec(resolvedCycleIndex, resolvedSubslotIndex, gcdSlotSpacingSec),
+                3,
+                MidpointRounding.AwayFromZero);
+
+            if (Math.Abs(entry.TimeOffsetSec - alignedOgcdTimeSec) > 0.0005)
+            {
+                entry.TimeOffsetSec = alignedOgcdTimeSec;
+                movedCount++;
+            }
+
+            nextOgcdSlotOrdinal = resolvedSlotOrdinal;
+        }
+
+        tl.Entries = tl.Entries
+            .OrderBy(entry => entry.TimeOffsetSec)
+            .ThenByDescending(entry => entry.Frequency)
+            .ToList();
+
+        if (tl.Entries.Count > 0)
+            tl.AverageDurationMs = Math.Max(tl.AverageDurationMs, tl.Entries.Max(entry => entry.TimeOffsetSec) * 1000.0);
+
+        plugin.CustomTimelineStore.SaveTimeline(plugin.Configuration, key, tl);
+        plugin.EncounterTracker.RebuildZoneMappings();
+        customEditorDirty = false;
+        InvalidateEncounterTimelineCaches();
+        plugin.OverlayWindow.InvalidateTimelineCaches();
+        ClearCustomEditorCaches();
+        SetDebugStatus($"Auto aligned {movedCount} action{(movedCount == 1 ? string.Empty : "s")} in {BuildTimelineLinkLabel(key, tl)} to Auto Timeline GCD/oGCD slots.");
+    }
+
+    private sealed record OrderedTimelineEntry(TimelineEntry Entry, int Index);
 
     private const double AutoCooldownToleranceSec = 0.35;
     private const double AutoCastLockToleranceSec = 0.05;
@@ -2653,28 +2814,35 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             .Select(entry => entry.AbilityId)
             .ToHashSet();
         var sourceTimeline = PrepareAutoTimelineSourceClone(tl);
-        var runToken = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff");
-        var result = BuildAutoTimelineResult(sourceTimeline, captureDebug: true);
+        var debugEnabled = plugin.Configuration.DebugEnabled;
+        var runToken = debugEnabled ? DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff") : null;
+        var result = BuildAutoTimelineResult(sourceTimeline, captureDebug: debugEnabled);
         var visibleEntries = FilterVisibleAutoTimelineResultEntries(result.Entries);
         var finalEntries = isCustomTimeline
             ? FilterAutoTimelineResultEntries(visibleEntries, allowedOutputAbilityIds)
             : visibleEntries;
-        lastAutoTimelineDebugReport = finalEntries.Count != result.Entries.Count
-            ? string.Concat(
-                result.DebugReport,
-                Environment.NewLine,
-                Environment.NewLine,
-                $"Output Filter{Environment.NewLine}  filtered {result.Entries.Count - finalEntries.Count} reasoning-only entries not present in the copied custom timeline skill set.")
-            : result.DebugReport;
+        if (debugEnabled)
+        {
+            var autoDebugReport = finalEntries.Count != result.Entries.Count
+                ? string.Concat(
+                    result.DebugReport,
+                    Environment.NewLine,
+                    Environment.NewLine,
+                    $"Output Filter{Environment.NewLine}  filtered {result.Entries.Count - finalEntries.Count} reasoning-only entries not present in the copied custom timeline skill set.")
+                : result.DebugReport;
+            SetLatestAutoTimelineDebugReport(tl.SpecName, autoDebugReport);
+            SaveTimelineSnapshot(sourceTimeline, "pre_auto_timeline", runToken);
+            if (!string.IsNullOrWhiteSpace(autoDebugReport))
+                SaveDebugTextArtifact(tl, autoDebugReport, "auto_timeline_debug", runToken);
+            else
+                SetDebugStatus("Auto Timeline completed, but no debug report was generated.", true);
+        }
         tl.Entries = finalEntries;
-
-        SaveTimelineSnapshot(sourceTimeline, "pre_auto_timeline", runToken);
-        SaveTimelineSnapshot(tl, "post_auto_timeline", runToken);
-        SaveCachedFflogsDebugArtifacts(sourceTimeline, runToken);
-        if (!string.IsNullOrWhiteSpace(lastAutoTimelineDebugReport))
-            SaveDebugTextArtifact(tl, lastAutoTimelineDebugReport, "auto_timeline_debug", runToken);
-        else
-            SetDebugStatus("Auto Timeline completed, but no debug report was generated.", true);
+        if (debugEnabled)
+        {
+            SaveTimelineSnapshot(tl, "post_auto_timeline", runToken);
+            SaveCachedFflogsDebugArtifacts(sourceTimeline, runToken);
+        }
     }
 
     private AutoTimelineBuildResult BuildAutoTimelineResult(AggregatedTimeline tl, bool captureDebug)
@@ -3564,7 +3732,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             finalEntries,
             promoteMacrocosmosToVisualGcd: false,
             debugNotes: postSelectionDebugNotes);
-        if (postSelectionDebugNotes is { Count: > 0 })
+        if (debug != null && postSelectionDebugNotes is { Count: > 0 })
         {
             debug.Add("Post-Selection Job Rules");
             foreach (var note in postSelectionDebugNotes)
@@ -7440,8 +7608,8 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
     {
         if (!effect.StateName.StartsWith("Action Grant::", StringComparison.OrdinalIgnoreCase))
         {
-            IReadOnlyList<GaugeSimulator.GaugeEffect> gaugeEffects = [];
-            IReadOnlyList<GrantedActionDatabase.GrantedActionEffect> grantedEffects = [];
+            IReadOnlyList<GaugeSimulator.GaugeEffect>? gaugeEffects = null;
+            IReadOnlyList<GrantedActionDatabase.GrantedActionEffect>? grantedEffects = null;
             var hasGaugeEffects = gaugeRules?.EffectByName.TryGetValue(abilityName, out gaugeEffects) == true;
             var hasGrantedEffects = grantedRules?.EffectByName.TryGetValue(abilityName, out grantedEffects) == true;
             if (hasGaugeEffects || hasGrantedEffects)
@@ -9286,6 +9454,134 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         riStatusIsError = false;
     }
 
+    private AggregatedTimeline? GetFetchedBossAttackSourceTimeline(AggregatedTimeline? timeline)
+    {
+        if (timeline == null ||
+            timeline.EncounterId == 0 ||
+            string.IsNullOrWhiteSpace(timeline.SpecName))
+            return null;
+
+        var sourceTimeline = plugin.TimelineStore.GetTimeline(timeline.EncounterId, timeline.SpecName);
+        if (sourceTimeline == null ||
+            sourceTimeline.CachedFflogsParses.Count == 0 ||
+            sourceTimeline.BossEntries.Count == 0)
+            return null;
+
+        return sourceTimeline;
+    }
+
+    private void GenerateBossAttacksFromFetchedLogs(AggregatedTimeline targetTimeline, AggregatedTimeline sourceTimeline)
+    {
+        if (sourceTimeline.BossEntries.Count == 0)
+        {
+            SetEiStatus($"No cached boss attacks are available for {sourceTimeline.EncounterName} / {sourceTimeline.SpecName}.", true);
+            return;
+        }
+
+        var bossEntriesToAdd = sourceTimeline.BossEntries
+            .Select(CloneBossTimelineEntry)
+            .ToList();
+        targetTimeline.BossEntries.AddRange(bossEntriesToAdd);
+
+        var maxBossTimeSec = targetTimeline.BossEntries
+            .Select(entry => Math.Max(entry.CastStartSec, entry.CastEndSec))
+            .DefaultIfEmpty(0.0)
+            .Max();
+        if (maxBossTimeSec * 1000.0 > targetTimeline.AverageDurationMs)
+        {
+            targetTimeline.AverageDurationMs = maxBossTimeSec * 1000.0;
+            if (ReferenceEquals(targetTimeline, editingTimeline))
+                editDurationSec = (float)(targetTimeline.AverageDurationMs / 1000.0);
+        }
+
+        MarkCustomEditorModified();
+        SetEiStatus($"Added {bossEntriesToAdd.Count} boss attack{(bossEntriesToAdd.Count == 1 ? string.Empty : "s")} from fetched FFLogs data.");
+    }
+
+    private void ImportBossAttacksFromCsvClipboard(AggregatedTimeline targetTimeline)
+    {
+        try
+        {
+            var text = ImGui.GetClipboardText();
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                SetEiStatus("Clipboard is empty.", true);
+                return;
+            }
+
+            var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            if (lines.Length == 0)
+            {
+                SetEiStatus("No data in clipboard.", true);
+                return;
+            }
+
+            var lineIdx = 0;
+            if (lines[lineIdx].TrimStart().StartsWith("# ATKTip ", StringComparison.Ordinal))
+                lineIdx++;
+
+            if (lineIdx < lines.Length &&
+                lines[lineIdx].TrimStart('"').StartsWith("Time", StringComparison.OrdinalIgnoreCase))
+                lineIdx++;
+
+            var importedBossEntries = new List<BossTimelineEntry>();
+            foreach (var rawLine in lines.Skip(lineIdx))
+            {
+                var line = rawLine.Trim();
+                if (string.IsNullOrEmpty(line))
+                    continue;
+
+                var cols = SplitCsvLine(line);
+                if (!TryParseImportedBossCsvRow(cols, out var bossEntry, allowPlainCastRows: true))
+                    continue;
+
+                importedBossEntries.Add(bossEntry);
+            }
+
+            if (importedBossEntries.Count == 0)
+            {
+                SetEiStatus("No valid boss attack entries found in clipboard.", true);
+                return;
+            }
+
+            targetTimeline.BossEntries.AddRange(importedBossEntries);
+
+            var maxBossTimeSec = targetTimeline.BossEntries
+                .Select(entry => Math.Max(entry.CastStartSec, entry.CastEndSec))
+                .DefaultIfEmpty(0.0)
+                .Max();
+            if (maxBossTimeSec * 1000.0 > targetTimeline.AverageDurationMs)
+            {
+                targetTimeline.AverageDurationMs = maxBossTimeSec * 1000.0;
+                if (ReferenceEquals(targetTimeline, editingTimeline))
+                    editDurationSec = (float)(targetTimeline.AverageDurationMs / 1000.0);
+            }
+
+            MarkCustomEditorModified();
+            SetEiStatus($"Imported {importedBossEntries.Count} boss attack{(importedBossEntries.Count == 1 ? string.Empty : "s")} from clipboard.");
+        }
+        catch (Exception ex)
+        {
+            SetEiStatus($"Boss attack import failed: {ex.Message}", true);
+        }
+    }
+
+    private void RemoveAllBossAttacks(AggregatedTimeline targetTimeline)
+    {
+        if (targetTimeline.BossEntries.Count == 0)
+        {
+            SetEiStatus("No boss attacks to remove.", true);
+            return;
+        }
+
+        var removedCount = targetTimeline.BossEntries.Count;
+        targetTimeline.BossEntries.Clear();
+        if (editingEntryIsBoss)
+            editingEntryIndex = -1;
+        MarkCustomEditorModified();
+        SetEiStatus($"Removed {removedCount} boss attack{(removedCount == 1 ? string.Empty : "s")} from this custom timeline.");
+    }
+
     private void StartReportFetch()
     {
         var m = Regex.Match(riUrl, @"fflogs\.com/reports/([A-Za-z0-9]+)");
@@ -9372,11 +9668,18 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                     return;
                 }
 
+                var rawBossEvents = await plugin.FFLogsClient.GetBossCastEventsAsync(
+                    code,
+                    fight.Id,
+                    ct);
+                var bossEntries = plugin.Aggregator.AggregateBossEvents(rawBossEvents);
+
                 var timeline = BuildImportedTimeline(
                     fight,
                     jobDisplay,
                     code,
                     events,
+                    bossEntries,
                     selectedPhaseWindow);
                 if (timeline == null)
                 {
@@ -9387,7 +9690,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                     return;
                 }
 
-                var key = BuildImportedTimelineKey(code, fight.Id, player.Name, selectedPhaseWindow);
+                var key = BuildImportedTimelineKey(fight.EncounterId, jobDisplay, selectedPhaseWindow);
                 plugin.CustomTimelineStore.SaveTimeline(plugin.Configuration, key, timeline);
 
                 InvalidateCustomTimelineListCache();
@@ -9395,7 +9698,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 var phaseLabel = selectedPhaseWindow == null
                     ? string.Empty
                     : $" / {GetRomanNumeral(selectedPhaseWindow.Ordinal)}";
-                riStatus        = $"Saved \"{fight.Name}{phaseLabel} / {player.Name} ({jobDisplay})\" ({timeline.Entries.Count} casts).";
+                riStatus        = $"Saved \"{fight.Name}{phaseLabel} / {player.Name} ({jobDisplay})\" ({timeline.Entries.Count} casts, {timeline.BossEntries.Count} boss attacks).";
                 riStatusIsError = false;
             }
             catch (OperationCanceledException) { }
@@ -9877,6 +10180,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         string specName,
         string reportCode,
         List<CastEvent> events,
+        List<BossTimelineEntry> bossEntries,
         EncounterPhaseWindow? phaseWindow)
     {
         var scopedEvents = phaseWindow == null
@@ -9912,20 +10216,20 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                     PhaseInfo = CloneFightPhaseInfo(CreateFightPhaseInfo(fight)),
                 }
             ],
-            BossEntries = [],
+            BossEntries = phaseWindow == null
+                ? bossEntries.Select(CloneBossTimelineEntry).ToList()
+                : SlicePhaseBossEntries(bossEntries, phaseWindow),
             PhaseInfo = CloneFightPhaseInfo(CreateFightPhaseInfo(fight)),
         };
     }
 
     private static string BuildImportedTimelineKey(
-        string reportCode,
-        int fightId,
-        string playerName,
+        int encounterId,
+        string specName,
         EncounterPhaseWindow? phaseWindow)
     {
-        return phaseWindow == null
-            ? $"report_{reportCode}_{fightId}_{playerName}"
-            : $"report_{reportCode}_{fightId}_p{phaseWindow.Ordinal}_{playerName}";
+        var baseKey = BuildCustomTimelineSaveKey(encounterId, specName, phaseWindow);
+        return $"report_{baseKey}";
     }
 
     private static string BuildAutoTimelinePhaseScopedKey(int encounterId, string specName, int selectedPhaseIndex)
@@ -10866,8 +11170,8 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             return;
         }
 
-        var timelineKey      = TimelineDatabase.MakeKey(currentTimeline.EncounterId, currentTimeline.SpecName);
-        var isCustomTimeline = plugin.Configuration.CustomTimelines.ContainsKey(timelineKey);
+        var customTimelineKey = ResolveActiveCustomTimelineKey(currentTimeline);
+        var isCustomTimeline  = customTimelineKey != null;
         TimelineEntry? iconCtxEntry = null;
 
         var durationSec = currentTimeline.AverageDurationMs / 1000.0;
@@ -11058,8 +11362,8 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         if (iconCtxEntry != null)
         {
             var removedAny = RemoveDisplayedEntryFromTimeline(currentTimeline, iconCtxEntry);
-            if (selectedCustomKey != null &&
-                plugin.Configuration.CustomTimelines.TryGetValue(selectedCustomKey, out var selectedCustomTimeline) &&
+            if (customTimelineKey != null &&
+                plugin.Configuration.CustomTimelines.TryGetValue(customTimelineKey, out var selectedCustomTimeline) &&
                 !ReferenceEquals(selectedCustomTimeline, currentTimeline))
             {
                 removedAny |= RemoveDisplayedEntryFromTimeline(selectedCustomTimeline, iconCtxEntry);
@@ -11073,9 +11377,9 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 InvalidateEncounterTimelineCaches();
                 InvalidateCustomEditorCaches();
                 plugin.OverlayWindow.InvalidateTimelineCaches();
-                if (selectedCustomKey != null &&
-                    plugin.Configuration.CustomTimelines.TryGetValue(selectedCustomKey, out var selectedCustomTimelineForSave))
-                    plugin.CustomTimelineStore.SaveTimeline(plugin.Configuration, selectedCustomKey, selectedCustomTimelineForSave);
+                if (customTimelineKey != null &&
+                    plugin.Configuration.CustomTimelines.TryGetValue(customTimelineKey, out var selectedCustomTimelineForSave))
+                    plugin.CustomTimelineStore.SaveTimeline(plugin.Configuration, customTimelineKey, selectedCustomTimelineForSave);
 
                 RequestDeferredConfigSave();
             }
@@ -11127,6 +11431,25 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             .OrderBy(sourceEntry => Math.Abs(sourceEntry.TimeOffsetSec - displayedEntry.TimeOffsetSec))
             .ThenByDescending(sourceEntry => sourceEntry.Frequency)
             .FirstOrDefault();
+    }
+
+    private string? ResolveActiveCustomTimelineKey(AggregatedTimeline? timeline)
+    {
+        if (timeline == null)
+            return null;
+
+        if (selectedCustomKey != null &&
+            plugin.Configuration.CustomTimelines.TryGetValue(selectedCustomKey, out var selectedTimeline) &&
+            ReferenceEquals(selectedTimeline, timeline))
+            return selectedCustomKey;
+
+        foreach (var kvp in plugin.Configuration.CustomTimelines)
+        {
+            if (ReferenceEquals(kvp.Value, timeline))
+                return kvp.Key;
+        }
+
+        return null;
     }
 
     private bool TryDrawActionIcon(ImDrawListPtr dl, int abilityId, Vector2 pos, float size, float alpha)
@@ -11836,6 +12159,13 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         // Non-collapsed features beneath the groups
         DrawCfgOverlaySettings();
         ImGui.Spacing(); ImGui.Spacing();
+        var debugEnabled = plugin.Configuration.DebugEnabled;
+        if (ImGui.Checkbox("Debug Enabled", ref debugEnabled))
+        {
+            plugin.Configuration.DebugEnabled = debugEnabled;
+            RequestDeferredUiSettingsSave();
+        }
+        ImGui.Spacing(); ImGui.Spacing();
         DrawCfgResetSection();
         ImGui.Spacing(); ImGui.Spacing();
         ImGui.TextDisabled("ATKTip v1.2.2");
@@ -12308,6 +12638,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             cfg.MainIconScale          = 1.0f;
             cfg.AutoTimelineGcdRecastSec = 2.5f;
             cfg.AutoTimelineDotRefreshBufferSec = 6.0f;
+            cfg.DebugEnabled           = false;
             cfg.AutoTimelineDisabledAbilities.Clear();
             cfg.AntsEnabled            = true;
             cfg.AntsCustomEnabled      = true;
@@ -12545,13 +12876,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 .Select(CloneCachedFflogsParseTimeline)
                 .ToList(),
             BossEntries = tl.BossEntries
-                .Select(entry => new BossTimelineEntry
-                {
-                    AbilityId = entry.AbilityId,
-                    AbilityName = entry.AbilityName,
-                    CastStartSec = entry.CastStartSec,
-                    CastEndSec = entry.CastEndSec,
-                })
+                .Select(CloneBossTimelineEntry)
                 .ToList(),
             PhaseInfo = CloneFightPhaseInfo(tl.PhaseInfo),
         };
@@ -12588,6 +12913,17 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         };
     }
 
+    private static BossTimelineEntry CloneBossTimelineEntry(BossTimelineEntry entry)
+    {
+        return new BossTimelineEntry
+        {
+            AbilityId = entry.AbilityId,
+            AbilityName = entry.AbilityName,
+            CastStartSec = entry.CastStartSec,
+            CastEndSec = entry.CastEndSec,
+        };
+    }
+
     private static TimelineEntry CloneTimelineEntryWithOffset(TimelineEntry entry, double offsetSec)
     {
         var clone = CloneTimelineEntry(entry);
@@ -12616,15 +12952,27 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         }
     }
 
+    private string GetLatestAutoTimelineDebugReport(string specName)
+        => lastAutoTimelineDebugReportsBySpec.GetValueOrDefault(specName, string.Empty);
+
+    private void SetLatestAutoTimelineDebugReport(string specName, string report)
+    {
+        if (string.IsNullOrWhiteSpace(specName))
+            return;
+
+        lastAutoTimelineDebugReportsBySpec[specName] = report ?? string.Empty;
+    }
+
     private void SaveAutoTimelineDebugReport(AggregatedTimeline tl)
     {
-        if (string.IsNullOrWhiteSpace(lastAutoTimelineDebugReport))
+        var report = GetLatestAutoTimelineDebugReport(tl.SpecName);
+        if (string.IsNullOrWhiteSpace(report))
         {
-            SetDebugStatus("No Auto Timeline debug report has been captured yet. Run Auto Timeline first.", true);
+            SetDebugStatus($"No Auto Timeline debug report has been captured yet for {tl.SpecName}. Run Auto Timeline first.", true);
             return;
         }
 
-        SaveDebugTextArtifact(tl, lastAutoTimelineDebugReport, "auto_timeline_debug");
+        SaveDebugTextArtifact(tl, report, "auto_timeline_debug");
     }
 
     private void SaveCachedFflogsDebugArtifacts(AggregatedTimeline tl, string? runToken = null)

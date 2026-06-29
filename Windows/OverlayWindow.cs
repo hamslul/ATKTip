@@ -22,8 +22,8 @@ namespace ATKTip.Windows;
 
 /// <summary>
 /// Overlay window that renders an ATR-exact two-pass timeline:
-///   Pass 1 (General layer) — horizontal GCD/oGCD bars
-///   Pass 2 (Icon layer)    — action icons drawn on top of bars
+///   Pass 1 (General layer) â€” horizontal GCD/oGCD bars
+///   Pass 2 (Icon layer)    â€” action icons drawn on top of bars
 /// Boss casts are rendered in a strip anchored to the bottom edge.
 /// </summary>
 public sealed class OverlayWindow : Window, IDisposable
@@ -36,7 +36,7 @@ public sealed class OverlayWindow : Window, IDisposable
     private readonly IPluginLog log;
     private readonly Hook<ActionManager.Delegates.UseAction>? useActionHook;
     private readonly Hook<ReceiveActionEffectDelegate>? receiveActionEffectHook;
-    // ── Auto-execute (hidden feature) ──
+    // â”€â”€ Auto-execute (hidden feature) â”€â”€
     /// <summary>
     /// When true, each timeline entry is automatically executed via
     /// <c>ActionManager.UseAction</c> the moment it crosses the red bar during live combat.
@@ -49,9 +49,9 @@ public sealed class OverlayWindow : Window, IDisposable
     private double autoScrubLastSeekTimeSec = double.NaN;
     private DateTime autoScrubLastSeekAtUtc = DateTime.MinValue;
 
-    // ── ATR geometry constants (match ATR defaults exactly) ──
+    // â”€â”€ ATR geometry constants (match ATR defaults exactly) â”€â”€
     // GCDHeightHigh / GCDHeightLow control the vertical extent of the GCD bar.
-    // ATR defaults: high=0.5, low=0.8 → bar spans centerY+0 to centerY+0.3*iconSize.
+    // ATR defaults: high=0.5, low=0.8 â†’ bar spans centerY+0 to centerY+0.3*iconSize.
     private const float BaseActionAnimationLockSec = 0.50f;
     private const float AssumedAnimationLockLatencySec = 0.02f;
     private const float GCDHeightHigh  = 0.5f;
@@ -72,7 +72,7 @@ public sealed class OverlayWindow : Window, IDisposable
     // Gap between stacked icons in the same bucket.
     private const float IconGap        = 2.0f;
 
-    // ── ATR-exact colours ──
+    // â”€â”€ ATR-exact colours â”€â”€
     // GCD bar: dark background, blue cast fill, white border.
     private static readonly Vector4 ColGCDBackground  = new(0.20f, 0.20f, 0.20f, 1.00f);
     private static readonly Vector4 ColGCDCast        = new(0.40f, 0.60f, 0.90f, 1.00f);
@@ -83,14 +83,14 @@ public sealed class OverlayWindow : Window, IDisposable
     private static readonly Vector4 ColOGCDBorder     = new(1.00f, 1.00f, 1.00f, 0.70f);
     // Center guide line (ATR GridCenterLine).
     private static readonly Vector4 ColCenterLine     = new(0.80f, 0.80f, 0.80f, 0.50f);
-    // Now / start line (ATR GridStartLine — red vertical bar at current time).
+    // Now / start line (ATR GridStartLine â€” red vertical bar at current time).
     private static readonly Vector4 ColNowLine        = new(0.80f, 0.20f, 0.20f, 1.00f);
     // Grid lines.
     private static readonly Vector4 ColGrid           = new(1.00f, 1.00f, 1.00f, 0.12f);
     private static readonly Vector4 ColGridMajor      = new(1.00f, 1.00f, 1.00f, 0.28f);
     private static readonly Vector4 ColGridLabel      = new(1.00f, 1.00f, 1.00f, 0.22f);
 
-    // ── Combat tracking ──
+    // â”€â”€ Combat tracking â”€â”€
     private bool     inCombat;
     private DateTime combatStartTime;
     private double   combatElapsedSec;
@@ -99,7 +99,7 @@ public sealed class OverlayWindow : Window, IDisposable
     private bool     combatViewPaused;
     private bool     awaitingManualPhaseStart;
     private bool     manualOverlayActive;
-    /// <summary>Set when the user clicks × to close the overlay mid-combat.
+    /// <summary>Set when the user clicks Ã— to close the overlay mid-combat.
     /// Suppresses ants and auto-execute until a fresh timeline is loaded.</summary>
     private bool     overlayDismissed;
     private bool     antsArmed;
@@ -111,7 +111,7 @@ public sealed class OverlayWindow : Window, IDisposable
     /// </summary>
     private bool     isEncounterZone;
 
-    // ── Preview (scrub) mode ──
+    // â”€â”€ Preview (scrub) mode â”€â”€
     private bool     isPreview;
     private bool     previewAutoplay;
     private DateTime previewStartTime;
@@ -127,12 +127,12 @@ public sealed class OverlayWindow : Window, IDisposable
     private double                   embeddedPreviewManualTimeSec;
     private bool                     embeddedPreviewIsScrubbing;
 
-    // ── Timeline data ──
+    // â”€â”€ Timeline data â”€â”€
     private AggregatedTimeline?      activeTimeline;
     private string                   activeTimelineKey = string.Empty;
     private Dictionary<int, bool>    skillVisibility   = [];
 
-    // ── Caches ──
+    // â”€â”€ Caches â”€â”€
     private readonly Dictionary<int, uint> iconIdCache = [];
     private readonly ConcurrentDictionary<int, bool> oGcdCache = new();
     private AggregatedTimeline? cachedActiveFilteredTimeline;
@@ -212,7 +212,7 @@ public sealed class OverlayWindow : Window, IDisposable
         public bool IsPrimaryBoss { get; init; }
     }
 
-    // ═══════════════════════════════════════════════════════════════════
+    // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     public unsafe OverlayWindow(Plugin plugin, ICondition condition, IDutyState dutyState, IObjectTable objectTable, IFramework framework, IGameInteropProvider gameInterop, IPluginLog log)
         : base("ATKTip##Overlay",
@@ -255,7 +255,7 @@ public sealed class OverlayWindow : Window, IDisposable
         SizeCondition = ImGuiCond.FirstUseEver;
     }
 
-    // ── Public API ──────────────────────────────────────────────────────
+    // â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// <summary>True when a timeline is loaded and ready to display.</summary>
     public bool HasActiveTimeline => activeTimeline != null;
@@ -287,7 +287,7 @@ public sealed class OverlayWindow : Window, IDisposable
         activeTimeline    = timeline;
         activeTimelineKey = key;
         if (resetDismissed)
-            overlayDismissed = false;      // fresh load — re-enable ants and auto-exec
+            overlayDismissed = false;      // fresh load â€” re-enable ants and auto-exec
         antsArmed         = false;
         skillVisibility.Clear();
         oGcdCache.Clear();
@@ -475,7 +475,7 @@ public sealed class OverlayWindow : Window, IDisposable
         SetTimeline(timeline, key);
         antsArmed            = true;
         isPreview            = true;
-        previewAutoplay      = false;   // start paused — user presses play to begin
+        previewAutoplay      = false;   // start paused â€” user presses play to begin
         previewStartTime     = DateTime.UtcNow;
         previewManualTimeSec = 0;
         combatElapsedSec     = 0;
@@ -636,12 +636,12 @@ public sealed class OverlayWindow : Window, IDisposable
         // studies or plays the timeline before the pull starts.
         antsArmed            = true;
         isPreview            = true;
-        previewAutoplay      = false;   // paused — user scrubs freely
+        previewAutoplay      = false;   // paused â€” user scrubs freely
         previewStartTime     = DateTime.UtcNow;
         previewManualTimeSec = 0;
         combatElapsedSec     = 0;
         isScrubbing          = false;
-        isEncounterZone      = true;    // loaded by EncounterTracker — respond to combat events
+        isEncounterZone      = true;    // loaded by EncounterTracker â€” respond to combat events
         IsOpen               = true;
     }
 
@@ -698,19 +698,6 @@ public sealed class OverlayWindow : Window, IDisposable
         autoScrubLastSeekAtUtc = DateTime.MinValue;
     }
 
-    private static void WriteAutoDebug(string _) { }
-
-    private string GetAutoLaneName(AutoLaneState lane)
-        => ReferenceEquals(lane, autoOgcdLane) ? "oGCD" : "GCD";
-
-    private static string DescribeAutoEntry(TimelineEntry? entry)
-        => entry == null
-            ? "<none>"
-            : $"{entry.AbilityName}#{entry.AbilityId}@{entry.TimeOffsetSec:F3}";
-
-    private void WriteAutoLaneDebug(AutoLaneState lane, string message)
-        => WriteAutoDebug($"{GetAutoLaneName(lane)} | {message}");
-
     private void SeekTimelineToTime(double timeSec)
     {
         var fightDur = activeTimeline?.AverageDurationMs / 1000.0 ?? 0.0;
@@ -759,8 +746,6 @@ public sealed class OverlayWindow : Window, IDisposable
         {
             if (!TryResolveAutoScrubBossEntry((int)cast.AbilityId, currentElapsedSec, out var matchedEntry))
                 continue;
-
-            WriteAutoDebug($"SCRUB seek | bossAction={cast.AbilityId} | from={currentElapsedSec:F3} | to={matchedEntry.CastStartSec:F3}");
             autoScrubLastSeekTimeSec = matchedEntry.CastStartSec;
             autoScrubLastSeekAtUtc = DateTime.UtcNow;
             SeekTimelineToTime(matchedEntry.CastStartSec);
@@ -941,7 +926,6 @@ public sealed class OverlayWindow : Window, IDisposable
             !startedAreaTargeting &&
             actionType == ActionType.Action)
         {
-            WriteAutoDebug($"USE accepted | action={actionId} | target={targetId:X}");
             ObservePendingAutoActionRequest(actionId);
         }
 
@@ -1011,7 +995,7 @@ public sealed class OverlayWindow : Window, IDisposable
         return (gcd, ogcd);
     }
 
-    // ── Combat events ───────────────────────────────────────────────────
+    // â”€â”€ Combat events â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     private void OnConditionChange(ConditionFlag flag, bool value)
     {
@@ -1084,7 +1068,7 @@ public sealed class OverlayWindow : Window, IDisposable
             return;
         }
 
-        // Wipe — snap back to t=0 in paused preview.
+        // Wipe â€” snap back to t=0 in paused preview.
         if (activeTimeline != null)
         {
             isPreview            = true;
@@ -1108,7 +1092,7 @@ public sealed class OverlayWindow : Window, IDisposable
             return;
         }
 
-        // Completion — stay paused at wherever the timeline is.
+        // Completion â€” stay paused at wherever the timeline is.
         if (activeTimeline != null)
         {
             isPreview            = true;
@@ -1118,7 +1102,7 @@ public sealed class OverlayWindow : Window, IDisposable
         }
     }
 
-    // ── Window lifecycle ────────────────────────────────────────────────
+    // â”€â”€ Window lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     public override bool DrawConditions()
     {
@@ -1133,7 +1117,7 @@ public sealed class OverlayWindow : Window, IDisposable
 
     public override void PreDraw()
     {
-        // Lock applies in ALL modes (including preview) — respects config.
+        // Lock applies in ALL modes (including preview) â€” respects config.
         if ((Cfg.OverlayLocked || inCombat) && !isScrubbing)
             Flags |= ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize;
         else
@@ -1146,9 +1130,9 @@ public sealed class OverlayWindow : Window, IDisposable
         ImGui.SetNextWindowBgAlpha(0.0f);
     }
 
-    // ═══════════════════════════════════════════════════════════════════
+    // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     // DRAW
-    // ═══════════════════════════════════════════════════════════════════
+    // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     public override void Draw()
     {
@@ -1164,7 +1148,7 @@ public sealed class OverlayWindow : Window, IDisposable
         var maxStack   = Cfg.OverlayMaxStackedIcons;
         var fightDur   = activeTimeline.AverageDurationMs / 1000.0;
 
-        // ── Time update ──────────────────────────────────────────────
+        // â”€â”€ Time update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if (isPreview)
         {
             if (previewAutoplay)
@@ -1203,12 +1187,12 @@ public sealed class OverlayWindow : Window, IDisposable
         var wPos       = ImGui.GetWindowPos();
         var wSize      = ImGui.GetWindowSize();
 
-        // ── Background ───────────────────────────────────────────────
+        // â”€â”€ Background â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         drawList.AddRectFilled(wPos, wPos + wSize,
             ImGui.GetColorU32(new Vector4(0.06f, 0.06f, 0.10f, bgOpacity)), 4.0f);
 
-        // ── Scrub / control bar (preview AND live combat) ────────────
-        // Row: [▶/⏸] [🔒] [track...........] [time] [×]
+        // â”€â”€ Scrub / control bar (preview AND live combat) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // Row: [â–¶/â¸] [ðŸ”’] [track...........] [time] [Ã—]
         var scrubH = 0.0f;
         if ((isPreview || inCombat) && fightDur > 0)
         {
@@ -1220,17 +1204,14 @@ public sealed class OverlayWindow : Window, IDisposable
 
             var sTop = wPos.Y + 3f;
             var midY = sTop + btnH / 2f;
-            var trackerState = plugin.EncounterTracker.GetTrackerDebugState();
-            var hasManualNextPhase = trackerState.HasActiveEncounter && trackerState.HasNextPhase;
 
             // Button X anchors
             var playX  = wPos.X + margin;
             var lockX  = playX  + btnW + btnGap;
-            var nextX  = lockX  + btnW + btnGap;
             var closeX = wPos.X + wSize.X - margin - btnW;
 
-            // Track sits between next button and close button
-            var trackL = nextX + btnW + btnGap;
+            // Track sits between the lock button and close button
+            var trackL = lockX + btnW + btnGap;
             var trackR = closeX - btnGap;
             var trackW = MathF.Max(trackR - trackL, 1f);
 
@@ -1262,7 +1243,7 @@ public sealed class OverlayWindow : Window, IDisposable
                 ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.35f)),
                 timeLabel);
 
-            // ── Play / Pause button ───────────────────────────────────
+            // â”€â”€ Play / Pause button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             var playTL    = new Vector2(playX,        sTop);
             var playBR    = new Vector2(playX + btnW, sTop + btnH);
             var playHover = ImGui.IsMouseHoveringRect(playTL, playBR);
@@ -1304,7 +1285,7 @@ public sealed class OverlayWindow : Window, IDisposable
             {
                 if (inCombat)
                 {
-                    // Toggle freeze — pause freezes the view, play re-syncs to live.
+                    // Toggle freeze â€” pause freezes the view, play re-syncs to live.
                     if (combatViewPaused)
                         ResumeCombatViewFromCurrentTime();
                     else
@@ -1322,7 +1303,7 @@ public sealed class OverlayWindow : Window, IDisposable
                 }
             }
 
-            // ── Lock button ───────────────────────────────────────────
+            // â”€â”€ Lock button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             var lockTL    = new Vector2(lockX,        sTop);
             var lockBR    = new Vector2(lockX + btnW, sTop + btnH);
             var lockHover = ImGui.IsMouseHoveringRect(lockTL, lockBR);
@@ -1347,43 +1328,7 @@ public sealed class OverlayWindow : Window, IDisposable
                 plugin.SaveUiSettings();
             }
 
-            var nextTL    = new Vector2(nextX,        sTop);
-            var nextBR    = new Vector2(nextX + btnW, sTop + btnH);
-            var nextHover = ImGui.IsMouseHoveringRect(nextTL, nextBR);
-
-            drawList.AddRectFilled(nextTL, nextBR,
-                ImGui.GetColorU32(
-                    !hasManualNextPhase
-                        ? new Vector4(0.16f, 0.16f, 0.18f, 0.45f)
-                        : nextHover
-                            ? new Vector4(0.25f, 0.72f, 0.35f, 0.92f)
-                            : new Vector4(0.16f, 0.45f, 0.22f, 0.78f)), 3f);
-
-            var nextLbl = ">";
-            var nextSz  = ImGui.CalcTextSize(nextLbl);
-            drawList.AddText(
-                new Vector2(nextX + (btnW - nextSz.X) / 2f, sTop + (btnH - nextSz.Y) / 2f),
-                ImGui.GetColorU32(hasManualNextPhase
-                    ? new Vector4(1f, 1f, 1f, 0.95f)
-                    : new Vector4(1f, 1f, 1f, 0.35f)),
-                nextLbl);
-
-            if (nextHover)
-            {
-                ImGui.SetTooltip(hasManualNextPhase
-                    ? $"Advance manually to phase {trackerState.ActivePhaseOrdinal + 1}."
-                    : "No further phase timeline is available.");
-            }
-
-            if (hasManualNextPhase && nextHover && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
-            {
-                if (plugin.EncounterTracker.DebugCommitNextPhase(out var message))
-                    log.Info("Overlay manual phase advance: {0}", message);
-                else
-                    log.Warning("Overlay manual phase advance failed: {0}", message);
-            }
-
-            // ── Close button ──────────────────────────────────────────
+            // â”€â”€ Close button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             var closeTL    = new Vector2(closeX,        sTop);
             var closeBR    = new Vector2(closeX + btnW, sTop + btnH);
             var closeHover = ImGui.IsMouseHoveringRect(closeTL, closeBR);
@@ -1429,7 +1374,7 @@ public sealed class OverlayWindow : Window, IDisposable
                 return;
             }
 
-            // ── Scrub input (track hit area) ──────────────────────────
+            // â”€â”€ Scrub input (track hit area) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             // Available in preview always; in combat only when the view is paused.
             var scrubAllowed = isPreview || combatViewPaused;
             var barTL = new Vector2(trackL, midY - trackH / 2f - 4f);
@@ -1482,7 +1427,7 @@ public sealed class OverlayWindow : Window, IDisposable
             scrubH = btnH + labelSz.Y + 5f;
         }
 
-        // ── Lay out timeline and boss strip ─────────────────────────
+        // â”€â”€ Lay out timeline and boss strip â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         var hasBoss       = activeTimeline.BossEntries.Count > 0;
         var bossStripH    = hasBoss ? 26.0f : 0.0f;
 
@@ -1495,14 +1440,14 @@ public sealed class OverlayWindow : Window, IDisposable
 
         if (tlH < 16f || tlW < 50f) return;
 
-        // "Now" X — timeBehind seconds from the LEFT edge, so widening the window
+        // "Now" X â€” timeBehind seconds from the LEFT edge, so widening the window
         // extends the look-ahead on the right rather than pushing the red line left.
         var nowX = tlLeft + timeBehind * pxPerSec;
 
         // Vertical center of the timeline (ATR centers all items here)
         var centerY = tlTop + tlH / 2f;
 
-        // oGCD size and center Y — follow ATR's presentation more closely:
+        // oGCD size and center Y â€” follow ATR's presentation more closely:
         // smaller icons that sit above the center line, while still sharing
         // the same horizontal timing space as GCDs.
         var oGcdSize    = iconSize * Cfg.OGCDSizeRatio;
@@ -1517,7 +1462,7 @@ public sealed class OverlayWindow : Window, IDisposable
         var visStart = Math.Min(gcdElapsedSec, ogcdElapsedSec) - (nowX - tlLeft)  / pxPerSec;
         var visEnd   = Math.Max(gcdElapsedSec, ogcdElapsedSec) + (tlRight - nowX) / pxPerSec;
 
-        // ── ATR DrawGrid ──────────────────────────────────────────────
+        // â”€â”€ ATR DrawGrid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if (showGrid)
         {
             for (var t = Math.Ceiling(visStart); t <= visEnd; t += 1.0)
@@ -1544,19 +1489,19 @@ public sealed class OverlayWindow : Window, IDisposable
             }
         }
 
-        // ── ATR GridCenterLine ────────────────────────────────────────
+        // â”€â”€ ATR GridCenterLine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         drawList.AddLine(
             new Vector2(tlLeft,  centerY),
             new Vector2(tlRight, centerY),
             ImGui.GetColorU32(ColCenterLine), 1.0f);
 
-        // ── ATR GridStartLine (the "now" vertical bar) ────────────────
+        // â”€â”€ ATR GridStartLine (the "now" vertical bar) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         drawList.AddLine(
             new Vector2(nowX, tlTop),
             new Vector2(nowX, tlBot),
             ImGui.GetColorU32(ColNowLine), 2.0f);
 
-        // ── Idle message ──────────────────────────────────────────────
+        // â”€â”€ Idle message â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if (!isActive)
         {
             const string msg = "Waiting for combat...";
@@ -1567,7 +1512,7 @@ public sealed class OverlayWindow : Window, IDisposable
         }
         else
         {
-            // ── Collect and bucket visible entries ────────────────────
+            // â”€â”€ Collect and bucket visible entries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             EnsureActiveFilteredEntriesCache();
             var sourceEntries = autoPlaybackActive ? activeTimeline.Entries : cachedActiveFilteredEntries;
             CollectEntriesInTimeWindow(sourceEntries, visStart - 5, visEnd + 5, activeVisibleEntriesScratch);
@@ -1591,14 +1536,14 @@ public sealed class OverlayWindow : Window, IDisposable
                 pxPerSec,
                 maxStack);
 
-            // ══════════════════════════════════════════════════════════
-            // PASS 1 — TimelineLayer.General
+            // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            // PASS 1 â€” TimelineLayer.General
             // Draw horizontal bars for every GCD and oGCD.
-            // ATR draws: Background → AnimLock (skipped: no data) → Cast fill → Border
-            // ══════════════════════════════════════════════════════════
+            // ATR draws: Background â†’ AnimLock (skipped: no data) â†’ Cast fill â†’ Border
+            // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             foreach (var bucket in gcdBuckets)
             {
-                // ── GCD bars ──
+                // â”€â”€ GCD bars â”€â”€
                 for (var i = 0; i < bucket.Entries.Count; i++)
                 {
                     var e        = bucket.Entries[i];
@@ -1621,7 +1566,7 @@ public sealed class OverlayWindow : Window, IDisposable
                             new Vector2(barR, gcdBarBot),
                             MulAlpha(ColGCDBackground, barAlpha), BarRound);
 
-                        // Cast fill (blue) — left 45% approximates cast time
+                        // Cast fill (blue) â€” left 45% approximates cast time
                         var castR = barL + (barR - barL) * 0.45f;
                         drawList.AddRectFilled(
                             new Vector2(barL, gcdBarTop),
@@ -1659,9 +1604,9 @@ public sealed class OverlayWindow : Window, IDisposable
             }
         }
 
-        // ══════════════════════════════════════════════════════════════
-        // BOSS CAST STRIP — anchored to bottom
-        // ══════════════════════════════════════════════════════════════
+        // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        // BOSS CAST STRIP â€” anchored to bottom
+        // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         if (hasBoss)
         {
             var bTop    = wPos.Y + wSize.Y - bossStripH - 2f;
@@ -1734,9 +1679,9 @@ public sealed class OverlayWindow : Window, IDisposable
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════
+    // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     // PASS 2 ICON HELPER
-    // ═══════════════════════════════════════════════════════════════════
+    // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     private bool DrawEmbeddedPreviewContents(AggregatedTimeline timeline)
     {
@@ -2153,7 +2098,7 @@ public sealed class OverlayWindow : Window, IDisposable
 
         if (entry.AbilityId > 0 && !TryDrawActionIcon(dl, entry.AbilityId, pos, size, alpha))
         {
-            // Fallback — coloured rect + abbreviated name
+            // Fallback â€” coloured rect + abbreviated name
             var hue = (entry.AbilityId % 12) / 12.0f;
             HsvToRgb(hue, 0.5f, 0.6f, out var cr, out var cg, out var cb);
             dl.AddRectFilled(pos, end,
@@ -2318,9 +2263,9 @@ public sealed class OverlayWindow : Window, IDisposable
         return -1;
     }
 
-    // ═══════════════════════════════════════════════════════════════════
+    // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     // ICON LOADING
-    // ═══════════════════════════════════════════════════════════════════
+    // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     private bool TryDrawActionIcon(ImDrawListPtr dl, int abilityId, Vector2 pos, float size, float alpha)
     {
@@ -2354,9 +2299,9 @@ public sealed class OverlayWindow : Window, IDisposable
         catch { return false; }
     }
 
-    // ═══════════════════════════════════════════════════════════════════
+    // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     // oGCD DETECTION
-    // ═══════════════════════════════════════════════════════════════════
+    // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     /// <summary>
     /// Returns the effective frequency threshold for a specific ability.
@@ -2394,9 +2339,9 @@ public sealed class OverlayWindow : Window, IDisposable
         return isOgcd;
     }
 
-    // ═══════════════════════════════════════════════════════════════════
+    // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     // HELPERS
-    // ═══════════════════════════════════════════════════════════════════
+    // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     /// <summary>Multiplies the alpha component of a Vector4 colour.</summary>
     private static uint MulAlpha(Vector4 col, float alpha)
@@ -2458,7 +2403,7 @@ public sealed class OverlayWindow : Window, IDisposable
     /// </summary>
     private static void DrawLockIcon(ImDrawListPtr dl, Vector2 center, float size, bool locked, uint col)
     {
-        // Body — filled rounded rect occupying the lower ~55% of the icon area
+        // Body â€” filled rounded rect occupying the lower ~55% of the icon area
         var bodyW = size * 0.62f;
         var bodyH = size * 0.50f;
         var bodyT = center.Y + size * 0.06f;
@@ -2467,7 +2412,7 @@ public sealed class OverlayWindow : Window, IDisposable
         var bodyR = center.X + bodyW / 2f;
         dl.AddRectFilled(new Vector2(bodyL, bodyT), new Vector2(bodyR, bodyB), col, 2f);
 
-        // Keyhole — small dark circle in center of body
+        // Keyhole â€” small dark circle in center of body
         dl.AddCircleFilled(
             new Vector2(center.X, bodyT + bodyH * 0.42f),
             bodyW * 0.12f,
@@ -2478,7 +2423,7 @@ public sealed class OverlayWindow : Window, IDisposable
         var sCenX = locked ? center.X : center.X + sR * 0.55f; // shift right when open
         var sCenY = bodyT;                                       // arc center at body top
 
-        // Top arc (upper semicircle, π → 2π) rendered as line segments
+        // Top arc (upper semicircle, Ï€ â†’ 2Ï€) rendered as line segments
         const int segs = 7;
         for (var i = 0; i < segs; i++)
         {
@@ -2510,7 +2455,7 @@ public sealed class OverlayWindow : Window, IDisposable
         if (ImGui.CalcTextSize(text).X <= maxWidth) return text;
         var approxChars = (int)(maxWidth / 7.0f);
         if (approxChars <= 1) return string.Empty;
-        var t = text[..Math.Min(text.Length, approxChars - 1)] + "…";
+        var t = text[..Math.Min(text.Length, approxChars - 1)] + "â€¦";
         return ImGui.CalcTextSize(t).X <= maxWidth ? t : string.Empty;
     }
 
@@ -2522,9 +2467,6 @@ public sealed class OverlayWindow : Window, IDisposable
             autoGcdLane.NextIndex > 0 ||
             autoOgcdLane.NextIndex > 0)
         {
-            WriteAutoDebug(
-                $"RUNTIME reset | gcdNext={autoGcdLane.NextIndex}/{autoGcdLane.Entries.Count} pending={DescribeAutoEntry(autoGcdLane.PendingEntry)} | " +
-                $"ogcdNext={autoOgcdLane.NextIndex}/{autoOgcdLane.Entries.Count} pending={DescribeAutoEntry(autoOgcdLane.PendingEntry)}");
         }
 
         autoGcdLane.Entries.Clear();
@@ -2604,7 +2546,6 @@ public sealed class OverlayWindow : Window, IDisposable
 
     private bool InitializeAutoRuntime(double baseTimeSec)
     {
-        WriteAutoDebug($"RUNTIME init begin | timeline={activeTimelineKey} | base={baseTimeSec:F3}");
         ResetAutoRuntimeState();
         if (activeTimeline == null)
             return false;
@@ -2658,9 +2599,6 @@ public sealed class OverlayWindow : Window, IDisposable
         autoLastObservedBaseTimeSec = baseTimeSec;
         autoLastObservedBaseAtUtc = DateTime.UtcNow;
         autoRuntimeInitialized = true;
-        WriteAutoDebug(
-            $"RUNTIME init done | gcdEntries={autoGcdLane.Entries.Count} next={autoGcdLane.NextIndex} | " +
-            $"ogcdEntries={autoOgcdLane.Entries.Count} next={autoOgcdLane.NextIndex}");
         return true;
     }
 
@@ -2668,19 +2606,16 @@ public sealed class OverlayWindow : Window, IDisposable
     {
         if (!autoRuntimeInitialized)
         {
-            WriteAutoDebug($"REBASE reason=uninitialized | base={baseTimeSec:F3}");
             return true;
         }
 
         if (!string.Equals(autoTimelineKey, activeTimelineKey, StringComparison.Ordinal))
         {
-            WriteAutoDebug($"REBASE reason=timeline_changed | old={autoTimelineKey} | new={activeTimelineKey} | base={baseTimeSec:F3}");
             return true;
         }
 
         if (!double.IsFinite(autoLastObservedBaseTimeSec) || autoLastObservedBaseAtUtc == DateTime.MinValue)
         {
-            WriteAutoDebug($"REBASE reason=missing_base_history | base={baseTimeSec:F3}");
             return true;
         }
 
@@ -2693,21 +2628,16 @@ public sealed class OverlayWindow : Window, IDisposable
             double.IsFinite(autoScrubLastSeekTimeSec) &&
             Math.Abs(baseTimeSec - autoScrubLastSeekTimeSec) <= 0.05)
         {
-            WriteAutoDebug($"REBASE suppressed | reason=recent_auto_scrub | base={baseTimeSec:F3} | seek={autoScrubLastSeekTimeSec:F3}");
             return false;
         }
 
         if (observedAdvanceSec < -AutoRebaseJumpThresholdSec)
         {
-            WriteAutoDebug($"REBASE reason=backwards_jump | base={baseTimeSec:F3} | prev={autoLastObservedBaseTimeSec:F3} | observedDelta={observedAdvanceSec:F3}");
             return true;
         }
 
         if (Math.Abs(observedAdvanceSec - wallAdvanceSec) > AutoRebaseJumpThresholdSec)
         {
-            WriteAutoDebug(
-                $"REBASE reason=delta_mismatch | base={baseTimeSec:F3} | prev={autoLastObservedBaseTimeSec:F3} | " +
-                $"observedDelta={observedAdvanceSec:F3} | wallDelta={wallAdvanceSec:F3}");
             return true;
         }
 
@@ -2718,9 +2648,6 @@ public sealed class OverlayWindow : Window, IDisposable
     {
         if (lane.PendingEntry != null || lane.RequestAccepted || lane.RecastObserved || lane.CastObserved || lane.CompletionObserved)
         {
-            WriteAutoLaneDebug(
-                lane,
-                $"pending clear | entry={DescribeAutoEntry(lane.PendingEntry)} | accepted={lane.RequestAccepted} | recast={lane.RecastObserved} | cast={lane.CastObserved} | complete={lane.CompletionObserved}");
         }
 
         lane.PendingEntry = null;
@@ -2736,9 +2663,6 @@ public sealed class OverlayWindow : Window, IDisposable
     {
         if (lane.PendingEntry != null)
         {
-            WriteAutoLaneDebug(
-                lane,
-                $"complete | entry={DescribeAutoEntry(lane.PendingEntry)} | nextIndex={lane.NextIndex + 1}");
             lane.NextIndex++;
         }
 
@@ -2821,9 +2745,6 @@ public sealed class OverlayWindow : Window, IDisposable
             return;
 
         var now = DateTime.UtcNow;
-        WriteAutoLaneDebug(
-            lane,
-            $"request observed | requestedAction={actionId} | pending={DescribeAutoEntry(lane.PendingEntry)}");
         lane.RequestAccepted = true;
         lane.RequestAcceptedAtUtc = now;
         lane.LastAttemptAtUtc = now;
@@ -2945,9 +2866,6 @@ public sealed class OverlayWindow : Window, IDisposable
             {
                 if (status.StatusId == selfStatusId)
                 {
-                    WriteAutoLaneDebug(
-                        lane,
-                        $"self status observed by id | entry={DescribeAutoEntry(lane.PendingEntry)} | statusId={selfStatusId}");
                     return true;
                 }
             }
@@ -2965,9 +2883,6 @@ public sealed class OverlayWindow : Window, IDisposable
                     var statusName = statusRow.Value.Name.ExtractText().Trim();
                     if (string.Equals(statusName, selfStatusName, StringComparison.OrdinalIgnoreCase))
                     {
-                        WriteAutoLaneDebug(
-                            lane,
-                            $"self status observed by name | entry={DescribeAutoEntry(lane.PendingEntry)} | statusName={statusName} | statusId={status.StatusId}");
                         return true;
                     }
                 }
@@ -3064,10 +2979,6 @@ public sealed class OverlayWindow : Window, IDisposable
 
         if (completionStateNames.Any(playerStatusNames.Contains))
             return false;
-
-        WriteAutoLaneDebug(
-            lane,
-            $"required state consumed | entry={DescribeAutoEntry(lane.PendingEntry)} | states=[{string.Join(", ", completionStateNames)}]");
         return true;
     }
 
@@ -3079,9 +2990,6 @@ public sealed class OverlayWindow : Window, IDisposable
         var remaining = GetActionCooldownRemainingSec(ResolveAutoActionId(lane));
         if (remaining > 0.0)
         {
-            WriteAutoLaneDebug(
-                lane,
-                $"skip on cooldown | entry={DescribeAutoEntry(lane.PendingEntry)} | cooldownRemaining={remaining:F3}");
             return true;
         }
 
@@ -3112,9 +3020,6 @@ public sealed class OverlayWindow : Window, IDisposable
         var interrupted = DateTime.UtcNow >= lane.RequestAcceptedAtUtc.AddSeconds(AutoPendingResetGraceSec);
         if (interrupted)
         {
-            WriteAutoLaneDebug(
-                lane,
-                $"cast interrupted | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId}");
         }
 
         return interrupted;
@@ -3127,7 +3032,6 @@ public sealed class OverlayWindow : Window, IDisposable
 
         if (lane.CompletionObserved)
         {
-            WriteAutoLaneDebug(lane, $"satisfied by action effect | entry={DescribeAutoEntry(lane.PendingEntry)}");
             return true;
         }
 
@@ -3136,9 +3040,6 @@ public sealed class OverlayWindow : Window, IDisposable
         if (!lane.RecastObserved && cooldownRemaining > 0.0)
         {
             lane.RecastObserved = true;
-            WriteAutoLaneDebug(
-                lane,
-                $"recast observed | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId} | cooldownRemaining={cooldownRemaining:F3}");
         }
 
         if (!lane.RecastObserved)
@@ -3159,9 +3060,6 @@ public sealed class OverlayWindow : Window, IDisposable
             var satisfied = DateTime.UtcNow >= lane.RequestAcceptedAtUtc.AddSeconds(AutoPendingResetGraceSec);
             if (satisfied)
             {
-                WriteAutoLaneDebug(
-                    lane,
-                    $"instant satisfied after grace | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId}");
             }
 
             return satisfied;
@@ -3176,9 +3074,6 @@ public sealed class OverlayWindow : Window, IDisposable
             if (!lane.CastObserved)
             {
                 lane.CastObserved = true;
-                WriteAutoLaneDebug(
-                    lane,
-                    $"cast observed | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId}");
             }
 
             return false;
@@ -3190,9 +3085,6 @@ public sealed class OverlayWindow : Window, IDisposable
         var castSatisfied = DateTime.UtcNow >= lane.RequestAcceptedAtUtc.AddSeconds(AutoPendingResetGraceSec);
         if (castSatisfied)
         {
-            WriteAutoLaneDebug(
-                lane,
-                $"cast satisfied after grace | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId}");
         }
 
         return castSatisfied;
@@ -3219,9 +3111,6 @@ public sealed class OverlayWindow : Window, IDisposable
 
                 lane.PendingEntry = nextEntry;
                 lane.DisplayTimeSec = nextEntry.TimeOffsetSec;
-                WriteAutoLaneDebug(
-                    lane,
-                    $"pending set | entry={DescribeAutoEntry(nextEntry)} | base={baseTimeSec:F3} | nextIndex={lane.NextIndex}");
             }
 
             lane.DisplayTimeSec = lane.PendingEntry!.TimeOffsetSec;
@@ -3249,9 +3138,6 @@ public sealed class OverlayWindow : Window, IDisposable
                     if (!lane.CastObserved)
                     {
                         lane.CastObserved = true;
-                        WriteAutoLaneDebug(
-                            lane,
-                            $"cast observed in update | entry={DescribeAutoEntry(lane.PendingEntry)} | actionId={resolvedActionId}");
                     }
                 }
 
@@ -3267,9 +3153,6 @@ public sealed class OverlayWindow : Window, IDisposable
                     DateTime.UtcNow >= lane.RequestAcceptedAtUtc.AddSeconds(AutoAcceptedInstantRetrySec) &&
                     !IsPendingActionSatisfied(lane))
                 {
-                    WriteAutoLaneDebug(
-                        lane,
-                        $"instant retry timeout | entry={DescribeAutoEntry(lane.PendingEntry)} | timeout={AutoAcceptedInstantRetrySec:F2}");
                     ClearLanePending(lane);
                     continue;
                 }
@@ -3281,23 +3164,14 @@ public sealed class OverlayWindow : Window, IDisposable
                 return;
 
             lane.LastAttemptAtUtc = DateTime.UtcNow;
-            WriteAutoLaneDebug(
-                lane,
-                $"attempt use | entry={DescribeAutoEntry(lane.PendingEntry)} | resolvedAction={ResolveAutoActionId(lane)} | base={baseTimeSec:F3}");
             if (!TryIssueAutoAction(lane.PendingEntry))
             {
-                WriteAutoLaneDebug(
-                    lane,
-                    $"attempt failed | entry={DescribeAutoEntry(lane.PendingEntry)} | resolvedAction={ResolveAutoActionId(lane)}");
                 return;
             }
 
             lane.RequestAccepted = true;
             lane.RequestAcceptedAtUtc = DateTime.UtcNow;
             lane.RecastObserved = GetActionCooldownRemainingSec(ResolveAutoActionId(lane)) > 0.0;
-            WriteAutoLaneDebug(
-                lane,
-                $"attempt succeeded | entry={DescribeAutoEntry(lane.PendingEntry)} | resolvedAction={ResolveAutoActionId(lane)} | recastObserved={lane.RecastObserved}");
             return;
         }
     }
@@ -3323,14 +3197,12 @@ public sealed class OverlayWindow : Window, IDisposable
             {
                 autoGcdLane.CompletionObserved = true;
                 autoGcdLane.RecastObserved = true;
-                WriteAutoLaneDebug(autoGcdLane, $"action effect observed | actionId={actionId} | entry={DescribeAutoEntry(autoGcdLane.PendingEntry)}");
             }
 
             if (LaneMatchesActionId(autoOgcdLane, actionId))
             {
                 autoOgcdLane.CompletionObserved = true;
                 autoOgcdLane.RecastObserved = true;
-                WriteAutoLaneDebug(autoOgcdLane, $"action effect observed | actionId={actionId} | entry={DescribeAutoEntry(autoOgcdLane.PendingEntry)}");
             }
         }
         catch
@@ -3338,21 +3210,21 @@ public sealed class OverlayWindow : Window, IDisposable
         }
     }
 
-    // ── Auto-execute framework update ───────────────────────────────────
+    // â”€â”€ Auto-execute framework update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// <summary>
     /// Called every game frame on the framework thread.
     /// Fires <c>ActionManager.UseAction</c> for each timeline entry the moment it
-    /// crosses the red bar during live combat — but only when
+    /// crosses the red bar during live combat â€” but only when
     /// <see cref="AutoExecuteEnabled"/> is true (the hidden easter egg).
     ///
     /// Queue-based design following the WrathCombo pattern:
-    ///   • Phase 1 – Scan all entries each frame. Enqueue each one exactly once when it
-    ///               reaches its scheduled time (±350 ms accept window). Entries that pass
+    ///   â€¢ Phase 1 â€“ Scan all entries each frame. Enqueue each one exactly once when it
+    ///               reaches its scheduled time (Â±350 ms accept window). Entries that pass
     ///               the 350 ms window before being seen are permanently skipped so a late-
     ///               joining auto-execute doesn't fire obviously stale actions.
-    ///   • Phase 2 – When <c>AnimationLock == 0</c> (game ready), dequeue the next pending
-    ///               action and fire it — one per frame, matching WrathCombo's approach.
+    ///   â€¢ Phase 2 â€“ When <c>AnimationLock == 0</c> (game ready), dequeue the next pending
+    ///               action and fire it â€” one per frame, matching WrathCombo's approach.
     ///               Items that have sat in the queue > 5 s (implying a hung queue) are
     ///               discarded, but normally queued oGCDs will fire within a full GCD cycle.
     ///

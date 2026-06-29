@@ -81,6 +81,7 @@ public sealed unsafe class AntsController : IDisposable
         if (hotbarModule == null) return;
 
         var time = (float)ImGui.GetTime();
+        var slotNodes = stackalloc AtkResNode*[12];
 
         for (var barIdx = 0; barIdx < HotbarAddonNames.Length; barIdx++)
         {
@@ -94,7 +95,6 @@ public sealed unsafe class AntsController : IDisposable
             // Locate the 12 slot button component nodes by their stable NodeId (8–19).
             // NodeId-based lookup is more reliable than size-filtering because component
             // nodes can have Width=Height=0 when their layout is managed by child nodes.
-            var slotNodes = stackalloc AtkResNode*[12];
             for (var k = 0; k < 12; k++) slotNodes[k] = null;
 
             for (var i = 0; i < nodeCount; i++)

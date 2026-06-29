@@ -39,6 +39,7 @@ public sealed class Configuration : IPluginConfiguration
     public float MainIconScale   { get; set; } = 1.0f;
     public float AutoTimelineGcdRecastSec { get; set; } = 2.5f;
     public float AutoTimelineDotRefreshBufferSec { get; set; } = 6.0f;
+    public bool DebugEnabled { get; set; }
 
     // Ability Ants — master toggle + custom mode
     public bool    AntsEnabled         { get; set; } = true;
@@ -75,30 +76,37 @@ public sealed class Configuration : IPluginConfiguration
 
     // Per-timeline skill visibility: key = "encounterId_specName", value = set of hidden ability IDs
     [JsonIgnore]
+    [System.Text.Json.Serialization.JsonIgnore]
     public Dictionary<string, HashSet<int>> HiddenAbilities { get; set; } = [];
 
     // Per-ability frequency thresholds: key = "encounterId_specName", value = { abilityId -> threshold (0..1) }
     // Overrides OverlayFreqThreshold for specific abilities. Falls back to global if not set.
     [JsonIgnore]
+    [System.Text.Json.Serialization.JsonIgnore]
     public Dictionary<string, Dictionary<int, float>> AbilityFreqThresholds { get; set; } = [];
 
     // Per-auto-timeline skill filters: key = "encounterId_specName", value = set of ability IDs excluded from auto-timeline generation
     [JsonIgnore]
+    [System.Text.Json.Serialization.JsonIgnore]
     public Dictionary<string, HashSet<int>> AutoTimelineDisabledAbilities { get; set; } = [];
 
     // Custom timelines the user has saved (serialized copies they can edit)
     [JsonIgnore]
+    [System.Text.Json.Serialization.JsonIgnore]
     public Dictionary<string, Data.AggregatedTimeline> CustomTimelines { get; set; } = [];
 
     // Custom timeline groups: ordered list of group names
     [JsonIgnore]
+    [System.Text.Json.Serialization.JsonIgnore]
     public List<string> TimelineGroups { get; set; } = [];
 
     // Maps timeline key → group name (unassigned keys = ungrouped)
     [JsonIgnore]
+    [System.Text.Json.Serialization.JsonIgnore]
     public Dictionary<string, string> TimelineGroupAssignments { get; set; } = [];
 
     [JsonIgnore]
+    [System.Text.Json.Serialization.JsonIgnore]
     public Dictionary<string, string> TimelineNextLinks { get; set; } = [];
 
     public void RemoveTimelineReferences(string key)

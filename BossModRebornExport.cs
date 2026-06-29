@@ -423,8 +423,6 @@ internal static partial class BossModRebornExport
             Path.Combine(AppContext.BaseDirectory, EncounterDataFileName),
             assemblyDirectory != null ? Path.Combine(assemblyDirectory, EncounterDataFileName) : string.Empty,
             Path.Combine(Environment.CurrentDirectory, EncounterDataFileName),
-            Path.Combine(Environment.CurrentDirectory, "ATKTipDebug", EncounterDataFileName),
-            Path.Combine(Environment.CurrentDirectory, "ATKTipDebug", "bin", "x64", "Release", EncounterDataFileName),
         };
 
         var path = candidates.FirstOrDefault(path => !string.IsNullOrWhiteSpace(path) && File.Exists(path));

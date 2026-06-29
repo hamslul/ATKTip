@@ -128,12 +128,12 @@ internal static class AutoTimelineSourceBuilder
         return Math.Abs(entry.TimeOffsetSec - expectedOgcdTimeSec) <= AlignmentEpsilonSec;
     }
 
-    private static int ResolveGcdSlotIndex(double timeSec, double gcdSlotSpacingSec)
+    internal static int ResolveGcdSlotIndex(double timeSec, double gcdSlotSpacingSec)
     {
         return (int)Math.Round(timeSec / gcdSlotSpacingSec, MidpointRounding.AwayFromZero);
     }
 
-    private static (int cycleIndex, int subslotIndex) ResolveOgcdSlotKey(double timeSec, double gcdSlotSpacingSec)
+    internal static (int cycleIndex, int subslotIndex) ResolveOgcdSlotKey(double timeSec, double gcdSlotSpacingSec)
     {
         var cycleIndex = (int)Math.Floor(timeSec / gcdSlotSpacingSec);
         var cycleStartSec = cycleIndex * gcdSlotSpacingSec;
@@ -142,14 +142,14 @@ internal static class AutoTimelineSourceBuilder
         return (cycleIndex, subslotIndex);
     }
 
-    private static double GetGcdSlotTimeSec(int slotIndex, double gcdSlotSpacingSec)
+    internal static double GetGcdSlotTimeSec(int slotIndex, double gcdSlotSpacingSec)
         => slotIndex * gcdSlotSpacingSec;
 
-    private static double GetOgcdSlotTimeSec(int cycleIndex, int subslotIndex, double gcdSlotSpacingSec)
+    internal static double GetOgcdSlotTimeSec(int cycleIndex, int subslotIndex, double gcdSlotSpacingSec)
         => cycleIndex * gcdSlotSpacingSec +
            (subslotIndex <= 0 ? gcdSlotSpacingSec / 3.0 : (gcdSlotSpacingSec * 2.0) / 3.0);
 
-    private static double NormalizeGcdSlotSpacingSec(double gcdSlotSpacingSec)
+    internal static double NormalizeGcdSlotSpacingSec(double gcdSlotSpacingSec)
         => Math.Clamp(gcdSlotSpacingSec, 2.0, 2.5);
 
     private static void AccumulateParseUsage<TKey>(

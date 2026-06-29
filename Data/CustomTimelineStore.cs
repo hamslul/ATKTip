@@ -27,8 +27,9 @@ public sealed class CustomTimelineStore
     public void LoadInto(Configuration cfg)
     {
         Directory.CreateDirectory(rootDir);
+        var manifestExists = File.Exists(manifestPath);
 
-        if (File.Exists(manifestPath))
+        if (manifestExists)
         {
             try
             {
@@ -62,7 +63,7 @@ public sealed class CustomTimelineStore
             }
         }
 
-        if (loaded.Count == 0 && cfg.CustomTimelines.Count > 0)
+        if (!manifestExists && loaded.Count == 0 && cfg.CustomTimelines.Count > 0)
         {
             manifest = new CustomTimelineManifest();
             foreach (var (key, timeline) in cfg.CustomTimelines)

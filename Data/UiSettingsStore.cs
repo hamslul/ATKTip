@@ -73,6 +73,7 @@ public sealed class UiSettingsStore
         MainIconScale = cfg.MainIconScale,
         AutoTimelineGcdRecastSec = cfg.AutoTimelineGcdRecastSec,
         AutoTimelineDotRefreshBufferSec = cfg.AutoTimelineDotRefreshBufferSec,
+        DebugEnabled = cfg.DebugEnabled,
         AntsEnabled = cfg.AntsEnabled,
         AntsCustomEnabled = cfg.AntsCustomEnabled,
         OgcdAntsEnabled = cfg.OgcdAntsEnabled,
@@ -126,6 +127,7 @@ public sealed class UiSettingsStore
         cfg.MainIconScale = data.MainIconScale;
         cfg.AutoTimelineGcdRecastSec = Math.Clamp(data.AutoTimelineGcdRecastSec, 2.0f, 2.5f);
         cfg.AutoTimelineDotRefreshBufferSec = Math.Clamp(data.AutoTimelineDotRefreshBufferSec, 0.0f, 15.0f);
+        cfg.DebugEnabled = data.DebugEnabled;
         cfg.AntsEnabled = data.AntsEnabled;
         cfg.AntsCustomEnabled = true;
         cfg.OgcdAntsEnabled = data.OgcdAntsEnabled;
@@ -179,6 +181,7 @@ public sealed class UiSettingsStore
         public float MainIconScale { get; set; }
         public float AutoTimelineGcdRecastSec { get; set; } = 2.5f;
         public float AutoTimelineDotRefreshBufferSec { get; set; } = 6.0f;
+        public bool DebugEnabled { get; set; }
         public bool AntsEnabled { get; set; }
         public bool AntsCustomEnabled { get; set; }
         public bool OgcdAntsEnabled { get; set; }
