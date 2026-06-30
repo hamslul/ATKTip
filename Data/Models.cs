@@ -94,6 +94,14 @@ public sealed class BossTimelineEntry
     public double CastEndSec { get; set; }     // == CastStartSec when instant
     public int AbilityId { get; set; }
     public string AbilityName { get; set; } = string.Empty;
+    public int SourceId { get; set; }
+    public bool IsPrimaryBoss { get; set; }
+}
+
+public sealed class DeadSpaceRange
+{
+    public double StartSec { get; set; }
+    public double EndSec { get; set; }
 }
 
 // ── Aggregated timeline models (what we persist) ──
@@ -117,6 +125,7 @@ public sealed class AggregatedTimeline
     public int ParseCount { get; set; }
     public List<TimelineEntry> Entries { get; set; } = [];
     public List<BossTimelineEntry> BossEntries { get; set; } = [];
+    public List<DeadSpaceRange> DeadSpaceRanges { get; set; } = [];
     /// <summary>Original source entries used by Auto Timeline so repeated runs are stable.</summary>
     public List<TimelineEntry> AutoTimelineSourceEntries { get; set; } = [];
     /// <summary>Per-parse cached FFLogs timelines used for debug inspection of the top source parses.</summary>
@@ -133,6 +142,7 @@ public sealed class CachedFflogsParseTimeline
     public double RankingAmount { get; set; }
     public double DurationSec { get; set; }
     public List<TimelineEntry> Entries { get; set; } = [];
+    public List<BossTimelineEntry> BossEntries { get; set; } = [];
     public FightPhaseInfo? PhaseInfo { get; set; }
     public bool HasVisiblePhaseEntries { get; set; }
 }

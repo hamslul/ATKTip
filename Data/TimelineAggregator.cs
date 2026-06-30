@@ -104,7 +104,7 @@ public sealed class TimelineAggregator
             info?.IsGcdAction ?? false);
     }
 
-    public List<BossTimelineEntry> AggregateBossEvents(List<RawBossCastEvent> events)
+    public List<BossTimelineEntry> AggregateBossEvents(List<RawBossCastEvent> events, FightPhaseInfo? phaseInfo = null)
     {
         if (events.Count == 0)
             return [];
@@ -134,6 +134,7 @@ public sealed class TimelineAggregator
                     CastEndSec = e.Timestamp / 1000.0,
                     AbilityId = e.AbilityGameId,
                     AbilityName = e.AbilityName,
+                    SourceId = e.SourceId,
                 });
             }
         }
@@ -156,9 +157,92 @@ public sealed class TimelineAggregator
             lastSeen[entry.AbilityId] = entry.CastStartSec;
         }
 
+        MarkPrimaryBossEntries(deduped, phaseInfo);
+
         log.Debug("Boss timeline: {0} cast entries ({1} after multi-hit dedup).",
             result.Count, deduped.Count);
         return deduped;
+    }
+
+    private static void MarkPrimaryBossEntries(List<BossTimelineEntry> entries, FightPhaseInfo? phaseInfo)
+    {
+        foreach (var entry in entries)
+            entry.IsPrimaryBoss = false;
+
+        var phaseWindows = BuildPhaseWindows(phaseInfo);
+        if (phaseWindows.Count == 0)
+        {
+            MarkPrimaryBossEntriesForWindow(entries, 0.0, double.PositiveInfinity);
+            return;
+        }
+
+        foreach (var (startSec, endSec) in phaseWindows)
+            MarkPrimaryBossEntriesForWindow(entries, startSec, endSec);
+    }
+
+    private static void MarkPrimaryBossEntriesForWindow(
+        List<BossTimelineEntry> entries,
+        double startSec,
+        double endSec)
+    {
+        var sourceGroups = entries
+            .Where(entry => entry.SourceId != 0 &&
+                            entry.CastStartSec >= startSec &&
+                            entry.CastStartSec < endSec)
+            .GroupBy(entry => entry.SourceId)
+            .Select(group => new
+            {
+                SourceId = group.Key,
+                Count = group.Count(),
+                TotalCastTime = group.Sum(entry => Math.Max(0.0, entry.CastEndSec - entry.CastStartSec)),
+                FirstCast = group.Min(entry => entry.CastStartSec),
+            })
+            .OrderByDescending(group => group.Count)
+            .ThenByDescending(group => group.TotalCastTime)
+            .ThenBy(group => group.FirstCast)
+            .ToList();
+        if (sourceGroups.Count == 0)
+            return;
+
+        var primarySourceId = sourceGroups[0].SourceId;
+        foreach (var entry in entries.Where(entry => entry.SourceId == primarySourceId &&
+                                                     entry.CastStartSec >= startSec &&
+                                                     entry.CastStartSec < endSec))
+        {
+            entry.IsPrimaryBoss = true;
+        }
+    }
+
+    private static List<(double StartSec, double EndSec)> BuildPhaseWindows(FightPhaseInfo? phaseInfo)
+    {
+        if (phaseInfo == null || phaseInfo.PhaseTransitions.Count == 0)
+            return [];
+
+        var metadataById = phaseInfo.PhaseMetadata.ToDictionary(phase => phase.Id);
+        var orderedTransitions = phaseInfo.PhaseTransitions
+            .OrderBy(transition => transition.StartTime)
+            .ToList();
+        var windows = new List<(double StartSec, double EndSec)>();
+
+        for (var index = 0; index < orderedTransitions.Count; index++)
+        {
+            var transition = orderedTransitions[index];
+            var metadata = metadataById.GetValueOrDefault(transition.Id);
+            if (metadata?.IsIntermission == true)
+                continue;
+
+            var nextStartTime = index + 1 < orderedTransitions.Count
+                ? orderedTransitions[index + 1].StartTime
+                : phaseInfo.FightEndTime;
+            var startSec = Math.Max(0L, transition.StartTime - phaseInfo.FightStartTime) / 1000.0;
+            var endSec = Math.Max(transition.StartTime - phaseInfo.FightStartTime, nextStartTime - phaseInfo.FightStartTime) / 1000.0;
+            if (endSec <= startSec)
+                continue;
+
+            windows.Add((startSec, endSec));
+        }
+
+        return windows;
     }
 
     private static TimelineEntry CloneTimelineEntry(TimelineEntry entry)

@@ -44,10 +44,15 @@ public sealed class OverlayWindow : Window, IDisposable
     /// </summary>
     public bool AutoExecuteEnabled { get; set; }
     private readonly Dictionary<ulong, uint> observedBossCastIds = [];
+    private readonly Dictionary<uint, string?> bossActionNameCache = [];
+    private readonly Dictionary<string, int> bossActionIdByNameCache = new(StringComparer.OrdinalIgnoreCase);
     private double autoScrubLastResolvedBossTimeSec = double.NegativeInfinity;
+    private double autoScrubLastResolvedPrimaryBossTimeSec = double.NegativeInfinity;
     private double autoScrubLastObservedElapsedSec = double.NegativeInfinity;
     private double autoScrubLastSeekTimeSec = double.NaN;
     private DateTime autoScrubLastSeekAtUtc = DateTime.MinValue;
+    private bool autoScrubWaitingForPrimaryBossCast;
+    private double autoScrubWaitingPrimaryBossTimeSec = double.NaN;
 
     // â”€â”€ ATR geometry constants (match ATR defaults exactly) â”€â”€
     // GCDHeightHigh / GCDHeightLow control the vertical extent of the GCD bar.
@@ -207,6 +212,7 @@ public sealed class OverlayWindow : Window, IDisposable
     private sealed class ObservedBossCast
     {
         public uint AbilityId { get; init; }
+        public string AbilityName { get; init; } = string.Empty;
         public ulong MaxHp { get; init; }
         public ulong CurrentHp { get; init; }
         public bool IsPrimaryBoss { get; init; }
@@ -297,8 +303,24 @@ public sealed class OverlayWindow : Window, IDisposable
 
         if (timeline != null)
         {
+            RepairTimelineBossEntryAbilityIds(timeline);
             PopulateTimelineVisibility(timeline, key, skillVisibility);
             ClassifyTimelineEntries(timeline);
+        }
+    }
+
+    private void RepairTimelineBossEntryAbilityIds(AggregatedTimeline timeline)
+    {
+        if (timeline.BossEntries.Count == 0)
+            return;
+
+        foreach (var entry in timeline.BossEntries)
+        {
+            if (entry.AbilityId > 0 || string.IsNullOrWhiteSpace(entry.AbilityName))
+                continue;
+
+            if (TryResolveBossActionIdByName(entry.AbilityName, out var resolvedAbilityId))
+                entry.AbilityId = resolvedAbilityId;
         }
     }
 
@@ -682,6 +704,13 @@ public sealed class OverlayWindow : Window, IDisposable
         awaitingManualPhaseStart = armForManualPhaseStart;
     }
 
+    private void PauseCombatViewAtTime(double timeSec)
+    {
+        SeekTimelineToTime(timeSec);
+        combatViewPaused = true;
+        awaitingManualPhaseStart = false;
+    }
+
     private void ResumeCombatViewFromCurrentTime()
     {
         combatStartTime = DateTime.UtcNow - TimeSpan.FromSeconds(Math.Max(0, combatElapsedSec));
@@ -693,9 +722,12 @@ public sealed class OverlayWindow : Window, IDisposable
     {
         observedBossCastIds.Clear();
         autoScrubLastResolvedBossTimeSec = double.NegativeInfinity;
+        autoScrubLastResolvedPrimaryBossTimeSec = double.NegativeInfinity;
         autoScrubLastObservedElapsedSec = double.NegativeInfinity;
         autoScrubLastSeekTimeSec = double.NaN;
         autoScrubLastSeekAtUtc = DateTime.MinValue;
+        autoScrubWaitingForPrimaryBossCast = false;
+        autoScrubWaitingPrimaryBossTimeSec = double.NaN;
     }
 
     private void SeekTimelineToTime(double timeSec)
@@ -729,7 +761,7 @@ public sealed class OverlayWindow : Window, IDisposable
         if (!inCombat && !isPreview)
             return;
 
-        if (inCombat && combatViewPaused)
+        if (inCombat && combatViewPaused && !autoScrubWaitingForPrimaryBossCast)
             return;
 
         var currentElapsedSec = GetBaseTimelineElapsedSec();
@@ -744,13 +776,34 @@ public sealed class OverlayWindow : Window, IDisposable
 
         foreach (var cast in CollectObservedBossCastStarts())
         {
-            if (!TryResolveAutoScrubBossEntry((int)cast.AbilityId, currentElapsedSec, out var matchedEntry))
+            if (!TryResolveAutoScrubBossEntry((int)cast.AbilityId, cast.AbilityName, currentElapsedSec, out var matchedEntry))
                 continue;
             autoScrubLastSeekTimeSec = matchedEntry.CastStartSec;
             autoScrubLastSeekAtUtc = DateTime.UtcNow;
             SeekTimelineToTime(matchedEntry.CastStartSec);
             autoScrubLastResolvedBossTimeSec = Math.Max(autoScrubLastResolvedBossTimeSec, matchedEntry.CastStartSec);
+            if (matchedEntry.IsPrimaryBoss)
+            {
+                autoScrubLastResolvedPrimaryBossTimeSec = Math.Max(autoScrubLastResolvedPrimaryBossTimeSec, matchedEntry.CastStartSec);
+                if (autoScrubWaitingForPrimaryBossCast &&
+                    Math.Abs(matchedEntry.CastStartSec - autoScrubWaitingPrimaryBossTimeSec) <= 0.05)
+                {
+                    autoScrubWaitingForPrimaryBossCast = false;
+                    autoScrubWaitingPrimaryBossTimeSec = double.NaN;
+                    ResumeCombatViewFromCurrentTime();
+                }
+            }
             return;
+        }
+
+        if (inCombat &&
+            !combatViewPaused &&
+            TryGetNextPrimaryBossAutoPauseEntry(currentElapsedSec, out var nextPrimaryBossEntry) &&
+            currentElapsedSec >= nextPrimaryBossEntry.CastStartSec - 0.0005)
+        {
+            autoScrubWaitingForPrimaryBossCast = true;
+            autoScrubWaitingPrimaryBossTimeSec = nextPrimaryBossEntry.CastStartSec;
+            PauseCombatViewAtTime(nextPrimaryBossEntry.CastStartSec);
         }
     }
 
@@ -789,6 +842,7 @@ public sealed class OverlayWindow : Window, IDisposable
             observedCasts.Add(new ObservedBossCast
             {
                 AbilityId = currentCastId,
+                AbilityName = GetBossActionName(currentCastId),
                 MaxHp = character.MaxHp,
                 CurrentHp = character.CurrentHp,
                 IsPrimaryBoss = primaryBossDataId != 0 && battleNpc.NameId == primaryBossDataId,
@@ -847,7 +901,7 @@ public sealed class OverlayWindow : Window, IDisposable
         return bestDataId;
     }
 
-    private bool TryResolveAutoScrubBossEntry(int abilityId, double currentElapsedSec, out BossTimelineEntry matchedEntry)
+    private bool TryResolveAutoScrubBossEntry(int abilityId, string abilityName, double currentElapsedSec, out BossTimelineEntry matchedEntry)
     {
         matchedEntry = null!;
         if (activeTimeline == null || activeTimeline.BossEntries.Count == 0)
@@ -863,7 +917,7 @@ public sealed class OverlayWindow : Window, IDisposable
 
         foreach (var entry in activeTimeline.BossEntries)
         {
-            if (entry.AbilityId != abilityId)
+            if (!BossEntryMatchesObservedCast(entry, abilityId, abilityName))
                 continue;
 
             if (double.IsNegativeInfinity(autoScrubLastResolvedBossTimeSec) && entry.CastStartSec >= initialAnchor)
@@ -896,6 +950,114 @@ public sealed class OverlayWindow : Window, IDisposable
         }
 
         return false;
+    }
+
+    private bool TryGetNextPrimaryBossAutoPauseEntry(double currentElapsedSec, out BossTimelineEntry entry)
+    {
+        entry = null!;
+        if (activeTimeline == null)
+            return false;
+
+        var resolvedAnchor = double.IsNegativeInfinity(autoScrubLastResolvedPrimaryBossTimeSec)
+            ? Math.Max(0.0, currentElapsedSec - 0.05)
+            : autoScrubLastResolvedPrimaryBossTimeSec + 0.05;
+        foreach (var bossEntry in activeTimeline.BossEntries)
+        {
+            if (!bossEntry.IsPrimaryBoss)
+                continue;
+
+            if (bossEntry.CastStartSec < resolvedAnchor)
+                continue;
+
+            entry = bossEntry;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool BossEntryMatchesObservedCast(BossTimelineEntry entry, int abilityId, string abilityName)
+    {
+        if (entry.AbilityId > 0 && abilityId > 0 && entry.AbilityId == abilityId)
+            return true;
+
+        if (string.IsNullOrWhiteSpace(abilityName) || string.IsNullOrWhiteSpace(entry.AbilityName))
+            return false;
+
+        return string.Equals(
+            NormalizeBossAbilityName(entry.AbilityName),
+            NormalizeBossAbilityName(abilityName),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string GetBossActionName(uint actionId)
+    {
+        if (actionId == 0)
+            return string.Empty;
+
+        if (bossActionNameCache.TryGetValue(actionId, out var cachedName))
+            return cachedName ?? string.Empty;
+
+        string? resolvedName = null;
+        try
+        {
+            var sheet = plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Action>();
+            var row = sheet?.GetRowOrDefault(actionId);
+            if (row.HasValue)
+            {
+                var rawName = row.Value.Name.ExtractText();
+                resolvedName = string.IsNullOrWhiteSpace(rawName) ? null : rawName.Trim();
+            }
+        }
+        catch
+        {
+        }
+
+        bossActionNameCache[actionId] = resolvedName;
+        return resolvedName ?? string.Empty;
+    }
+
+    private bool TryResolveBossActionIdByName(string abilityName, out int abilityId)
+    {
+        abilityId = 0;
+        var normalizedName = NormalizeBossAbilityName(abilityName);
+        if (string.IsNullOrWhiteSpace(normalizedName))
+            return false;
+
+        if (bossActionIdByNameCache.TryGetValue(normalizedName, out abilityId))
+            return abilityId > 0;
+
+        try
+        {
+            var sheet = plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Action>();
+            if (sheet != null)
+            {
+                foreach (var row in sheet)
+                {
+                    var candidateName = NormalizeBossAbilityName(row.Name.ExtractText());
+                    if (!string.Equals(candidateName, normalizedName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    abilityId = unchecked((int)row.RowId);
+                    break;
+                }
+            }
+        }
+        catch
+        {
+            abilityId = 0;
+        }
+
+        bossActionIdByNameCache[normalizedName] = abilityId;
+        return abilityId > 0;
+    }
+
+    private static string NormalizeBossAbilityName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        return string.Join(' ', value.Split(' ', StringSplitOptions.RemoveEmptyEntries)).Trim();
     }
 
     private unsafe bool HandleUseAction(

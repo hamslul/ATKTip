@@ -235,6 +235,7 @@ public sealed class MainWindow : Window
     private Dictionary<int, bool> skillVisibility = [];
     private bool showEmbeddedTimelinePreview;
     private readonly Dictionary<int, uint> iconIdCache = [];
+    private readonly Dictionary<string, int> importedBossAbilityIdCache = new(StringComparer.OrdinalIgnoreCase);
 
     // Update state
     private bool isUpdating;
@@ -814,7 +815,15 @@ public sealed class MainWindow : Window
 
                 var bossTimeCsv = FormatCsvTime(row.BossEntry.CastStartSec);
                 var bossAbilityCsv = BuildBossExportAbilityName(row.BossEntry);
-                sb.AppendLine($"\"{bossTimeCsv}\",\"Boss Cast\",\"{bossAbilityCsv}\",\"Boss\",\"\"");
+                var bossMetadataParts = new List<string>();
+                if (row.BossEntry.AbilityId > 0)
+                    bossMetadataParts.Add($"ability_id={row.BossEntry.AbilityId}");
+                if (row.BossEntry.SourceId > 0)
+                    bossMetadataParts.Add($"source_id={row.BossEntry.SourceId}");
+                if (row.BossEntry.IsPrimaryBoss)
+                    bossMetadataParts.Add("primary=1");
+                var bossMetadataCsv = string.Join(';', bossMetadataParts);
+                sb.AppendLine($"\"{bossTimeCsv}\",\"Boss Cast\",\"{bossAbilityCsv}\",\"Boss\",\"{bossMetadataCsv}\"");
             }
 
             ImGui.SetClipboardText(sb.ToString().TrimEnd());
@@ -839,6 +848,85 @@ public sealed class MainWindow : Window
         return castDurationSec > 0.0005
             ? $"{entry.AbilityName} {castDurationSec:0.00} sec"
             : entry.AbilityName;
+    }
+
+    private int ResolveImportedBossAbilityId(string abilityName, string? metadata)
+    {
+        if (TryParseImportedBossAbilityId(metadata, out var explicitAbilityId))
+            return explicitAbilityId;
+
+        var normalizedName = NormalizeImportedAbilityName(abilityName);
+        if (string.IsNullOrWhiteSpace(normalizedName))
+            return 0;
+
+        if (importedBossAbilityIdCache.TryGetValue(normalizedName, out var cachedAbilityId))
+            return cachedAbilityId;
+
+        var recastInfo = plugin.RecastDatabase.Lookup(0, normalizedName);
+        if (recastInfo != null)
+        {
+            cachedAbilityId = (int)recastInfo.AbilityId;
+            importedBossAbilityIdCache[normalizedName] = cachedAbilityId;
+            return cachedAbilityId;
+        }
+
+        cachedAbilityId = 0;
+        try
+        {
+            var sheet = plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Action>();
+            if (sheet != null)
+            {
+                foreach (var row in sheet)
+                {
+                    if (!string.Equals(
+                            NormalizeImportedAbilityName(row.Name.ExtractText()),
+                            normalizedName,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    cachedAbilityId = unchecked((int)row.RowId);
+                    break;
+                }
+            }
+        }
+        catch
+        {
+            cachedAbilityId = 0;
+        }
+
+        importedBossAbilityIdCache[normalizedName] = cachedAbilityId;
+        return cachedAbilityId;
+    }
+
+    private static bool TryParseImportedBossAbilityId(string? metadata, out int abilityId)
+    {
+        abilityId = ParseImportedBossMetadataInt(metadata, "ability_id");
+        return abilityId > 0;
+    }
+
+    private static int ParseImportedBossMetadataInt(string? metadata, string key)
+    {
+        if (string.IsNullOrWhiteSpace(metadata))
+            return 0;
+
+        foreach (var part in metadata.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!part.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var value = part[(key.Length + 1)..];
+            return int.TryParse(
+                value,
+                System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var parsedValue)
+                ? parsedValue
+                : 0;
+        }
+
+        return 0;
     }
 
     /// <summary>
@@ -1032,12 +1120,15 @@ public sealed class MainWindow : Window
             return false;
 
         var castDurationSec = ExtractImportedCastDurationSec(rawAbilityName);
-        var abilityInfo = plugin.RecastDatabase.Lookup(0, abilityName);
+        var metadata = cols.Count >= 5 ? cols[4] : null;
+        var abilityId = ResolveImportedBossAbilityId(abilityName, metadata);
 
         bossEntry = new BossTimelineEntry
         {
-            AbilityId = abilityInfo != null ? (int)abilityInfo.AbilityId : 0,
+            AbilityId = abilityId,
             AbilityName = abilityName,
+            SourceId = ParseImportedBossMetadataInt(metadata, "source_id"),
+            IsPrimaryBoss = ParseImportedBossMetadataInt(metadata, "primary") == 1,
             CastStartSec = timeSec,
             CastEndSec = castDurationSec > 0.0
                 ? Math.Round(timeSec + castDurationSec, 3, MidpointRounding.AwayFromZero)
@@ -9472,30 +9563,329 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
 
     private void GenerateBossAttacksFromFetchedLogs(AggregatedTimeline targetTimeline, AggregatedTimeline sourceTimeline)
     {
-        if (sourceTimeline.BossEntries.Count == 0)
+        var stitchedBossEntries = BuildGeneratedBossAttackTimeline(sourceTimeline);
+        if (stitchedBossEntries.Count == 0)
         {
             SetEiStatus($"No cached boss attacks are available for {sourceTimeline.EncounterName} / {sourceTimeline.SpecName}.", true);
             return;
         }
 
-        var bossEntriesToAdd = sourceTimeline.BossEntries
-            .Select(CloneBossTimelineEntry)
-            .ToList();
-        targetTimeline.BossEntries.AddRange(bossEntriesToAdd);
+        int addedCount;
+        double insertedDeadSpaceSec;
+        if (targetTimeline.BossEntries.Count == 0)
+        {
+            targetTimeline.BossEntries = stitchedBossEntries
+                .Select(CloneBossTimelineEntry)
+                .ToList();
+            targetTimeline.DeadSpaceRanges.Clear();
+            addedCount = targetTimeline.BossEntries.Count;
+            insertedDeadSpaceSec = 0.0;
+        }
+        else
+        {
+            addedCount = MergeGeneratedBossAttacksIntoTimeline(targetTimeline, stitchedBossEntries, out insertedDeadSpaceSec);
+        }
 
         var maxBossTimeSec = targetTimeline.BossEntries
             .Select(entry => Math.Max(entry.CastStartSec, entry.CastEndSec))
             .DefaultIfEmpty(0.0)
             .Max();
+        var maxActionTimeSec = targetTimeline.Entries
+            .Select(entry => entry.TimeOffsetSec)
+            .DefaultIfEmpty(0.0)
+            .Max();
         if (maxBossTimeSec * 1000.0 > targetTimeline.AverageDurationMs)
         {
-            targetTimeline.AverageDurationMs = maxBossTimeSec * 1000.0;
+            targetTimeline.AverageDurationMs = Math.Max(maxBossTimeSec, maxActionTimeSec) * 1000.0;
             if (ReferenceEquals(targetTimeline, editingTimeline))
                 editDurationSec = (float)(targetTimeline.AverageDurationMs / 1000.0);
         }
 
         MarkCustomEditorModified();
-        SetEiStatus($"Added {bossEntriesToAdd.Count} boss attack{(bossEntriesToAdd.Count == 1 ? string.Empty : "s")} from fetched FFLogs data.");
+        SetEiStatus(insertedDeadSpaceSec > 0.0005
+            ? $"Added {addedCount} boss attack{(addedCount == 1 ? string.Empty : "s")} from fetched FFLogs data and inserted {insertedDeadSpaceSec:F3}s of dead space."
+            : $"Added {addedCount} boss attack{(addedCount == 1 ? string.Empty : "s")} from fetched FFLogs data.");
+    }
+
+    private List<BossTimelineEntry> BuildGeneratedBossAttackTimeline(AggregatedTimeline sourceTimeline)
+    {
+        var cachedBossParses = sourceTimeline.CachedFflogsParses
+            .Where(parse => parse.BossEntries.Count > 0)
+            .OrderBy(parse => parse.ParseIndex)
+            .ToList();
+        if (cachedBossParses.Count == 0)
+        {
+            return sourceTimeline.BossEntries
+                .Select(CloneBossTimelineEntry)
+                .ToList();
+        }
+
+        var phaseWindows = sourceTimeline.PhaseInfo != null &&
+                           sourceTimeline.EncounterId == sourceTimeline.PhaseInfo.EncounterId
+            ? BuildEncounterPhaseWindows(sourceTimeline.PhaseInfo)
+            : [];
+        if (phaseWindows.Count == 0)
+        {
+            return cachedBossParses
+                .OrderByDescending(parse => parse.DurationSec)
+                .ThenBy(parse => parse.ParseIndex)
+                .Select(parse => parse.BossEntries.Select(CloneBossTimelineEntry).ToList())
+                .FirstOrDefault()
+                ?? sourceTimeline.BossEntries.Select(CloneBossTimelineEntry).ToList();
+        }
+
+        var stitchedBossEntries = new List<BossTimelineEntry>();
+        var cumulativeOffsetSec = 0.0;
+
+        foreach (var phaseWindow in phaseWindows)
+        {
+            CachedFflogsParseTimeline? bestParse = null;
+            EncounterPhaseWindow? bestParseWindow = null;
+            double bestPhaseDurationSec = double.NegativeInfinity;
+
+            foreach (var parse in cachedBossParses)
+            {
+                var parseWindow = BuildEncounterPhaseWindows(parse.PhaseInfo ?? sourceTimeline.PhaseInfo)
+                    .FirstOrDefault(window => window.Ordinal == phaseWindow.Ordinal);
+                if (parseWindow == null)
+                    continue;
+
+                var phaseDurationSec = Math.Max(0.0, (parseWindow.EndMs - parseWindow.StartMs) / 1000.0);
+                if (phaseDurationSec <= bestPhaseDurationSec)
+                    continue;
+
+                bestParse = parse;
+                bestParseWindow = parseWindow;
+                bestPhaseDurationSec = phaseDurationSec;
+            }
+
+            if (bestParse == null || bestParseWindow == null)
+                continue;
+
+            var phaseEntries = SlicePhaseBossEntries(bestParse.BossEntries, bestParseWindow)
+                .Select(entry =>
+                {
+                    var clone = CloneBossTimelineEntry(entry);
+                    clone.CastStartSec = Math.Round(clone.CastStartSec + cumulativeOffsetSec, 3, MidpointRounding.AwayFromZero);
+                    clone.CastEndSec = Math.Round(clone.CastEndSec + cumulativeOffsetSec, 3, MidpointRounding.AwayFromZero);
+                    return clone;
+                });
+            stitchedBossEntries.AddRange(phaseEntries);
+            cumulativeOffsetSec += bestPhaseDurationSec;
+        }
+
+        return stitchedBossEntries.Count > 0
+            ? stitchedBossEntries
+            : sourceTimeline.BossEntries.Select(CloneBossTimelineEntry).ToList();
+    }
+
+    private static List<BossTimelineEntry> BuildSingleParseBossAttackTimeline(AggregatedTimeline sourceTimeline)
+    {
+        var parseBossEntries = sourceTimeline.CachedFflogsParses
+            .OrderBy(parse => parse.ParseIndex)
+            .Select(parse => parse.BossEntries)
+            .FirstOrDefault(entries => entries.Count > 0);
+        if (parseBossEntries != null)
+            return parseBossEntries.Select(CloneBossTimelineEntry).ToList();
+
+        return sourceTimeline.BossEntries
+            .Select(CloneBossTimelineEntry)
+            .ToList();
+    }
+
+    private int MergeGeneratedBossAttacksIntoTimeline(
+        AggregatedTimeline targetTimeline,
+        IReadOnlyList<BossTimelineEntry> sourceBossEntries,
+        out double insertedDeadSpaceSec)
+    {
+        insertedDeadSpaceSec = 0.0;
+
+        var orderedTargetBossEntries = targetTimeline.BossEntries
+            .OrderBy(entry => entry.CastStartSec)
+            .ThenBy(entry => entry.AbilityName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var orderedSourceBossEntries = sourceBossEntries
+            .OrderBy(entry => entry.CastStartSec)
+            .ThenBy(entry => entry.AbilityName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var matches = MatchBossEntriesInOrder(orderedTargetBossEntries, orderedSourceBossEntries);
+
+        targetTimeline.DeadSpaceRanges.Clear();
+
+        if (matches.Count > 1)
+        {
+            for (var matchIndex = 1; matchIndex < matches.Count; matchIndex++)
+            {
+                var previousTargetEntry = orderedTargetBossEntries[matches[matchIndex - 1].TargetIndex];
+                var currentTargetEntry = orderedTargetBossEntries[matches[matchIndex].TargetIndex];
+                var previousSourceEntry = orderedSourceBossEntries[matches[matchIndex - 1].SourceIndex];
+                var currentSourceEntry = orderedSourceBossEntries[matches[matchIndex].SourceIndex];
+                var existingIntervalSec = currentTargetEntry.CastStartSec - previousTargetEntry.CastStartSec;
+                var sourceIntervalSec = currentSourceEntry.CastStartSec - previousSourceEntry.CastStartSec;
+                var deltaSec = Math.Round(sourceIntervalSec - existingIntervalSec, 3, MidpointRounding.AwayFromZero);
+                if (deltaSec <= 0.0005)
+                    continue;
+
+                var insertionBoundarySec = currentTargetEntry.CastStartSec;
+                ShiftTimelineAfter(targetTimeline, insertionBoundarySec, deltaSec);
+                targetTimeline.DeadSpaceRanges.Add(new DeadSpaceRange
+                {
+                    StartSec = insertionBoundarySec,
+                    EndSec = insertionBoundarySec + deltaSec,
+                });
+                insertedDeadSpaceSec += deltaSec;
+            }
+
+            targetTimeline.DeadSpaceRanges = MergeDeadSpaceRanges(targetTimeline.DeadSpaceRanges);
+        }
+
+        var matchedSourceIndices = matches
+            .Select(match => match.SourceIndex)
+            .ToHashSet();
+        var addedCount = 0;
+
+        for (var sourceIndex = 0; sourceIndex < orderedSourceBossEntries.Count; sourceIndex++)
+        {
+            if (matchedSourceIndices.Contains(sourceIndex))
+                continue;
+
+            var sourceEntry = orderedSourceBossEntries[sourceIndex];
+            var resolvedStartSec = ResolveInsertedBossEntryTime(orderedTargetBossEntries, orderedSourceBossEntries, matches, sourceIndex);
+            var durationSec = Math.Max(0.0, sourceEntry.CastEndSec - sourceEntry.CastStartSec);
+            if (targetTimeline.BossEntries.Any(existingEntry =>
+                    BossEntriesMatchForStitching(existingEntry, sourceEntry) &&
+                    Math.Abs(existingEntry.CastStartSec - resolvedStartSec) <= 0.05))
+            {
+                continue;
+            }
+
+            targetTimeline.BossEntries.Add(new BossTimelineEntry
+            {
+                AbilityId = sourceEntry.AbilityId,
+                AbilityName = sourceEntry.AbilityName,
+                SourceId = sourceEntry.SourceId,
+                IsPrimaryBoss = sourceEntry.IsPrimaryBoss,
+                CastStartSec = Math.Round(resolvedStartSec, 3, MidpointRounding.AwayFromZero),
+                CastEndSec = Math.Round(resolvedStartSec + durationSec, 3, MidpointRounding.AwayFromZero),
+            });
+            addedCount++;
+        }
+
+        targetTimeline.BossEntries = targetTimeline.BossEntries
+            .OrderBy(entry => entry.CastStartSec)
+            .ThenBy(entry => entry.AbilityName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return addedCount;
+    }
+
+    private static List<(int TargetIndex, int SourceIndex)> MatchBossEntriesInOrder(
+        IReadOnlyList<BossTimelineEntry> targetEntries,
+        IReadOnlyList<BossTimelineEntry> sourceEntries)
+    {
+        var matches = new List<(int TargetIndex, int SourceIndex)>();
+        var nextSourceIndex = 0;
+
+        for (var targetIndex = 0; targetIndex < targetEntries.Count; targetIndex++)
+        {
+            for (var sourceIndex = nextSourceIndex; sourceIndex < sourceEntries.Count; sourceIndex++)
+            {
+                if (!BossEntriesMatchForStitching(targetEntries[targetIndex], sourceEntries[sourceIndex]))
+                    continue;
+
+                matches.Add((targetIndex, sourceIndex));
+                nextSourceIndex = sourceIndex + 1;
+                break;
+            }
+        }
+
+        return matches;
+    }
+
+    private static bool BossEntriesMatchForStitching(BossTimelineEntry left, BossTimelineEntry right)
+    {
+        if (left.AbilityId > 0 && right.AbilityId > 0 && left.AbilityId == right.AbilityId)
+            return true;
+
+        return string.Equals(
+            NormalizeImportedAbilityName(left.AbilityName),
+            NormalizeImportedAbilityName(right.AbilityName),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void ShiftTimelineAfter(AggregatedTimeline timeline, double boundarySec, double deltaSec)
+    {
+        foreach (var entry in timeline.Entries.Where(entry => entry.TimeOffsetSec >= boundarySec))
+            entry.TimeOffsetSec = Math.Round(entry.TimeOffsetSec + deltaSec, 3, MidpointRounding.AwayFromZero);
+
+        foreach (var bossEntry in timeline.BossEntries.Where(entry => entry.CastStartSec >= boundarySec))
+        {
+            bossEntry.CastStartSec = Math.Round(bossEntry.CastStartSec + deltaSec, 3, MidpointRounding.AwayFromZero);
+            bossEntry.CastEndSec = Math.Round(bossEntry.CastEndSec + deltaSec, 3, MidpointRounding.AwayFromZero);
+        }
+    }
+
+    private static double ResolveInsertedBossEntryTime(
+        IReadOnlyList<BossTimelineEntry> targetEntries,
+        IReadOnlyList<BossTimelineEntry> sourceEntries,
+        IReadOnlyList<(int TargetIndex, int SourceIndex)> matches,
+        int sourceIndex)
+    {
+        var previousMatchIndex = -1;
+        for (var matchIndex = matches.Count - 1; matchIndex >= 0; matchIndex--)
+        {
+            if (matches[matchIndex].SourceIndex >= sourceIndex)
+                continue;
+
+            previousMatchIndex = matchIndex;
+            break;
+        }
+
+        if (previousMatchIndex >= 0)
+        {
+            var previousMatch = matches[previousMatchIndex];
+            var previousTargetEntry = targetEntries[previousMatch.TargetIndex];
+            var previousSourceEntry = sourceEntries[previousMatch.SourceIndex];
+            return previousTargetEntry.CastStartSec + (sourceEntries[sourceIndex].CastStartSec - previousSourceEntry.CastStartSec);
+        }
+
+        for (var matchIndex = 0; matchIndex < matches.Count; matchIndex++)
+        {
+            if (matches[matchIndex].SourceIndex <= sourceIndex)
+                continue;
+
+            var nextMatch = matches[matchIndex];
+            var nextTargetEntry = targetEntries[nextMatch.TargetIndex];
+            var nextSourceEntry = sourceEntries[nextMatch.SourceIndex];
+            return nextTargetEntry.CastStartSec - (nextSourceEntry.CastStartSec - sourceEntries[sourceIndex].CastStartSec);
+        }
+
+        return sourceEntries[sourceIndex].CastStartSec;
+    }
+
+    private static List<DeadSpaceRange> MergeDeadSpaceRanges(IEnumerable<DeadSpaceRange> ranges)
+    {
+        var orderedRanges = ranges
+            .Where(range => range.EndSec > range.StartSec)
+            .OrderBy(range => range.StartSec)
+            .ToList();
+        if (orderedRanges.Count == 0)
+            return [];
+
+        var mergedRanges = new List<DeadSpaceRange> { CloneDeadSpaceRange(orderedRanges[0]) };
+        for (var rangeIndex = 1; rangeIndex < orderedRanges.Count; rangeIndex++)
+        {
+            var currentRange = orderedRanges[rangeIndex];
+            var lastRange = mergedRanges[^1];
+            if (currentRange.StartSec <= lastRange.EndSec + 0.0005)
+            {
+                lastRange.EndSec = Math.Max(lastRange.EndSec, currentRange.EndSec);
+                continue;
+            }
+
+            mergedRanges.Add(CloneDeadSpaceRange(currentRange));
+        }
+
+        return mergedRanges;
     }
 
     private void ImportBossAttacksFromCsvClipboard(AggregatedTimeline targetTimeline)
@@ -9576,6 +9966,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
 
         var removedCount = targetTimeline.BossEntries.Count;
         targetTimeline.BossEntries.Clear();
+        targetTimeline.DeadSpaceRanges.Clear();
         if (editingEntryIsBoss)
             editingEntryIndex = -1;
         MarkCustomEditorModified();
@@ -9672,7 +10063,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                     code,
                     fight.Id,
                     ct);
-                var bossEntries = plugin.Aggregator.AggregateBossEvents(rawBossEvents);
+                var bossEntries = plugin.Aggregator.AggregateBossEvents(rawBossEvents, CreateFightPhaseInfo(fight));
 
                 var timeline = BuildImportedTimeline(
                     fight,
@@ -9750,14 +10141,18 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         var customTimeline = CloneTimeline(sourceTimeline);
         customTimeline.Entries = [];
         customTimeline.AutoTimelineSourceEntries = rawSourceEntries;
+        customTimeline.BossEntries = BuildSingleParseBossAttackTimeline(sourceTimeline);
+        customTimeline.DeadSpaceRanges.Clear();
         ApplyAutoTimeline(customTimeline);
-
-        plugin.CustomTimelineStore.SaveTimeline(plugin.Configuration, fullTimelineKey, customTimeline);
         RemoveStoredCustomPhaseTimelines(encounter.Id, specName);
 
         var phaseWindows = customPhaseWindows?.Count > 0
             ? customPhaseWindows.ToList()
             : BuildEncounterPhaseWindows(sourceTimeline.PhaseInfo);
+        if (!createPerPhaseTimelines)
+            GenerateBossAttacksFromFetchedLogs(customTimeline, sourceTimeline);
+
+        plugin.CustomTimelineStore.SaveTimeline(plugin.Configuration, fullTimelineKey, customTimeline);
         if (createPerPhaseTimelines)
         {
             foreach (var phaseWindow in phaseWindows)
@@ -9765,6 +10160,14 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 var phaseTimeline = BuildPhaseTimelineFromBuiltTimeline(encounter.Id, customTimeline, phaseWindow);
                 if (phaseTimeline == null)
                     continue;
+
+                var phaseSourceTimeline = BuildPhaseScopedTimeline(sourceTimeline, phaseWindow);
+                if (phaseSourceTimeline != null)
+                {
+                    phaseTimeline.BossEntries = BuildSingleParseBossAttackTimeline(phaseSourceTimeline);
+                    phaseTimeline.DeadSpaceRanges.Clear();
+                    GenerateBossAttacksFromFetchedLogs(phaseTimeline, phaseSourceTimeline);
+                }
 
                 var phaseKey = BuildCustomTimelineSaveKey(encounter.Id, specName, phaseWindow);
                 plugin.CustomTimelineStore.SaveTimeline(plugin.Configuration, phaseKey, phaseTimeline);
@@ -10154,6 +10557,9 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                     RankingAmount = parse.RankingAmount,
                     DurationSec = Math.Max(0.0, endSec - startSec),
                     Entries = scopedEntries,
+                    BossEntries = parsePhaseWindow == null
+                        ? parse.BossEntries.Select(CloneBossTimelineEntry).ToList()
+                        : SlicePhaseBossEntries(parse.BossEntries, parsePhaseWindow),
                     PhaseInfo = CloneFightPhaseInfo(parse.PhaseInfo ?? sourceTimeline.PhaseInfo),
                     HasVisiblePhaseEntries = hasVisiblePhaseEntries,
                 };
@@ -10171,6 +10577,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         scopedTimeline.AutoTimelineSourceEntries = [];
         scopedTimeline.Entries = [];
         scopedTimeline.BossEntries = SlicePhaseBossEntries(sourceTimeline.BossEntries, phaseWindow);
+        scopedTimeline.DeadSpaceRanges = SlicePhaseDeadSpaceRanges(sourceTimeline.DeadSpaceRanges, phaseWindow);
         scopedTimeline.PhaseInfo = CloneFightPhaseInfo(sourceTimeline.PhaseInfo);
         return scopedTimeline;
     }
@@ -10213,12 +10620,16 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                     Entries = entries
                         .Select(CloneTimelineEntry)
                         .ToList(),
+                    BossEntries = phaseWindow == null
+                        ? bossEntries.Select(CloneBossTimelineEntry).ToList()
+                        : SlicePhaseBossEntries(bossEntries, phaseWindow),
                     PhaseInfo = CloneFightPhaseInfo(CreateFightPhaseInfo(fight)),
                 }
             ],
             BossEntries = phaseWindow == null
                 ? bossEntries.Select(CloneBossTimelineEntry).ToList()
                 : SlicePhaseBossEntries(bossEntries, phaseWindow),
+            DeadSpaceRanges = [],
             PhaseInfo = CloneFightPhaseInfo(CreateFightPhaseInfo(fight)),
         };
     }
@@ -10297,6 +10708,30 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 AbilityName = entry.AbilityName,
                 CastStartSec = Math.Max(0.0, entry.CastStartSec - startSec),
                 CastEndSec = Math.Max(0.0, entry.CastEndSec - startSec),
+                SourceId = entry.SourceId,
+                IsPrimaryBoss = entry.IsPrimaryBoss,
+            })
+            .ToList();
+    }
+
+    private static List<DeadSpaceRange> SlicePhaseDeadSpaceRanges(
+        IEnumerable<DeadSpaceRange> deadSpaceRanges,
+        EncounterPhaseWindow window)
+    {
+        var startSec = window.StartMs / 1000.0;
+        var endSec = window.EndMs / 1000.0;
+
+        return deadSpaceRanges
+            .Select(range => new DeadSpaceRange
+            {
+                StartSec = Math.Max(startSec, range.StartSec),
+                EndSec = Math.Min(endSec, range.EndSec),
+            })
+            .Where(range => range.EndSec > range.StartSec)
+            .Select(range => new DeadSpaceRange
+            {
+                StartSec = Math.Max(0.0, range.StartSec - startSec),
+                EndSec = Math.Max(0.0, range.EndSec - startSec),
             })
             .ToList();
     }
@@ -10337,6 +10772,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         phaseTimeline.Entries = phaseEntries;
         phaseTimeline.AutoTimelineSourceEntries = SlicePhaseTimelineEntries(builtTimeline.AutoTimelineSourceEntries, phaseWindow);
         phaseTimeline.BossEntries = SlicePhaseBossEntries(builtTimeline.BossEntries, phaseWindow);
+        phaseTimeline.DeadSpaceRanges = SlicePhaseDeadSpaceRanges(builtTimeline.DeadSpaceRanges, phaseWindow);
         phaseTimeline.PhaseInfo = CloneFightPhaseInfo(builtTimeline.PhaseInfo);
         return phaseTimeline;
     }
@@ -11616,7 +12052,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             updateProgress = 0.1f;
 
             var semaphore = new SemaphoreSlim(MaxConcurrency);
-            var parseResults = new List<(CastEventsResult Result, RankingEntry Ranking)>();
+            var parseResults = new List<(CastEventsResult Result, RankingEntry Ranking, List<BossTimelineEntry> BossEntries)>();
             var parseLock = new object();
             var completedParses = 0;
             var skippedParses = 0;
@@ -11635,9 +12071,11 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
 
                     if (parseResult.Casts.Count > 0)
                     {
+                        var bossRaw = await client.GetBossCastEventsAsync(ranking.ReportCode, ranking.FightId, ct);
+                        var bossEntries = aggregator.AggregateBossEvents(bossRaw, parseResult.PhaseInfo);
                         lock (parseLock)
                         {
-                            parseResults.Add((parseResult, ranking));
+                            parseResults.Add((parseResult, ranking, bossEntries));
                         }
                     }
                 }
@@ -11677,7 +12115,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 var cachedParseTimelines = new List<CachedFflogsParseTimeline>();
                 var parseIndex = 1;
 
-                foreach (var (result, ranking) in orderedParseResults)
+                foreach (var (result, ranking, bossEntries) in orderedParseResults)
                 {
                     if (result.Casts.Count == 0)
                         continue;
@@ -11692,37 +12130,27 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                         RankingAmount = ranking.Amount,
                         DurationSec = fightEnd / 1000.0,
                         Entries = BuildExactTimelineEntries(result.Casts),
+                        BossEntries = bossEntries
+                            .Select(CloneBossTimelineEntry)
+                            .ToList(),
                         PhaseInfo = CloneFightPhaseInfo(result.PhaseInfo),
                     });
                 }
 
-                // Fetch boss events from the first successful parse (boss mechanics are deterministic)
-                var bossEntries = new List<BossTimelineEntry>();
-                if (orderedParseResults.Count > 0)
-                {
-                    try
-                    {
-                        updateStatus = "Fetching boss attack timeline...";
-                        var bossRaw = await client.GetBossCastEventsAsync(
-                            orderedParseResults[0].Ranking.ReportCode,
-                            orderedParseResults[0].Ranking.FightId,
-                            ct);
-                        bossEntries = aggregator.AggregateBossEvents(bossRaw);
-                        log.Info("Boss timeline: {0} entries.", bossEntries.Count);
-                    }
-                    catch (Exception ex)
-                    {
-                        log.Warning("Boss events fetch failed (non-fatal): {0}", ex.Message);
-                    }
-                }
-
                 var timeline = aggregator.Aggregate(
                     encounter.Id, encounter.Name, specName, parseData);
-                timeline.BossEntries = bossEntries;
                 timeline.CachedFflogsParses = cachedParseTimelines
                     .OrderBy(parse => parse.ParseIndex)
                     .ToList();
                 timeline.PhaseInfo = CloneFightPhaseInfo(samplePhaseInfo);
+                timeline.BossEntries = BuildGeneratedBossAttackTimeline(timeline);
+                log.Info("Boss timeline: {0} entries.", timeline.BossEntries.Count);
+                timeline.AverageDurationMs = Math.Max(
+                    timeline.AverageDurationMs,
+                    timeline.BossEntries
+                        .Select(entry => Math.Max(entry.CastStartSec, entry.CastEndSec))
+                        .DefaultIfEmpty(0.0)
+                        .Max() * 1000.0);
                 RefreshTimelineRuntimeMetadata(timeline);
                 store.SaveTimeline(timeline);
                 InvalidateAutoTimelineSkillFilterCache();
@@ -11796,7 +12224,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             updateProgress = 0.1f;
 
             var semaphore = new SemaphoreSlim(MaxConcurrency);
-            var parseResults = new List<(CastEventsResult Result, RankingEntry Ranking)>();
+            var parseResults = new List<(CastEventsResult Result, RankingEntry Ranking, List<BossTimelineEntry> BossEntries)>();
             var parseLock = new object();
             var completedParses = 0;
             var skippedParses = 0;
@@ -11815,9 +12243,11 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
 
                     if (parseResult.Casts.Count > 0)
                     {
+                        var bossRaw = await client.GetBossCastEventsAsync(ranking.ReportCode, ranking.FightId, ct);
+                        var bossEntries = aggregator.AggregateBossEvents(bossRaw, parseResult.PhaseInfo);
                         lock (parseLock)
                         {
-                            parseResults.Add((parseResult, ranking));
+                            parseResults.Add((parseResult, ranking, bossEntries));
                         }
                     }
                 }
@@ -11862,22 +12292,6 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 .FirstOrDefault(phaseInfo => phaseInfo != null);
             var phaseWindows = BuildEncounterPhaseWindows(samplePhaseInfo);
 
-            var bossEntries = new List<BossTimelineEntry>();
-            try
-            {
-                updateStatus = "Fetching boss attack timeline...";
-                var bossRaw = await client.GetBossCastEventsAsync(
-                    orderedParseResults[0].Ranking.ReportCode,
-                    orderedParseResults[0].Ranking.FightId,
-                    ct);
-                bossEntries = aggregator.AggregateBossEvents(bossRaw);
-                log.Info("Boss timeline: {0} entries.", bossEntries.Count);
-            }
-            catch (Exception ex)
-            {
-                log.Warning("Boss events fetch failed (non-fatal): {0}", ex.Message);
-            }
-
             if (phaseWindows.Count > 1)
             {
                 foreach (var phaseWindow in phaseWindows)
@@ -11886,7 +12300,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                     var phaseCachedParseTimelines = new List<CachedFflogsParseTimeline>();
                     var parseIndex = 1;
 
-                        foreach (var (result, ranking) in orderedParseResults)
+                        foreach (var (result, ranking, bossEntries) in orderedParseResults)
                         {
                             var parsePhaseWindow = BuildEncounterPhaseWindows(result.PhaseInfo)
                                 .FirstOrDefault(window => window.Ordinal == phaseWindow.Ordinal);
@@ -11902,13 +12316,15 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                                 phaseCasts.Max(cast => cast.Timestamp));
                             phaseParseData.Add((phaseCasts, 0, phaseDurationMs));
                             phaseCachedParseTimelines.Add(new CachedFflogsParseTimeline
-                        {
+                            {
                             ParseIndex = parseIndex++,
                             ReportCode = ranking.ReportCode,
                             FightId = ranking.FightId,
                             RankingAmount = ranking.Amount,
                             DurationSec = phaseDurationMs / 1000.0,
                             Entries = BuildExactTimelineEntries(phaseCasts),
+                            BossEntries = SlicePhaseBossEntries(bossEntries, parsePhaseWindow),
+                            PhaseInfo = CloneFightPhaseInfo(result.PhaseInfo),
                         });
                     }
 
@@ -11922,8 +12338,15 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                         phaseEncounterName,
                         specName,
                         phaseParseData);
-                    phaseTimeline.BossEntries = SlicePhaseBossEntries(bossEntries, phaseWindow);
                     phaseTimeline.CachedFflogsParses = phaseCachedParseTimelines;
+                    phaseTimeline.PhaseInfo = CloneFightPhaseInfo(samplePhaseInfo);
+                    phaseTimeline.BossEntries = BuildGeneratedBossAttackTimeline(phaseTimeline);
+                    phaseTimeline.AverageDurationMs = Math.Max(
+                        phaseTimeline.AverageDurationMs,
+                        phaseTimeline.BossEntries
+                            .Select(entry => Math.Max(entry.CastStartSec, entry.CastEndSec))
+                            .DefaultIfEmpty(0.0)
+                            .Max() * 1000.0);
                     RefreshTimelineRuntimeMetadata(phaseTimeline);
                     store.SaveTimeline(phaseTimeline);
                     InvalidateAutoTimelineSkillFilterCache();
@@ -11938,7 +12361,7 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 var cachedParseTimelines = new List<CachedFflogsParseTimeline>();
                 var parseIndex = 1;
 
-                foreach (var (result, ranking) in orderedParseResults)
+                foreach (var (result, ranking, bossEntries) in orderedParseResults)
                 {
                     var fightEnd = result.Casts.Max(cast => cast.Timestamp);
                     parseData.Add((result.Casts, 0, fightEnd));
@@ -11950,6 +12373,10 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                         RankingAmount = ranking.Amount,
                         DurationSec = fightEnd / 1000.0,
                         Entries = BuildExactTimelineEntries(result.Casts),
+                        BossEntries = bossEntries
+                            .Select(CloneBossTimelineEntry)
+                            .ToList(),
+                        PhaseInfo = CloneFightPhaseInfo(result.PhaseInfo),
                     });
                 }
 
@@ -11958,8 +12385,15 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                     encounter.Name,
                     specName,
                     parseData);
-                timeline.BossEntries = bossEntries;
                 timeline.CachedFflogsParses = cachedParseTimelines;
+                timeline.PhaseInfo = CloneFightPhaseInfo(samplePhaseInfo);
+                timeline.BossEntries = BuildGeneratedBossAttackTimeline(timeline);
+                timeline.AverageDurationMs = Math.Max(
+                    timeline.AverageDurationMs,
+                    timeline.BossEntries
+                        .Select(entry => Math.Max(entry.CastStartSec, entry.CastEndSec))
+                        .DefaultIfEmpty(0.0)
+                        .Max() * 1000.0);
                 RefreshTimelineRuntimeMetadata(timeline);
                 store.SaveTimeline(timeline);
                 InvalidateAutoTimelineSkillFilterCache();
@@ -12063,6 +12497,9 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
                 RankingAmount = parse.RankingAmount,
                 DurationSec = parse.DurationSec,
                 Entries = FilterCopiedTimelineEntries(parse.Entries),
+                BossEntries = parse.BossEntries
+                    .Select(CloneBossTimelineEntry)
+                    .ToList(),
             })
             .Where(parse => parse.Entries.Count > 0)
             .ToList();
@@ -12878,6 +13315,9 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             BossEntries = tl.BossEntries
                 .Select(CloneBossTimelineEntry)
                 .ToList(),
+            DeadSpaceRanges = tl.DeadSpaceRanges
+                .Select(CloneDeadSpaceRange)
+                .ToList(),
             PhaseInfo = CloneFightPhaseInfo(tl.PhaseInfo),
         };
     }
@@ -12893,6 +13333,9 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             DurationSec = parse.DurationSec,
             Entries = parse.Entries
                 .Select(CloneTimelineEntry)
+                .ToList(),
+            BossEntries = parse.BossEntries
+                .Select(CloneBossTimelineEntry)
                 .ToList(),
             PhaseInfo = CloneFightPhaseInfo(parse.PhaseInfo),
             HasVisiblePhaseEntries = parse.HasVisiblePhaseEntries,
@@ -12921,6 +13364,17 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             AbilityName = entry.AbilityName,
             CastStartSec = entry.CastStartSec,
             CastEndSec = entry.CastEndSec,
+            SourceId = entry.SourceId,
+            IsPrimaryBoss = entry.IsPrimaryBoss,
+        };
+    }
+
+    private static DeadSpaceRange CloneDeadSpaceRange(DeadSpaceRange range)
+    {
+        return new DeadSpaceRange
+        {
+            StartSec = range.StartSec,
+            EndSec = range.EndSec,
         };
     }
 
