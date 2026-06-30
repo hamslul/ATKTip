@@ -9583,7 +9583,11 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
         }
         else
         {
-            addedCount = MergeGeneratedBossAttacksIntoTimeline(targetTimeline, stitchedBossEntries, out insertedDeadSpaceSec);
+            addedCount = MergeGeneratedBossAttacksIntoTimeline(
+                targetTimeline,
+                stitchedBossEntries,
+                sourceTimeline.PhaseInfo,
+                out insertedDeadSpaceSec);
         }
 
         var maxBossTimeSec = targetTimeline.BossEntries
@@ -9696,9 +9700,20 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
     private int MergeGeneratedBossAttacksIntoTimeline(
         AggregatedTimeline targetTimeline,
         IReadOnlyList<BossTimelineEntry> sourceBossEntries,
+        FightPhaseInfo? sourcePhaseInfo,
         out double insertedDeadSpaceSec)
     {
         insertedDeadSpaceSec = 0.0;
+
+        if (TryMergeGeneratedBossAttacksByPhaseAnchors(
+                targetTimeline,
+                sourceBossEntries,
+                sourcePhaseInfo,
+                out var phaseAwareAddedCount,
+                out insertedDeadSpaceSec))
+        {
+            return phaseAwareAddedCount;
+        }
 
         var orderedTargetBossEntries = targetTimeline.BossEntries
             .OrderBy(entry => entry.CastStartSec)
@@ -9739,36 +9754,46 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             targetTimeline.DeadSpaceRanges = MergeDeadSpaceRanges(targetTimeline.DeadSpaceRanges);
         }
 
-        var matchedSourceIndices = matches
-            .Select(match => match.SourceIndex)
-            .ToHashSet();
         var addedCount = 0;
-
-        for (var sourceIndex = 0; sourceIndex < orderedSourceBossEntries.Count; sourceIndex++)
+        if (matches.Count < 2)
         {
-            if (matchedSourceIndices.Contains(sourceIndex))
-                continue;
+            targetTimeline.BossEntries = targetTimeline.BossEntries
+                .OrderBy(entry => entry.CastStartSec)
+                .ThenBy(entry => entry.AbilityName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            return 0;
+        }
 
-            var sourceEntry = orderedSourceBossEntries[sourceIndex];
-            var resolvedStartSec = ResolveInsertedBossEntryTime(orderedTargetBossEntries, orderedSourceBossEntries, matches, sourceIndex);
-            var durationSec = Math.Max(0.0, sourceEntry.CastEndSec - sourceEntry.CastStartSec);
-            if (targetTimeline.BossEntries.Any(existingEntry =>
-                    BossEntriesMatchForStitching(existingEntry, sourceEntry) &&
-                    Math.Abs(existingEntry.CastStartSec - resolvedStartSec) <= 0.05))
+        for (var matchIndex = 1; matchIndex < matches.Count; matchIndex++)
+        {
+            var previousMatch = matches[matchIndex - 1];
+            var currentMatch = matches[matchIndex];
+            var previousTargetEntry = orderedTargetBossEntries[previousMatch.TargetIndex];
+            var previousSourceEntry = orderedSourceBossEntries[previousMatch.SourceIndex];
+
+            for (var sourceIndex = previousMatch.SourceIndex + 1; sourceIndex < currentMatch.SourceIndex; sourceIndex++)
             {
-                continue;
+                var sourceEntry = orderedSourceBossEntries[sourceIndex];
+                var resolvedStartSec = previousTargetEntry.CastStartSec + (sourceEntry.CastStartSec - previousSourceEntry.CastStartSec);
+                var durationSec = Math.Max(0.0, sourceEntry.CastEndSec - sourceEntry.CastStartSec);
+                if (targetTimeline.BossEntries.Any(existingEntry =>
+                        BossEntriesMatchForStitching(existingEntry, sourceEntry) &&
+                        Math.Abs(existingEntry.CastStartSec - resolvedStartSec) <= 0.05))
+                {
+                    continue;
+                }
+
+                targetTimeline.BossEntries.Add(new BossTimelineEntry
+                {
+                    AbilityId = sourceEntry.AbilityId,
+                    AbilityName = sourceEntry.AbilityName,
+                    SourceId = sourceEntry.SourceId,
+                    IsPrimaryBoss = sourceEntry.IsPrimaryBoss,
+                    CastStartSec = Math.Round(resolvedStartSec, 3, MidpointRounding.AwayFromZero),
+                    CastEndSec = Math.Round(resolvedStartSec + durationSec, 3, MidpointRounding.AwayFromZero),
+                });
+                addedCount++;
             }
-
-            targetTimeline.BossEntries.Add(new BossTimelineEntry
-            {
-                AbilityId = sourceEntry.AbilityId,
-                AbilityName = sourceEntry.AbilityName,
-                SourceId = sourceEntry.SourceId,
-                IsPrimaryBoss = sourceEntry.IsPrimaryBoss,
-                CastStartSec = Math.Round(resolvedStartSec, 3, MidpointRounding.AwayFromZero),
-                CastEndSec = Math.Round(resolvedStartSec + durationSec, 3, MidpointRounding.AwayFromZero),
-            });
-            addedCount++;
         }
 
         targetTimeline.BossEntries = targetTimeline.BossEntries
@@ -9776,6 +9801,145 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
             .ThenBy(entry => entry.AbilityName, StringComparer.OrdinalIgnoreCase)
             .ToList();
         return addedCount;
+    }
+
+    private bool TryMergeGeneratedBossAttacksByPhaseAnchors(
+        AggregatedTimeline targetTimeline,
+        IReadOnlyList<BossTimelineEntry> sourceBossEntries,
+        FightPhaseInfo? sourcePhaseInfo,
+        out int addedCount,
+        out double insertedDeadSpaceSec)
+    {
+        addedCount = 0;
+        insertedDeadSpaceSec = 0.0;
+
+        var phaseWindows = BuildEncounterPhaseWindows(sourcePhaseInfo);
+        if (phaseWindows.Count < 2)
+            return false;
+
+        var phaseAnchors = phaseWindows
+            .Select(window =>
+            {
+                var phaseEntries = sourceBossEntries
+                    .Where(entry =>
+                    {
+                        var startSec = window.StartMs / 1000.0;
+                        var endSec = window.EndMs / 1000.0;
+                        return entry.CastStartSec >= startSec && entry.CastStartSec < endSec;
+                    })
+                    .OrderBy(entry => entry.CastStartSec)
+                    .ThenBy(entry => entry.AbilityName, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (phaseEntries.Count == 0)
+                    return null;
+
+                var anchor = phaseEntries.FirstOrDefault(entry => entry.IsPrimaryBoss) ?? phaseEntries[0];
+                return new PhaseBossAnchor
+                {
+                    Window = window,
+                    Anchor = anchor,
+                    Entries = phaseEntries,
+                };
+            })
+            .Where(phase => phase != null)
+            .Cast<PhaseBossAnchor>()
+            .ToList();
+        if (phaseAnchors.Count < 2)
+            return false;
+
+        var orderedTargetBossEntries = targetTimeline.BossEntries
+            .OrderBy(entry => entry.CastStartSec)
+            .ThenBy(entry => entry.AbilityName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var matchedPhaseAnchors = new List<(PhaseBossAnchor Phase, BossTimelineEntry TargetEntry)>();
+        var nextTargetIndex = 0;
+
+        foreach (var phaseAnchor in phaseAnchors)
+        {
+            BossTimelineEntry? matchedTargetEntry = null;
+            for (var targetIndex = nextTargetIndex; targetIndex < orderedTargetBossEntries.Count; targetIndex++)
+            {
+                if (!BossEntriesMatchForStitching(orderedTargetBossEntries[targetIndex], phaseAnchor.Anchor))
+                    continue;
+
+                matchedTargetEntry = orderedTargetBossEntries[targetIndex];
+                nextTargetIndex = targetIndex + 1;
+                break;
+            }
+
+            if (matchedTargetEntry != null)
+                matchedPhaseAnchors.Add((phaseAnchor, matchedTargetEntry));
+        }
+
+        if (matchedPhaseAnchors.Count < 2)
+            return false;
+
+        targetTimeline.DeadSpaceRanges.Clear();
+
+        for (var matchIndex = 1; matchIndex < matchedPhaseAnchors.Count; matchIndex++)
+        {
+            var previousMatch = matchedPhaseAnchors[matchIndex - 1];
+            var currentMatch = matchedPhaseAnchors[matchIndex];
+            var sourceIntervalSec = currentMatch.Phase.Anchor.CastStartSec - previousMatch.Phase.Anchor.CastStartSec;
+            var targetIntervalSec = currentMatch.TargetEntry.CastStartSec - previousMatch.TargetEntry.CastStartSec;
+            var deltaSec = Math.Round(sourceIntervalSec - targetIntervalSec, 3, MidpointRounding.AwayFromZero);
+            if (deltaSec <= 0.0005)
+                continue;
+
+            var insertionBoundarySec = currentMatch.TargetEntry.CastStartSec;
+            ShiftTimelineAfter(targetTimeline, insertionBoundarySec, deltaSec);
+            targetTimeline.DeadSpaceRanges.Add(new DeadSpaceRange
+            {
+                StartSec = insertionBoundarySec,
+                EndSec = insertionBoundarySec + deltaSec,
+            });
+            insertedDeadSpaceSec += deltaSec;
+        }
+
+        targetTimeline.DeadSpaceRanges = MergeDeadSpaceRanges(targetTimeline.DeadSpaceRanges);
+
+        foreach (var matchedPhase in matchedPhaseAnchors)
+        {
+            foreach (var sourceEntry in matchedPhase.Phase.Entries)
+            {
+                if (ReferenceEquals(sourceEntry, matchedPhase.Phase.Anchor))
+                    continue;
+
+                var resolvedStartSec = matchedPhase.TargetEntry.CastStartSec +
+                    (sourceEntry.CastStartSec - matchedPhase.Phase.Anchor.CastStartSec);
+                var durationSec = Math.Max(0.0, sourceEntry.CastEndSec - sourceEntry.CastStartSec);
+                if (targetTimeline.BossEntries.Any(existingEntry =>
+                        BossEntriesMatchForStitching(existingEntry, sourceEntry) &&
+                        Math.Abs(existingEntry.CastStartSec - resolvedStartSec) <= 0.05))
+                {
+                    continue;
+                }
+
+                targetTimeline.BossEntries.Add(new BossTimelineEntry
+                {
+                    AbilityId = sourceEntry.AbilityId,
+                    AbilityName = sourceEntry.AbilityName,
+                    SourceId = sourceEntry.SourceId,
+                    IsPrimaryBoss = sourceEntry.IsPrimaryBoss,
+                    CastStartSec = Math.Round(resolvedStartSec, 3, MidpointRounding.AwayFromZero),
+                    CastEndSec = Math.Round(resolvedStartSec + durationSec, 3, MidpointRounding.AwayFromZero),
+                });
+                addedCount++;
+            }
+        }
+
+        targetTimeline.BossEntries = targetTimeline.BossEntries
+            .OrderBy(entry => entry.CastStartSec)
+            .ThenBy(entry => entry.AbilityName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return true;
+    }
+
+    private sealed class PhaseBossAnchor
+    {
+        public required EncounterPhaseWindow Window { get; init; }
+        public required BossTimelineEntry Anchor { get; init; }
+        public required List<BossTimelineEntry> Entries { get; init; }
     }
 
     private static List<(int TargetIndex, int SourceIndex)> MatchBossEntriesInOrder(
