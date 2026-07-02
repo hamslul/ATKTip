@@ -5,8 +5,6 @@ using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Game.ClientState.Conditions;
-using Dalamud.Game.ClientState.Objects.Enums;
-using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Hooking;
 using Dalamud.Interface.Windowing;
 using Dalamud.Interface.Textures;
@@ -43,16 +41,7 @@ public sealed class OverlayWindow : Window, IDisposable
     /// Enabled by clicking the Config tab label 7 times in a row in the main window.
     /// </summary>
     public bool AutoExecuteEnabled { get; set; }
-    private readonly Dictionary<ulong, uint> observedBossCastIds = [];
-    private readonly Dictionary<uint, string?> bossActionNameCache = [];
     private readonly Dictionary<string, int> bossActionIdByNameCache = new(StringComparer.OrdinalIgnoreCase);
-    private double autoScrubLastResolvedBossTimeSec = double.NegativeInfinity;
-    private double autoScrubLastResolvedPrimaryBossTimeSec = double.NegativeInfinity;
-    private double autoScrubLastObservedElapsedSec = double.NegativeInfinity;
-    private double autoScrubLastSeekTimeSec = double.NaN;
-    private DateTime autoScrubLastSeekAtUtc = DateTime.MinValue;
-    private bool autoScrubWaitingForPrimaryBossCast;
-    private double autoScrubWaitingPrimaryBossTimeSec = double.NaN;
 
     // â”€â”€ ATR geometry constants (match ATR defaults exactly) â”€â”€
     // GCDHeightHigh / GCDHeightLow control the vertical extent of the GCD bar.
@@ -177,6 +166,14 @@ public sealed class OverlayWindow : Window, IDisposable
         public bool IsPast { get; set; }
     }
 
+    private sealed class OverlayPhaseMarker
+    {
+        public int Ordinal { get; init; }
+        public string DisplayName { get; init; } = string.Empty;
+        public double StartSec { get; init; }
+        public double EndSec { get; init; }
+    }
+
     private unsafe delegate void ReceiveActionEffectDelegate(
         uint casterEntityId,
         Character* casterPtr,
@@ -208,15 +205,6 @@ public sealed class OverlayWindow : Window, IDisposable
     private DateTime autoLastObservedBaseAtUtc = DateTime.MinValue;
     private double autoDisplayGcdTimeSec;
     private double autoDisplayOgcdTimeSec;
-
-    private sealed class ObservedBossCast
-    {
-        public uint AbilityId { get; init; }
-        public string AbilityName { get; init; } = string.Empty;
-        public ulong MaxHp { get; init; }
-        public ulong CurrentHp { get; init; }
-        public bool IsPrimaryBoss { get; init; }
-    }
 
     // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
@@ -292,13 +280,13 @@ public sealed class OverlayWindow : Window, IDisposable
     {
         activeTimeline    = timeline;
         activeTimelineKey = key;
+        plugin.EnemyCastTracker.SetActiveTimeline(timeline, key);
         if (resetDismissed)
             overlayDismissed = false;      // fresh load â€” re-enable ants and auto-exec
         antsArmed         = false;
         skillVisibility.Clear();
         oGcdCache.Clear();
         ResetAutoRuntimeState();
-        ResetAutoScrubState();
         InvalidateTimelineCaches();
 
         if (timeline != null)
@@ -630,6 +618,7 @@ public sealed class OverlayWindow : Window, IDisposable
     public void ClearForZoneChange()
     {
         SetTimeline(null, string.Empty);
+        plugin.EnemyCastTracker.NotifyZoneChange();
         manualOverlayActive = false;
         antsArmed         = false;
         isPreview        = false;
@@ -718,18 +707,6 @@ public sealed class OverlayWindow : Window, IDisposable
         awaitingManualPhaseStart = false;
     }
 
-    private void ResetAutoScrubState()
-    {
-        observedBossCastIds.Clear();
-        autoScrubLastResolvedBossTimeSec = double.NegativeInfinity;
-        autoScrubLastResolvedPrimaryBossTimeSec = double.NegativeInfinity;
-        autoScrubLastObservedElapsedSec = double.NegativeInfinity;
-        autoScrubLastSeekTimeSec = double.NaN;
-        autoScrubLastSeekAtUtc = DateTime.MinValue;
-        autoScrubWaitingForPrimaryBossCast = false;
-        autoScrubWaitingPrimaryBossTimeSec = double.NaN;
-    }
-
     private void SeekTimelineToTime(double timeSec)
     {
         var fightDur = activeTimeline?.AverageDurationMs / 1000.0 ?? 0.0;
@@ -746,275 +723,12 @@ public sealed class OverlayWindow : Window, IDisposable
             combatStartTime = DateTime.UtcNow - TimeSpan.FromSeconds(clampedTime);
     }
 
-    private void ProcessAutoScrub()
+    public void ApplyEnemyCastAlignment(double timeSec)
     {
-        if (activeTimeline == null ||
-            activeTimeline.BossEntries.Count == 0 ||
-            overlayDismissed ||
-            manualOverlayActive ||
-            isScrubbing ||
-            awaitingManualPhaseStart)
-        {
-            return;
-        }
-
-        if (!inCombat && !isPreview)
-            return;
-
-        if (inCombat && combatViewPaused && !autoScrubWaitingForPrimaryBossCast)
-            return;
-
-        var currentElapsedSec = GetBaseTimelineElapsedSec();
-
-        if (!double.IsNegativeInfinity(autoScrubLastObservedElapsedSec) &&
-            currentElapsedSec < autoScrubLastObservedElapsedSec - 5.0)
-        {
-            ResetAutoScrubState();
-        }
-
-        autoScrubLastObservedElapsedSec = currentElapsedSec;
-
-        foreach (var cast in CollectObservedBossCastStarts())
-        {
-            if (!TryResolveAutoScrubBossEntry((int)cast.AbilityId, cast.AbilityName, currentElapsedSec, out var matchedEntry))
-                continue;
-            autoScrubLastSeekTimeSec = matchedEntry.CastStartSec;
-            autoScrubLastSeekAtUtc = DateTime.UtcNow;
-            SeekTimelineToTime(matchedEntry.CastStartSec);
-            autoScrubLastResolvedBossTimeSec = Math.Max(autoScrubLastResolvedBossTimeSec, matchedEntry.CastStartSec);
-            if (matchedEntry.IsPrimaryBoss)
-            {
-                autoScrubLastResolvedPrimaryBossTimeSec = Math.Max(autoScrubLastResolvedPrimaryBossTimeSec, matchedEntry.CastStartSec);
-                if (autoScrubWaitingForPrimaryBossCast &&
-                    Math.Abs(matchedEntry.CastStartSec - autoScrubWaitingPrimaryBossTimeSec) <= 0.05)
-                {
-                    autoScrubWaitingForPrimaryBossCast = false;
-                    autoScrubWaitingPrimaryBossTimeSec = double.NaN;
-                    ResumeCombatViewFromCurrentTime();
-                }
-            }
-            return;
-        }
-
-        if (inCombat &&
-            !combatViewPaused &&
-            TryGetNextPrimaryBossAutoPauseEntry(currentElapsedSec, out var nextPrimaryBossEntry) &&
-            currentElapsedSec >= nextPrimaryBossEntry.CastStartSec - 0.0005)
-        {
-            autoScrubWaitingForPrimaryBossCast = true;
-            autoScrubWaitingPrimaryBossTimeSec = nextPrimaryBossEntry.CastStartSec;
-            PauseCombatViewAtTime(nextPrimaryBossEntry.CastStartSec);
-        }
-    }
-
-    private List<ObservedBossCast> CollectObservedBossCastStarts()
-    {
-        var observedCasts = new List<ObservedBossCast>();
-        var currentActorStates = new Dictionary<ulong, uint>();
-        var primaryBossDataId = GetObservedPrimaryBossDataId();
-
-        foreach (var obj in objectTable)
-        {
-            if (obj == null ||
-                obj.ObjectKind != ObjectKind.BattleNpc ||
-                !obj.IsTargetable ||
-                obj.IsDead ||
-                obj is not IBattleNpc battleNpc ||
-                obj is not IBattleChara battleChara ||
-                obj is not ICharacter character ||
-                character.CurrentHp == 0 ||
-                character.MaxHp == 0)
-            {
-                continue;
-            }
-
-            var currentCastId = battleChara.IsCasting ? battleChara.CastActionId : 0;
-            currentActorStates[obj.GameObjectId] = currentCastId;
-            if (currentCastId == 0)
-                continue;
-
-            if (observedBossCastIds.TryGetValue(obj.GameObjectId, out var previousCastId) &&
-                previousCastId == currentCastId)
-            {
-                continue;
-            }
-
-            observedCasts.Add(new ObservedBossCast
-            {
-                AbilityId = currentCastId,
-                AbilityName = GetBossActionName(currentCastId),
-                MaxHp = character.MaxHp,
-                CurrentHp = character.CurrentHp,
-                IsPrimaryBoss = primaryBossDataId != 0 && battleNpc.NameId == primaryBossDataId,
-            });
-        }
-
-        var staleActorIds = observedBossCastIds.Keys
-            .Where(gameObjectId => !currentActorStates.ContainsKey(gameObjectId))
-            .ToList();
-        foreach (var gameObjectId in staleActorIds)
-            observedBossCastIds.Remove(gameObjectId);
-
-        foreach (var actorState in currentActorStates)
-            observedBossCastIds[actorState.Key] = actorState.Value;
-
-        return observedCasts
-            .OrderByDescending(cast => cast.IsPrimaryBoss)
-            .ThenByDescending(cast => cast.MaxHp)
-            .ThenByDescending(cast => cast.CurrentHp)
-            .ToList();
-    }
-
-    private uint GetObservedPrimaryBossDataId()
-    {
-        uint bestDataId = 0;
-        ulong bestMaxHp = 0;
-        ulong bestCurrentHp = 0;
-
-        foreach (var obj in objectTable)
-        {
-            if (obj == null ||
-                obj.ObjectKind != ObjectKind.BattleNpc ||
-                !obj.IsTargetable ||
-                obj.IsDead ||
-                obj is not IBattleNpc battleNpc ||
-                obj is not ICharacter character ||
-                character.CurrentHp == 0 ||
-                character.MaxHp == 0)
-            {
-                continue;
-            }
-
-            var maxHp = character.MaxHp;
-            var currentHp = character.CurrentHp;
-            if (maxHp < bestMaxHp)
-                continue;
-
-            if (maxHp == bestMaxHp && currentHp <= bestCurrentHp)
-                continue;
-
-            bestDataId = battleNpc.NameId;
-            bestMaxHp = maxHp;
-            bestCurrentHp = currentHp;
-        }
-
-        return bestDataId;
-    }
-
-    private bool TryResolveAutoScrubBossEntry(int abilityId, string abilityName, double currentElapsedSec, out BossTimelineEntry matchedEntry)
-    {
-        matchedEntry = null!;
-        if (activeTimeline == null || activeTimeline.BossEntries.Count == 0)
-            return false;
-
-        BossTimelineEntry? bestFutureMatch = null;
-        BossTimelineEntry? bestNearestMatch = null;
-        var bestNearestDistance = double.MaxValue;
-        var initialAnchor = Math.Max(0.0, currentElapsedSec - 1.5);
-        var resolvedAnchor = double.IsNegativeInfinity(autoScrubLastResolvedBossTimeSec)
-            ? double.NegativeInfinity
-            : autoScrubLastResolvedBossTimeSec + 0.05;
-
-        foreach (var entry in activeTimeline.BossEntries)
-        {
-            if (!BossEntryMatchesObservedCast(entry, abilityId, abilityName))
-                continue;
-
-            if (double.IsNegativeInfinity(autoScrubLastResolvedBossTimeSec) && entry.CastStartSec >= initialAnchor)
-            {
-                matchedEntry = entry;
-                return true;
-            }
-
-            if (entry.CastStartSec >= resolvedAnchor && bestFutureMatch == null)
-                bestFutureMatch = entry;
-
-            var distance = Math.Abs(entry.CastStartSec - currentElapsedSec);
-            if (distance < bestNearestDistance)
-            {
-                bestNearestDistance = distance;
-                bestNearestMatch = entry;
-            }
-        }
-
-        if (bestFutureMatch != null)
-        {
-            matchedEntry = bestFutureMatch;
-            return true;
-        }
-
-        if (bestNearestMatch != null)
-        {
-            matchedEntry = bestNearestMatch;
-            return true;
-        }
-
-        return false;
-    }
-
-    private bool TryGetNextPrimaryBossAutoPauseEntry(double currentElapsedSec, out BossTimelineEntry entry)
-    {
-        entry = null!;
         if (activeTimeline == null)
-            return false;
+            return;
 
-        var resolvedAnchor = double.IsNegativeInfinity(autoScrubLastResolvedPrimaryBossTimeSec)
-            ? Math.Max(0.0, currentElapsedSec - 0.05)
-            : autoScrubLastResolvedPrimaryBossTimeSec + 0.05;
-        foreach (var bossEntry in activeTimeline.BossEntries)
-        {
-            if (!bossEntry.IsPrimaryBoss)
-                continue;
-
-            if (bossEntry.CastStartSec < resolvedAnchor)
-                continue;
-
-            entry = bossEntry;
-            return true;
-        }
-
-        return false;
-    }
-
-    private static bool BossEntryMatchesObservedCast(BossTimelineEntry entry, int abilityId, string abilityName)
-    {
-        if (entry.AbilityId > 0 && abilityId > 0 && entry.AbilityId == abilityId)
-            return true;
-
-        if (string.IsNullOrWhiteSpace(abilityName) || string.IsNullOrWhiteSpace(entry.AbilityName))
-            return false;
-
-        return string.Equals(
-            NormalizeBossAbilityName(entry.AbilityName),
-            NormalizeBossAbilityName(abilityName),
-            StringComparison.OrdinalIgnoreCase);
-    }
-
-    private string GetBossActionName(uint actionId)
-    {
-        if (actionId == 0)
-            return string.Empty;
-
-        if (bossActionNameCache.TryGetValue(actionId, out var cachedName))
-            return cachedName ?? string.Empty;
-
-        string? resolvedName = null;
-        try
-        {
-            var sheet = plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Action>();
-            var row = sheet?.GetRowOrDefault(actionId);
-            if (row.HasValue)
-            {
-                var rawName = row.Value.Name.ExtractText();
-                resolvedName = string.IsNullOrWhiteSpace(rawName) ? null : rawName.Trim();
-            }
-        }
-        catch
-        {
-        }
-
-        bossActionNameCache[actionId] = resolvedName;
-        return resolvedName ?? string.Empty;
+        SeekTimelineToTime(timeSec);
     }
 
     private bool TryResolveBossActionIdByName(string abilityName, out int abilityId)
@@ -1182,7 +896,7 @@ public sealed class OverlayWindow : Window, IDisposable
             awaitingManualPhaseStart = false;
             combatElapsedSec     = preserveAutoPlayback ? preservedElapsedSec : 0.0;
             combatStartTime      = DateTime.UtcNow - TimeSpan.FromSeconds(combatElapsedSec);
-            ResetAutoScrubState();
+            plugin.EnemyCastTracker.NotifyCombatStarted();
 
             if (activeTimeline != null && Cfg.OverlayEnabled)
                 IsOpen = true;
@@ -1192,7 +906,7 @@ public sealed class OverlayWindow : Window, IDisposable
             inCombat = false;
             antsArmed = false;
             awaitingManualPhaseStart = false;
-            ResetAutoScrubState();
+            plugin.EnemyCastTracker.NotifyCombatEnded();
 
             if (manualOverlayActive)
             {
@@ -1219,7 +933,7 @@ public sealed class OverlayWindow : Window, IDisposable
         inCombat = false;
         antsArmed = false;
         awaitingManualPhaseStart = false;
-        ResetAutoScrubState();
+        plugin.EnemyCastTracker.NotifyWipe();
 
         if (manualOverlayActive)
         {
@@ -1246,7 +960,7 @@ public sealed class OverlayWindow : Window, IDisposable
         inCombat = false;
         antsArmed = false;
         awaitingManualPhaseStart = false;
-        ResetAutoScrubState();
+        plugin.EnemyCastTracker.NotifyCombatEnded();
 
         if (manualOverlayActive)
         {
@@ -1662,6 +1376,16 @@ public sealed class OverlayWindow : Window, IDisposable
             new Vector2(nowX, tlTop),
             new Vector2(nowX, tlBot),
             ImGui.GetColorU32(ColNowLine), 2.0f);
+        DrawPhaseMarkers(
+            drawList,
+            BuildOverlayPhaseMarkers(activeTimeline.PhaseInfo),
+            displayTimelineElapsedSec,
+            nowX,
+            pxPerSec,
+            tlLeft,
+            tlRight,
+            tlTop,
+            tlBot);
 
         // â”€â”€ Idle message â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if (!isActive)
@@ -2094,6 +1818,16 @@ public sealed class OverlayWindow : Window, IDisposable
             new Vector2(nowX, tlBot),
             ImGui.GetColorU32(ColNowLine),
             2.0f);
+        DrawPhaseMarkers(
+            drawList,
+            BuildOverlayPhaseMarkers(timeline.PhaseInfo),
+            embeddedPreviewElapsedSec,
+            nowX,
+            pxPerSec,
+            tlLeft,
+            tlRight,
+            tlTop,
+            tlBot);
 
         EnsureEmbeddedFilteredEntriesCache();
         CollectEntriesInTimeWindow(cachedEmbeddedFilteredEntries, visStart - 5, visEnd + 5, embeddedVisibleEntriesScratch);
@@ -2425,6 +2159,96 @@ public sealed class OverlayWindow : Window, IDisposable
         return -1;
     }
 
+    private static List<OverlayPhaseMarker> BuildOverlayPhaseMarkers(FightPhaseInfo? phaseInfo)
+    {
+        if (phaseInfo == null || phaseInfo.PhaseTransitions.Count == 0)
+            return [];
+
+        var metadataById = phaseInfo.PhaseMetadata.ToDictionary(phase => phase.Id);
+        var orderedTransitions = phaseInfo.PhaseTransitions
+            .OrderBy(transition => transition.StartTime)
+            .ToList();
+        var markers = new List<OverlayPhaseMarker>();
+
+        for (var index = 0; index < orderedTransitions.Count; index++)
+        {
+            var transition = orderedTransitions[index];
+            if (!metadataById.TryGetValue(transition.Id, out var metadata))
+            {
+                metadata = new EncounterPhaseMetadata
+                {
+                    Id = transition.Id,
+                    Name = $"Phase {transition.Id}",
+                };
+            }
+
+            var nextStartTime = index + 1 < orderedTransitions.Count
+                ? orderedTransitions[index + 1].StartTime
+                : phaseInfo.FightEndTime;
+            var startSec = Math.Max(0L, transition.StartTime - phaseInfo.FightStartTime) / 1000.0;
+            var endSec = Math.Max(transition.StartTime - phaseInfo.FightStartTime, nextStartTime - phaseInfo.FightStartTime) / 1000.0;
+            if (endSec <= startSec || metadata.IsIntermission)
+                continue;
+
+            markers.Add(new OverlayPhaseMarker
+            {
+                Ordinal = markers.Count + 1,
+                DisplayName = metadata.Name,
+                StartSec = startSec,
+                EndSec = endSec,
+            });
+        }
+
+        return markers;
+    }
+
+    private static void DrawPhaseMarkers(
+        ImDrawListPtr drawList,
+        IReadOnlyList<OverlayPhaseMarker> phaseMarkers,
+        double displayElapsedSec,
+        float nowX,
+        float pxPerSec,
+        float tlLeft,
+        float tlRight,
+        float tlTop,
+        float tlBot)
+    {
+        foreach (var phaseMarker in phaseMarkers)
+        {
+            if (phaseMarker.StartSec <= 0.0)
+                continue;
+
+            var markerX = nowX + (float)(phaseMarker.StartSec - displayElapsedSec) * pxPerSec;
+            if (markerX < tlLeft || markerX > tlRight)
+                continue;
+
+            drawList.AddLine(
+                new Vector2(markerX, tlTop),
+                new Vector2(markerX, tlBot),
+                ImGui.GetColorU32(new Vector4(1.0f, 0.90f, 0.35f, 0.55f)),
+                1.5f);
+
+            var phaseLabel = $"P{phaseMarker.Ordinal}";
+            var labelSize = ImGui.CalcTextSize(phaseLabel);
+            drawList.AddText(
+                new Vector2(MathF.Min(markerX + 3f, tlRight - labelSize.X), tlTop + 12f),
+                ImGui.GetColorU32(new Vector4(1.0f, 0.94f, 0.60f, 0.80f)),
+                phaseLabel);
+
+            if (ImGui.IsMouseHoveringRect(
+                    new Vector2(markerX - 3f, tlTop),
+                    new Vector2(markerX + 3f, tlBot)))
+            {
+                ImGui.BeginTooltip();
+                ImGui.Text(phaseLabel);
+                ImGui.Separator();
+                ImGui.Text(phaseMarker.DisplayName);
+                ImGui.Text($"Start: {FormatTime(phaseMarker.StartSec)}");
+                ImGui.EndTooltip();
+            }
+        }
+    }
+
     // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     // ICON LOADING
     // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -2684,10 +2508,18 @@ public sealed class OverlayWindow : Window, IDisposable
         }
 
         if (inCombat)
-            return combatViewPaused ? combatElapsedSec : Math.Max(0.0, (DateTime.UtcNow - combatStartTime).TotalSeconds);
+        {
+            if (combatViewPaused)
+                return combatElapsedSec;
+
+            return Math.Max(0.0, (DateTime.UtcNow - combatStartTime).TotalSeconds);
+        }
 
         return manualOverlayActive ? 0.0 : combatElapsedSec;
     }
+
+    public double GetCurrentTimelineTimeSec()
+        => Math.Max(0.0, GetBaseTimelineElapsedSec());
 
     private bool IsAutoTimelinePlaying()
         => (inCombat && !combatViewPaused) || (isPreview && previewAutoplay);
@@ -2784,14 +2616,6 @@ public sealed class OverlayWindow : Window, IDisposable
         var now = DateTime.UtcNow;
         var wallAdvanceSec = Math.Max(0.0, (now - autoLastObservedBaseAtUtc).TotalSeconds);
         var observedAdvanceSec = baseTimeSec - autoLastObservedBaseTimeSec;
-
-        if (autoScrubLastSeekAtUtc != DateTime.MinValue &&
-            now <= autoScrubLastSeekAtUtc.AddSeconds(0.50) &&
-            double.IsFinite(autoScrubLastSeekTimeSec) &&
-            Math.Abs(baseTimeSec - autoScrubLastSeekTimeSec) <= 0.05)
-        {
-            return false;
-        }
 
         if (observedAdvanceSec < -AutoRebaseJumpThresholdSec)
         {
@@ -3350,6 +3174,8 @@ public sealed class OverlayWindow : Window, IDisposable
 
         try
         {
+            plugin.EnemyCastTracker.ObserveActionEffect(casterEntityId, header, targetEntityIds);
+
             var localPlayer = objectTable.LocalPlayer;
             if (localPlayer == null || casterEntityId != localPlayer.EntityId)
                 return;
@@ -3395,9 +3221,7 @@ public sealed class OverlayWindow : Window, IDisposable
     private unsafe void OnFrameworkUpdate(IFramework _)
     {
         combatElapsedSec = GetBaseTimelineElapsedSec();
-        ProcessAutoScrub();
-
-        var baseTimeSec = GetBaseTimelineElapsedSec();
+        var baseTimeSec = combatElapsedSec;
         autoBaseTimeSec = baseTimeSec;
         autoDisplayGcdTimeSec = baseTimeSec;
         autoDisplayOgcdTimeSec = baseTimeSec;

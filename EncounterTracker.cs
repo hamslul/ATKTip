@@ -212,17 +212,6 @@ public sealed unsafe class EncounterTracker : IDisposable
     private bool   wasInCombat;
     private int    loadedEncounterId;  // 0 = no encounter currently loaded
     private string loadedSpecName = string.Empty;
-    private DateTime encounterCombatStartTimeUtc;
-    private PhaseTimelineSet? activePhaseTimelineSet;
-    private int activePhaseOrdinal;
-    private uint activePhasePrimaryBossDataId;
-    private uint pendingPhasePrimaryBossDataId;
-    private DateTime pendingPhasePrimaryBossSeenUtc;
-    private uint pendingExpectedPhaseBossDataId;
-    private DateTime pendingExpectedPhaseBossSeenUtc;
-    private const double LivePhaseBossChangeStableSec = 1.5;
-    private const double LivePhaseFallbackDelaySec = 30.0;
-    private const double LivePhaseNamedBossStableSec = 0.75;
 
     /// <summary>
     /// Encounter ID to resolve on next frame(s) until the player object is available.
@@ -233,27 +222,6 @@ public sealed unsafe class EncounterTracker : IDisposable
     {
         public required string Key { get; init; }
         public required AggregatedTimeline Timeline { get; init; }
-        public int PhaseOrdinal { get; init; }
-        public List<string> ExpectedBossNames { get; init; } = [];
-        public List<uint> ExpectedBossActorIds { get; init; } = [];
-    }
-
-    private sealed class EncounterPhaseActorRule
-    {
-        public int PhaseOrdinal { get; init; }
-        public List<uint> ActorIds { get; init; } = [];
-    }
-
-    private static readonly Dictionary<int, List<EncounterPhaseActorRule>> KnownEncounterPhaseActorRules = new()
-    {
-        [1074] =
-        [
-            new() { PhaseOrdinal = 1, ActorIds = [0x2212] },
-            new() { PhaseOrdinal = 2, ActorIds = [0x221A] },
-            new() { PhaseOrdinal = 3, ActorIds = [0x2217] },
-            new() { PhaseOrdinal = 4, ActorIds = [0x221E, 0x221C] },
-            new() { PhaseOrdinal = 5, ActorIds = [0x221E] },
-        ],
     };
 
     private const int SyntheticPhaseEncounterIdBase = 1_000_000;
@@ -266,22 +234,6 @@ public sealed unsafe class EncounterTracker : IDisposable
                 [2] = 105,
             },
         };
-
-    private sealed class EncounterPhaseMarker
-    {
-        public int Ordinal { get; init; }
-        public double StartSec { get; init; }
-        public string Name { get; init; } = string.Empty;
-    }
-
-    private sealed class PhaseTimelineSet
-    {
-        public required int EncounterId { get; init; }
-        public required string SpecName { get; init; }
-        public required Dictionary<int, PhaseTimelineCandidate> PhaseTimelines { get; init; }
-        public required List<EncounterPhaseMarker> PhaseMarkers { get; init; }
-        public PhaseTimelineCandidate? FullTimeline { get; init; }
-    }
 
     public EncounterTracker(
         Plugin        plugin,
@@ -304,8 +256,6 @@ public sealed unsafe class EncounterTracker : IDisposable
 
         BuildCfcTerritoryMap();
         framework.Update += OnUpdate;
-        dutyState.DutyWiped += OnDutyReset;
-        dutyState.DutyCompleted += OnDutyReset;
         RebuildZoneMappings();
     }
 
@@ -476,14 +426,6 @@ public sealed unsafe class EncounterTracker : IDisposable
             pendingEncounterId = null;
             loadedEncounterId  = 0;
             loadedSpecName     = string.Empty;
-            activePhaseTimelineSet = null;
-            activePhaseOrdinal = 0;
-            activePhasePrimaryBossDataId = 0;
-            pendingPhasePrimaryBossDataId = 0;
-            pendingPhasePrimaryBossSeenUtc = default;
-            pendingExpectedPhaseBossDataId = 0;
-            pendingExpectedPhaseBossSeenUtc = default;
-
             int encounterId;
             bool mapped = false;
 
@@ -582,34 +524,19 @@ public sealed unsafe class EncounterTracker : IDisposable
 
         var encName = encounterIdToName.GetValueOrDefault(encounterId, string.Empty);
 
-        var phaseTimelineSet = BuildPhaseTimelineSet(encounterId, specName, encName);
-        var timelineCandidate = ResolveInitialTimelineCandidate(phaseTimelineSet, encounterId, specName, encName);
+        var timelineCandidate = ResolveInitialTimelineCandidate(encounterId, specName, encName);
 
         if (timelineCandidate == null)
         {
             log.Debug("EncounterTracker: no custom timeline for encounter {0} / {1}.", encounterId, specName);
             loadedEncounterId = 0;
             loadedSpecName = string.Empty;
-            activePhaseTimelineSet = null;
-            activePhaseOrdinal = 0;
-            activePhasePrimaryBossDataId = 0;
-            pendingPhasePrimaryBossDataId = 0;
-            pendingPhasePrimaryBossSeenUtc = default;
-            pendingExpectedPhaseBossDataId = 0;
-            pendingExpectedPhaseBossSeenUtc = default;
             return true;    // conclusive — nothing to load for this job
         }
 
         plugin.OverlayWindow.PrepareCombatPreview(timelineCandidate.Timeline, timelineCandidate.Key);
         loadedEncounterId = encounterId;
         loadedSpecName = specName;
-        activePhaseTimelineSet = phaseTimelineSet;
-        activePhaseOrdinal = timelineCandidate.PhaseOrdinal;
-        activePhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossSeenUtc = default;
-        pendingExpectedPhaseBossDataId = 0;
-        pendingExpectedPhaseBossSeenUtc = default;
         log.Info("EncounterTracker: loaded [{0}/{1}] (encounter {2}), overlay ready (paused at t=0).",
             timelineCandidate.Timeline.EncounterName, timelineCandidate.Timeline.SpecName, encounterId);
         return true;
@@ -617,22 +544,6 @@ public sealed unsafe class EncounterTracker : IDisposable
 
     private void OnCombatStart()
     {
-        encounterCombatStartTimeUtc = DateTime.UtcNow;
-        activePhasePrimaryBossDataId = GetPrimaryBossDataId();
-        pendingPhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossSeenUtc = default;
-        pendingExpectedPhaseBossDataId = 0;
-        pendingExpectedPhaseBossSeenUtc = default;
-        if (activePhaseTimelineSet != null)
-        {
-            var initialCandidate = ResolveInitialPhaseTimelineCandidate(activePhaseTimelineSet);
-            if (initialCandidate != null && activePhaseOrdinal <= 0)
-            {
-                plugin.OverlayWindow.PrepareCombatPreview(initialCandidate.Timeline, initialCandidate.Key);
-                activePhaseOrdinal = initialCandidate.PhaseOrdinal;
-            }
-        }
-
         if (plugin.OverlayWindow.HasActiveTimeline && plugin.Configuration.OverlayEnabled)
         {
             plugin.OverlayWindow.IsOpen = true;
@@ -642,526 +553,36 @@ public sealed unsafe class EncounterTracker : IDisposable
 
     private void OnCombatEnd()
     {
-        activePhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossSeenUtc = default;
-        pendingExpectedPhaseBossDataId = 0;
-        pendingExpectedPhaseBossSeenUtc = default;
     }
 
-    private void TryAdvanceCombatPhase()
-    {
-        if (activePhaseTimelineSet == null || activePhaseTimelineSet.PhaseTimelines.Count == 0)
-            return;
-
-        var elapsedSec = (DateTime.UtcNow - encounterCombatStartTimeUtc).TotalSeconds;
-        var nextPhaseOrdinal = activePhaseOrdinal > 0 ? activePhaseOrdinal + 1 : 1;
-        var nextMarker = activePhaseTimelineSet.PhaseMarkers
-            .FirstOrDefault(marker => marker.Ordinal == nextPhaseOrdinal);
-        if (!activePhaseTimelineSet.PhaseTimelines.TryGetValue(nextPhaseOrdinal, out var timelineCandidate))
-            return;
-
-        var currentTimelineCandidate = activePhaseTimelineSet.PhaseTimelines.GetValueOrDefault(activePhaseOrdinal);
-        var currentExpectedBossActorIds = currentTimelineCandidate?.ExpectedBossActorIds ?? [];
-        var currentExpectedBossNames = currentTimelineCandidate?.ExpectedBossNames ?? [];
-        var usesDistinctActorBossSpawn = timelineCandidate.ExpectedBossActorIds.Count > 0 &&
-                                         !HaveSamePhaseActorIds(currentExpectedBossActorIds, timelineCandidate.ExpectedBossActorIds);
-        var usesDistinctNamedBossSpawn = !usesDistinctActorBossSpawn &&
-                                         timelineCandidate.ExpectedBossNames.Count > 0 &&
-                                         !HaveSameNormalizedBossNames(currentExpectedBossNames, timelineCandidate.ExpectedBossNames);
-        var hasReachedNextPhaseMarker = nextMarker == null || elapsedSec >= nextMarker.StartSec;
-
-        if (!hasReachedNextPhaseMarker && (usesDistinctActorBossSpawn || usesDistinctNamedBossSpawn))
-        {
-            pendingExpectedPhaseBossDataId = 0;
-            pendingExpectedPhaseBossSeenUtc = default;
-            return;
-        }
-
-        if (usesDistinctActorBossSpawn)
-        {
-            if (TryGetTargetablePhaseBossActorId(timelineCandidate.ExpectedBossActorIds, out var expectedPhaseBossActorId))
-            {
-                if (pendingExpectedPhaseBossDataId != expectedPhaseBossActorId)
-                {
-                    pendingExpectedPhaseBossDataId = expectedPhaseBossActorId;
-                    pendingExpectedPhaseBossSeenUtc = DateTime.UtcNow;
-                }
-                else if ((DateTime.UtcNow - pendingExpectedPhaseBossSeenUtc).TotalSeconds >= LivePhaseNamedBossStableSec)
-                {
-                    plugin.OverlayWindow.SwitchCombatTimeline(timelineCandidate.Timeline, timelineCandidate.Key);
-                    activePhaseOrdinal = nextPhaseOrdinal;
-                    activePhasePrimaryBossDataId = expectedPhaseBossActorId;
-                    pendingPhasePrimaryBossDataId = 0;
-                    pendingPhasePrimaryBossSeenUtc = default;
-                    pendingExpectedPhaseBossDataId = 0;
-                    pendingExpectedPhaseBossSeenUtc = default;
-                    log.Info("EncounterTracker: advanced to phase {0} for encounter {1} / {2} via targetable phase actor 0x{3:X}.",
-                        nextPhaseOrdinal,
-                        activePhaseTimelineSet.EncounterId,
-                        activePhaseTimelineSet.SpecName,
-                        expectedPhaseBossActorId);
-                    return;
-                }
-            }
-            else
-            {
-                pendingExpectedPhaseBossDataId = 0;
-                pendingExpectedPhaseBossSeenUtc = default;
-            }
-        }
-        else if (usesDistinctNamedBossSpawn)
-        {
-            if (TryGetTargetablePhaseBossDataId(timelineCandidate.ExpectedBossNames, out var expectedPhaseBossDataId))
-            {
-                if (pendingExpectedPhaseBossDataId != expectedPhaseBossDataId)
-                {
-                    pendingExpectedPhaseBossDataId = expectedPhaseBossDataId;
-                    pendingExpectedPhaseBossSeenUtc = DateTime.UtcNow;
-                }
-                else if ((DateTime.UtcNow - pendingExpectedPhaseBossSeenUtc).TotalSeconds >= LivePhaseNamedBossStableSec)
-                {
-                    plugin.OverlayWindow.SwitchCombatTimeline(timelineCandidate.Timeline, timelineCandidate.Key);
-                    activePhaseOrdinal = nextPhaseOrdinal;
-                    activePhasePrimaryBossDataId = expectedPhaseBossDataId;
-                    pendingPhasePrimaryBossDataId = 0;
-                    pendingPhasePrimaryBossSeenUtc = default;
-                    pendingExpectedPhaseBossDataId = 0;
-                    pendingExpectedPhaseBossSeenUtc = default;
-                    log.Info("EncounterTracker: advanced to phase {0} for encounter {1} / {2} via targetable phase boss {3} (0x{4:X}).",
-                        nextPhaseOrdinal,
-                        activePhaseTimelineSet.EncounterId,
-                        activePhaseTimelineSet.SpecName,
-                        string.Join(", ", timelineCandidate.ExpectedBossNames),
-                        expectedPhaseBossDataId);
-                    return;
-                }
-            }
-            else
-            {
-                pendingExpectedPhaseBossDataId = 0;
-                pendingExpectedPhaseBossSeenUtc = default;
-            }
-        }
-
-        if (nextMarker == null || elapsedSec < nextMarker.StartSec)
-            return;
-
-        var currentBossDataId = GetPrimaryBossDataId();
-        var canAdvanceByBossChange = false;
-        if (currentBossDataId != 0 &&
-            activePhasePrimaryBossDataId != 0 &&
-            currentBossDataId != activePhasePrimaryBossDataId)
-        {
-            if (pendingPhasePrimaryBossDataId != currentBossDataId)
-            {
-                pendingPhasePrimaryBossDataId = currentBossDataId;
-                pendingPhasePrimaryBossSeenUtc = DateTime.UtcNow;
-            }
-            else if ((DateTime.UtcNow - pendingPhasePrimaryBossSeenUtc).TotalSeconds >= LivePhaseBossChangeStableSec)
-            {
-                canAdvanceByBossChange = true;
-            }
-        }
-        else
-        {
-            pendingPhasePrimaryBossDataId = 0;
-            pendingPhasePrimaryBossSeenUtc = default;
-        }
-
-        var canAdvanceByFallbackTime = elapsedSec >= nextMarker.StartSec + LivePhaseFallbackDelaySec;
-        if (!canAdvanceByBossChange && !canAdvanceByFallbackTime)
-            return;
-
-        plugin.OverlayWindow.SwitchCombatTimeline(timelineCandidate.Timeline, timelineCandidate.Key);
-        activePhaseOrdinal = nextPhaseOrdinal;
-        activePhasePrimaryBossDataId = currentBossDataId != 0 ? currentBossDataId : activePhasePrimaryBossDataId;
-        pendingPhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossSeenUtc = default;
-        log.Info("EncounterTracker: advanced to phase {0} for encounter {1} / {2} via {3}.",
-            nextPhaseOrdinal,
-            activePhaseTimelineSet.EncounterId,
-            activePhaseTimelineSet.SpecName,
-            canAdvanceByBossChange ? $"live boss change to 0x{currentBossDataId:X}" : "timing fallback");
-    }
-
-    private bool TryGetTargetablePhaseBossDataId(IReadOnlyList<string> expectedBossNames, out uint matchedDataId)
-    {
-        matchedDataId = 0;
-        if (expectedBossNames.Count == 0)
-            return false;
-
-        var normalizedExpectedNames = expectedBossNames
-            .Select(NormalizePhaseBossName)
-            .Where(name => !string.IsNullOrWhiteSpace(name))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        if (normalizedExpectedNames.Count == 0)
-            return false;
-
-        ulong bestMaxHp = 0;
-        ulong bestCurrentHp = 0;
-        foreach (var obj in objectTable)
-        {
-            if (obj == null ||
-                obj.ObjectKind != ObjectKind.BattleNpc ||
-                !obj.IsTargetable ||
-                obj.IsDead ||
-                obj.BaseId == 0)
-            {
-                continue;
-            }
-
-            var objectName = NormalizePhaseBossName(obj.Name.TextValue);
-            if (string.IsNullOrWhiteSpace(objectName) ||
-                !normalizedExpectedNames.Any(expectedName => DoesPhaseBossNameMatch(expectedName, objectName)))
-            {
-                continue;
-            }
-
-            var maxHp = obj is ICharacter character ? character.MaxHp : 0UL;
-            var currentHp = obj is ICharacter hpCharacter ? hpCharacter.CurrentHp : 0UL;
-
-            if (maxHp < bestMaxHp)
-                continue;
-
-            if (maxHp == bestMaxHp && currentHp <= bestCurrentHp)
-                continue;
-
-            matchedDataId = obj.BaseId;
-            bestMaxHp = maxHp;
-            bestCurrentHp = currentHp;
-        }
-
-        return matchedDataId != 0;
-    }
-
-    private bool TryGetTargetablePhaseBossActorId(IReadOnlyList<uint> expectedBossActorIds, out uint matchedActorId)
-    {
-        matchedActorId = 0;
-        if (expectedBossActorIds.Count == 0)
-            return false;
-
-        var actorIdSet = expectedBossActorIds.ToHashSet();
-        ulong bestMaxHp = 0;
-        ulong bestCurrentHp = 0;
-        foreach (var obj in objectTable)
-        {
-            if (obj is not IBattleNpc battleNpc ||
-                obj.ObjectKind != ObjectKind.BattleNpc ||
-                !obj.IsTargetable ||
-                obj.IsDead ||
-                !actorIdSet.Contains(battleNpc.NameId))
-            {
-                continue;
-            }
-
-            var maxHp = obj is ICharacter character ? character.MaxHp : 0UL;
-            var currentHp = obj is ICharacter hpCharacter ? hpCharacter.CurrentHp : 0UL;
-
-            if (maxHp < bestMaxHp)
-                continue;
-
-            if (maxHp == bestMaxHp && currentHp <= bestCurrentHp)
-                continue;
-
-            matchedActorId = battleNpc.NameId;
-            bestMaxHp = maxHp;
-            bestCurrentHp = currentHp;
-        }
-
-        return matchedActorId != 0;
-    }
-
-    private bool HasPresentPhaseBoss(IReadOnlyList<string> expectedBossNames)
-    {
-        if (expectedBossNames.Count == 0)
-            return false;
-
-        var normalizedExpectedNames = expectedBossNames
-            .Select(NormalizePhaseBossName)
-            .Where(name => !string.IsNullOrWhiteSpace(name))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        if (normalizedExpectedNames.Count == 0)
-            return false;
-
-        foreach (var obj in objectTable)
-        {
-            if (obj == null ||
-                obj.ObjectKind != ObjectKind.BattleNpc ||
-                obj.IsDead ||
-                obj.BaseId == 0)
-            {
-                continue;
-            }
-
-            var objectName = NormalizePhaseBossName(obj.Name.TextValue);
-            if (string.IsNullOrWhiteSpace(objectName))
-                continue;
-
-            if (normalizedExpectedNames.Any(expectedName => DoesPhaseBossNameMatch(expectedName, objectName)))
-                return true;
-        }
-
-        return false;
-    }
-
-    private bool HasPresentPhaseBossActor(IReadOnlyList<uint> expectedBossActorIds)
-    {
-        if (expectedBossActorIds.Count == 0)
-            return false;
-
-        var actorIdSet = expectedBossActorIds.ToHashSet();
-        foreach (var obj in objectTable)
-        {
-            if (obj is not IBattleNpc battleNpc ||
-                obj.ObjectKind != ObjectKind.BattleNpc ||
-                obj.IsDead ||
-                !actorIdSet.Contains(battleNpc.NameId))
-            {
-                continue;
-            }
-
-            if (obj is ICharacter character &&
-                character.CurrentHp <= 1 &&
-                !obj.IsTargetable)
-            {
-                continue;
-            }
-
-            return true;
-        }
-
-        return false;
-    }
-
-    private uint GetPrimaryBossDataId()
-    {
-        uint bestDataId = 0;
-        ulong bestMaxHp = 0;
-        ulong bestCurrentHp = 0;
-
-        foreach (var obj in objectTable)
-        {
-            if (obj == null ||
-                obj.ObjectKind != ObjectKind.BattleNpc ||
-                !obj.IsTargetable ||
-                obj.IsDead ||
-                obj is not IBattleNpc battleNpc ||
-                obj is not ICharacter character ||
-                character.CurrentHp == 0 ||
-                character.MaxHp == 0)
-            {
-                continue;
-            }
-
-            var maxHp = character.MaxHp;
-            var currentHp = character.CurrentHp;
-            if (maxHp < bestMaxHp)
-                continue;
-
-            if (maxHp == bestMaxHp && currentHp <= bestCurrentHp)
-                continue;
-
-            bestDataId = battleNpc.NameId;
-            bestMaxHp = maxHp;
-            bestCurrentHp = currentHp;
-        }
-
-        return bestDataId;
-    }
-
-    private static bool DoesPhaseBossNameMatch(string expectedName, string objectName)
-        => string.Equals(expectedName, objectName, StringComparison.OrdinalIgnoreCase) ||
-           objectName.Contains(expectedName, StringComparison.OrdinalIgnoreCase) ||
-           expectedName.Contains(objectName, StringComparison.OrdinalIgnoreCase);
-
-    private static string NormalizePhaseBossName(string name)
-    {
-        if (string.IsNullOrWhiteSpace(name))
-            return string.Empty;
-
-        var normalized = name.Trim().ToLowerInvariant();
-        if (normalized.StartsWith("the ", StringComparison.Ordinal))
-            normalized = normalized[4..];
-
-        if (normalized.EndsWith("s", StringComparison.Ordinal) && normalized.Length > 1)
-            normalized = normalized[..^1];
-
-        return normalized;
-    }
-
-    private static bool HaveSameNormalizedBossNames(IReadOnlyList<string> left, IReadOnlyList<string> right)
-    {
-        var leftNames = left
-            .Select(NormalizePhaseBossName)
-            .Where(name => !string.IsNullOrWhiteSpace(name))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        var rightNames = right
-            .Select(NormalizePhaseBossName)
-            .Where(name => !string.IsNullOrWhiteSpace(name))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        return leftNames.SequenceEqual(rightNames, StringComparer.OrdinalIgnoreCase);
-    }
-
-    private PhaseTimelineSet? BuildPhaseTimelineSet(int encounterId, string specName, string encounterName)
+    private PhaseTimelineCandidate? ResolveInitialTimelineCandidate(int encounterId, string specName, string encounterName)
     {
         var baseKey = TimelineDatabase.MakeKey(encounterId, specName);
         var matchingCustoms = plugin.Configuration.CustomTimelines
-            .Where(entry => string.Equals(entry.Value.SpecName, specName, StringComparison.OrdinalIgnoreCase))
-            .Where(entry => TimelineMatchesEncounter(entry.Key, entry.Value, encounterId, encounterName))
+            .Where(entry =>
+                string.Equals(entry.Value.SpecName, specName, StringComparison.OrdinalIgnoreCase) &&
+                TimelineMatchesEncounter(entry.Key, entry.Value, encounterId, encounterName))
+            .OrderBy(entry => entry.Key, StringComparer.OrdinalIgnoreCase)
             .ToList();
         if (matchingCustoms.Count == 0)
             return null;
 
-        var phaseTimelines = new Dictionary<int, PhaseTimelineCandidate>();
-        PhaseTimelineCandidate? fullTimeline = null;
-        var linkedPhaseOrdinals = BuildLinkedPhaseOrdinals(matchingCustoms);
-
-        PhaseTimelineCandidate CreatePhaseTimelineCandidate(string key, AggregatedTimeline timeline, int phaseOrdinal)
-            => new()
+        var fullTimeline = matchingCustoms
+            .FirstOrDefault(entry => IsFullTimelineCandidate(entry.Key, entry.Value, encounterId, baseKey));
+        if (!string.IsNullOrEmpty(fullTimeline.Key))
+        {
+            return new PhaseTimelineCandidate
             {
-                Key = key,
-                Timeline = timeline,
-                PhaseOrdinal = phaseOrdinal,
-                ExpectedBossNames = GetExpectedPhaseBossNames(timeline.PhaseInfo ?? plugin.TimelineStore.GetTimeline(encounterId, specName)?.PhaseInfo, phaseOrdinal),
-                ExpectedBossActorIds = GetExpectedPhaseBossActorIds(encounterId, phaseOrdinal),
+                Key = fullTimeline.Key,
+                Timeline = fullTimeline.Value,
             };
-
-        foreach (var (key, timeline) in matchingCustoms)
-        {
-            if (linkedPhaseOrdinals.TryGetValue(key, out var linkedPhaseOrdinal))
-            {
-                phaseTimelines[linkedPhaseOrdinal] = CreatePhaseTimelineCandidate(key, timeline, linkedPhaseOrdinal);
-                continue;
-            }
-
-            if (TryResolvePhaseOrdinal(key, timeline, encounterId, baseKey, out var phaseOrdinal))
-            {
-                phaseTimelines[phaseOrdinal] = CreatePhaseTimelineCandidate(key, timeline, phaseOrdinal);
-                continue;
-            }
-
-            if (IsFullTimelineCandidate(key, timeline, encounterId, baseKey) &&
-                (fullTimeline == null || string.Equals(key, baseKey, StringComparison.OrdinalIgnoreCase)))
-            {
-                fullTimeline = new PhaseTimelineCandidate
-                {
-                    Key = key,
-                    Timeline = timeline,
-                    PhaseOrdinal = 0,
-                    ExpectedBossNames = [],
-                    ExpectedBossActorIds = [],
-                };
-            }
         }
 
-        var phaseInfo = plugin.TimelineStore.GetTimeline(encounterId, specName)?.PhaseInfo
-                        ?? fullTimeline?.Timeline.PhaseInfo
-                        ?? phaseTimelines.OrderBy(entry => entry.Key).Select(entry => entry.Value.Timeline.PhaseInfo).FirstOrDefault(info => info != null);
-        var phaseMarkers = BuildEncounterPhaseMarkers(phaseInfo);
-        if (phaseTimelines.Count == 0)
-            return null;
-
-        return new PhaseTimelineSet
-        {
-            EncounterId = encounterId,
-            SpecName = specName,
-            PhaseTimelines = phaseTimelines,
-            PhaseMarkers = phaseMarkers,
-            FullTimeline = fullTimeline,
-        };
-    }
-
-    private Dictionary<string, int> BuildLinkedPhaseOrdinals(IReadOnlyList<KeyValuePair<string, AggregatedTimeline>> matchingCustoms)
-    {
-        var timelineKeys = matchingCustoms
-            .Select(entry => entry.Key)
-            .ToHashSet(StringComparer.Ordinal);
-        var nextLinks = plugin.Configuration.TimelineNextLinks
-            .Where(entry => timelineKeys.Contains(entry.Key) &&
-                            timelineKeys.Contains(entry.Value) &&
-                            !string.Equals(entry.Key, entry.Value, StringComparison.Ordinal))
-            .ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.Ordinal);
-        if (nextLinks.Count == 0)
-            return [];
-
-        var inboundCounts = timelineKeys.ToDictionary(key => key, _ => 0, StringComparer.Ordinal);
-        foreach (var targetKey in nextLinks.Values)
-            inboundCounts[targetKey] = inboundCounts.GetValueOrDefault(targetKey) + 1;
-
-        var rootKeys = nextLinks.Keys
-            .Where(sourceKey => inboundCounts.GetValueOrDefault(sourceKey) == 0)
-            .OrderBy(sourceKey => sourceKey, StringComparer.Ordinal)
-            .ToList();
-        if (rootKeys.Count == 0)
-            return [];
-
-        var linkedOrdinals = new Dictionary<string, int>(StringComparer.Ordinal);
-        var nextPhaseOrdinal = 1;
-
-        foreach (var rootKey in rootKeys)
-        {
-            var currentKey = rootKey;
-            var visitedKeys = new HashSet<string>(StringComparer.Ordinal);
-            while (!string.IsNullOrWhiteSpace(currentKey) &&
-                   timelineKeys.Contains(currentKey) &&
-                   visitedKeys.Add(currentKey) &&
-                   !linkedOrdinals.ContainsKey(currentKey))
-            {
-                linkedOrdinals[currentKey] = nextPhaseOrdinal++;
-                if (!nextLinks.TryGetValue(currentKey, out currentKey!))
-                    break;
-            }
-        }
-
-        return linkedOrdinals;
-    }
-
-    private static PhaseTimelineCandidate? ResolveInitialPhaseTimelineCandidate(PhaseTimelineSet phaseTimelineSet)
-    {
-        if (phaseTimelineSet.PhaseTimelines.TryGetValue(1, out var phaseOneTimeline))
-            return phaseOneTimeline;
-
-        return phaseTimelineSet.PhaseTimelines
-            .OrderBy(entry => entry.Key)
-            .Select(entry => entry.Value)
-            .FirstOrDefault();
-    }
-
-    private PhaseTimelineCandidate? ResolveInitialTimelineCandidate(
-        PhaseTimelineSet? phaseTimelineSet,
-        int encounterId,
-        string specName,
-        string encounterName)
-    {
-        var initialPhaseTimeline = phaseTimelineSet != null
-            ? ResolveInitialPhaseTimelineCandidate(phaseTimelineSet)
-            : null;
-        if (initialPhaseTimeline != null)
-            return initialPhaseTimeline;
-
-        var fullTimeline = plugin.Configuration.CustomTimelines
-            .FirstOrDefault(entry =>
-                string.Equals(entry.Value.SpecName, specName, StringComparison.OrdinalIgnoreCase) &&
-                TimelineMatchesEncounter(entry.Key, entry.Value, encounterId, encounterName) &&
-                IsFullTimelineCandidate(entry.Key, entry.Value, encounterId, TimelineDatabase.MakeKey(encounterId, specName)));
-        if (string.IsNullOrEmpty(fullTimeline.Key))
-            return null;
-
+        var firstTimeline = matchingCustoms[0];
         return new PhaseTimelineCandidate
         {
-            Key = fullTimeline.Key,
-            Timeline = fullTimeline.Value,
-            PhaseOrdinal = 0,
-            ExpectedBossNames = [],
-            ExpectedBossActorIds = [],
+            Key = firstTimeline.Key,
+            Timeline = firstTimeline.Value,
         };
     }
 
@@ -1177,14 +598,6 @@ public sealed unsafe class EncounterTracker : IDisposable
 
         return int.TryParse(suffix[2..], NumberStyles.Integer, CultureInfo.InvariantCulture, out phaseOrdinal) &&
                phaseOrdinal > 0;
-    }
-
-    private static bool TryResolvePhaseOrdinal(string key, AggregatedTimeline timeline, int encounterId, string baseKey, out int phaseOrdinal)
-    {
-        if (TryGetPhaseOrdinalFromEncounterId(timeline.EncounterId, encounterId, out phaseOrdinal))
-            return true;
-
-        return TryGetPhaseOrdinalFromCustomKey(key, baseKey, out phaseOrdinal);
     }
 
     private static bool TimelineMatchesEncounter(string key, AggregatedTimeline timeline, int encounterId, string encounterName)
@@ -1293,93 +706,8 @@ public sealed unsafe class EncounterTracker : IDisposable
         return true;
     }
 
-    private static List<EncounterPhaseMarker> BuildEncounterPhaseMarkers(FightPhaseInfo? phaseInfo)
-    {
-        if (phaseInfo == null || phaseInfo.PhaseTransitions.Count == 0)
-            return [];
 
-        var metadataById = phaseInfo.PhaseMetadata.ToDictionary(phase => phase.Id);
-        var markers = new List<EncounterPhaseMarker>();
 
-        foreach (var transition in phaseInfo.PhaseTransitions.OrderBy(transition => transition.StartTime))
-        {
-            if (metadataById.TryGetValue(transition.Id, out var metadata) && metadata.IsIntermission)
-                continue;
-
-            markers.Add(new EncounterPhaseMarker
-            {
-                Ordinal = markers.Count + 1,
-                StartSec = Math.Max(0.0, (transition.StartTime - phaseInfo.FightStartTime) / 1000.0),
-                Name = metadata?.Name ?? string.Empty,
-            });
-        }
-
-        return markers;
-    }
-
-    private static List<string> GetExpectedPhaseBossNames(FightPhaseInfo? phaseInfo, int phaseOrdinal)
-    {
-        var marker = BuildEncounterPhaseMarkers(phaseInfo)
-            .FirstOrDefault(candidate => candidate.Ordinal == phaseOrdinal);
-        if (marker == null || string.IsNullOrWhiteSpace(marker.Name))
-            return [];
-
-        var normalized = marker.Name.Trim();
-        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            normalized,
-        };
-
-        if (normalized.EndsWith("s", StringComparison.OrdinalIgnoreCase))
-            names.Add(normalized[..^1]);
-
-        if (normalized.StartsWith("The ", StringComparison.OrdinalIgnoreCase))
-            names.Add(normalized[4..]);
-
-        return names
-            .Where(name => !string.IsNullOrWhiteSpace(name))
-            .ToList();
-    }
-
-    private static List<uint> GetExpectedPhaseBossActorIds(int encounterId, int phaseOrdinal)
-    {
-        if (!KnownEncounterPhaseActorRules.TryGetValue(encounterId, out var rules))
-            return [];
-
-        return rules
-            .Where(rule => rule.PhaseOrdinal == phaseOrdinal)
-            .SelectMany(rule => rule.ActorIds)
-            .Distinct()
-            .ToList();
-    }
-
-    private static bool HaveSamePhaseActorIds(IReadOnlyList<uint> left, IReadOnlyList<uint> right)
-    {
-        if (left.Count == 0 && right.Count == 0)
-            return true;
-
-        var leftIds = left.Distinct().OrderBy(id => id).ToArray();
-        var rightIds = right.Distinct().OrderBy(id => id).ToArray();
-        return leftIds.SequenceEqual(rightIds);
-    }
-
-    private void OnDutyReset(Dalamud.Game.DutyState.IDutyStateEventArgs _)
-    {
-        if (activePhaseTimelineSet == null)
-            return;
-
-        var initialCandidate = ResolveInitialPhaseTimelineCandidate(activePhaseTimelineSet);
-        if (initialCandidate == null)
-            return;
-
-        plugin.OverlayWindow.PrepareCombatPreview(initialCandidate.Timeline, initialCandidate.Key);
-        activePhaseOrdinal = initialCandidate.PhaseOrdinal;
-        activePhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossSeenUtc = default;
-        pendingExpectedPhaseBossDataId = 0;
-        pendingExpectedPhaseBossSeenUtc = default;
-    }
 
     // ── Manual preview (fallback for failed auto-detection) ─────────────
 
@@ -1452,20 +780,19 @@ public sealed unsafe class EncounterTracker : IDisposable
 
         var selectedGroup = candidates[0].ToList();
         var representative = selectedGroup[0];
-        var timeline = representative.Timeline;
         var resolvedSpecName = specName ?? representative.Timeline.SpecName;
         var resolvedEncounterId = (int)representative.BaseEncounterId;
         var resolvedEncounterName = (string)representative.BaseEncounterName;
-        var phaseTimelineSet = resolvedEncounterId > 0
-            ? BuildPhaseTimelineSet(resolvedEncounterId, resolvedSpecName, resolvedEncounterName)
-            : null;
         var timelineCandidate = resolvedEncounterId > 0
-            ? ResolveInitialTimelineCandidate(phaseTimelineSet, resolvedEncounterId, resolvedSpecName, resolvedEncounterName)
+            ? ResolveInitialTimelineCandidate(resolvedEncounterId, resolvedSpecName, resolvedEncounterName)
             : null;
         if (timelineCandidate != null)
         {
-            ApplyLoadedEncounterState(resolvedEncounterId, resolvedSpecName, phaseTimelineSet, timelineCandidate);
-            log.Info("EncounterTracker: manual overlay â†’ [{0}/{1}] via phase-set resolution.", timelineCandidate.Timeline.EncounterName, timelineCandidate.Timeline.SpecName);
+            plugin.OverlayWindow.PrepareCombatPreview(timelineCandidate.Timeline, timelineCandidate.Key);
+            plugin.OverlayWindow.IsOpen = true;
+            loadedEncounterId = resolvedEncounterId;
+            loadedSpecName = resolvedSpecName;
+            log.Info("EncounterTracker: manual overlay â†’ [{0}/{1}] via encounter resolution.", timelineCandidate.Timeline.EncounterName, timelineCandidate.Timeline.SpecName);
             return true;
         }
 
@@ -1498,11 +825,13 @@ public sealed unsafe class EncounterTracker : IDisposable
             if (string.IsNullOrWhiteSpace(encounterName))
                 encounterName = encounterIdToName.GetValueOrDefault(encounterId, timeline.EncounterName);
 
-            var phaseTimelineSet = BuildPhaseTimelineSet(encounterId, specName, encounterName);
-            var timelineCandidate = ResolveInitialTimelineCandidate(phaseTimelineSet, encounterId, specName, encounterName);
+            var timelineCandidate = ResolveInitialTimelineCandidate(encounterId, specName, encounterName);
             if (timelineCandidate != null)
             {
-                ApplyLoadedEncounterState(encounterId, specName, phaseTimelineSet, timelineCandidate);
+                plugin.OverlayWindow.PrepareCombatPreview(timelineCandidate.Timeline, timelineCandidate.Key);
+                plugin.OverlayWindow.IsOpen = true;
+                loadedEncounterId = encounterId;
+                loadedSpecName = specName;
                 log.Info("EncounterTracker: manual encounter load → [{0}/{1}] via key {2}.", timelineCandidate.Timeline.EncounterName, timelineCandidate.Timeline.SpecName, key);
                 return true;
             }
@@ -1511,34 +840,8 @@ public sealed unsafe class EncounterTracker : IDisposable
         plugin.OverlayWindow.PrepareCombatPreview(timeline, key);
         loadedEncounterId = encounterId > 0 ? encounterId : timeline.EncounterId;
         loadedSpecName = specName;
-        activePhaseTimelineSet = null;
-        activePhaseOrdinal = 0;
-        activePhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossSeenUtc = default;
-        pendingExpectedPhaseBossDataId = 0;
-        pendingExpectedPhaseBossSeenUtc = default;
         log.Info("EncounterTracker: manual fallback load → [{0}/{1}] via key {2}.", timeline.EncounterName, timeline.SpecName, key);
         return true;
-    }
-
-    private void ApplyLoadedEncounterState(
-        int encounterId,
-        string specName,
-        PhaseTimelineSet? phaseTimelineSet,
-        PhaseTimelineCandidate timelineCandidate)
-    {
-        plugin.OverlayWindow.PrepareCombatPreview(timelineCandidate.Timeline, timelineCandidate.Key);
-        plugin.OverlayWindow.IsOpen = true;
-        loadedEncounterId = encounterId;
-        loadedSpecName = specName;
-        activePhaseTimelineSet = phaseTimelineSet;
-        activePhaseOrdinal = timelineCandidate.PhaseOrdinal;
-        activePhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossDataId = 0;
-        pendingPhasePrimaryBossSeenUtc = default;
-        pendingExpectedPhaseBossDataId = 0;
-        pendingExpectedPhaseBossSeenUtc = default;
     }
 
     /// <summary>
@@ -1567,8 +870,6 @@ public sealed unsafe class EncounterTracker : IDisposable
 
     public void Dispose()
     {
-        dutyState.DutyWiped -= OnDutyReset;
-        dutyState.DutyCompleted -= OnDutyReset;
         framework.Update -= OnUpdate;
     }
 }

@@ -33,6 +33,7 @@ public sealed class Plugin : IDalamudPlugin
     public TimelineAggregator Aggregator { get; }
     public Data.RecastDatabase RecastDatabase { get; }
     public ActionStateDatabase ActionStateDatabase { get; }
+    public EnemyCastTracker EnemyCastTracker { get; }
 
     private readonly MainWindow mainWindow;
     private readonly OverlayWindow overlayWindow;
@@ -98,6 +99,7 @@ public sealed class Plugin : IDalamudPlugin
         RecastDatabase = new Data.RecastDatabase(dataManager, log);
         ActionStateDatabase = new ActionStateDatabase(RecastDatabase);
         Aggregator     = new TimelineAggregator(log, RecastDatabase);
+        EnemyCastTracker = new EnemyCastTracker(this, objectTable, framework, gameInterop, log);
 
         // Windows
         mainWindow = new MainWindow(this, log);
@@ -223,6 +225,7 @@ public sealed class Plugin : IDalamudPlugin
         antsController.Dispose();
         encounterTracker.Dispose();
         overlayWindow.Dispose();
+        EnemyCastTracker.Dispose();
         FFLogsClient.Dispose();
     }
 }

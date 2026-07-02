@@ -312,6 +312,9 @@ public sealed class MainWindow : Window
     private string cfgClientSecret = string.Empty;
     private bool   cfgInitialized;
     private bool   focusConfigTab;
+    private int    fightLogSelectedPull;
+    private bool   fightLogAutoScroll = true;
+    private bool   fightLogJumpToLatestRequested;
 
     // Hidden easter-egg: click "Config" tab 7 times rapidly to toggle auto-execute
     private int               secretClickCount;
@@ -422,6 +425,12 @@ public sealed class MainWindow : Window
         if (ImGui.BeginTabItem("Custom Timelines"))
         {
             DrawCustomTimelinesTab();
+            ImGui.EndTabItem();
+        }
+
+        if (plugin.Configuration.DebugEnabled && ImGui.BeginTabItem("Fight Log"))
+        {
+            DrawFightLogTab();
             ImGui.EndTabItem();
         }
 
@@ -12718,6 +12727,156 @@ private const double AutoHighConfidenceGcdFrequencyPct = 25.0;
     }
 
     // ── Config tab ──────────────────────────────────────────────────────
+
+    private void DrawFightLogTab()
+    {
+        var tracker = plugin.EnemyCastTracker;
+        var selectedPull = ResolveFightLogSelection(tracker);
+        var latestPull = tracker.Pulls.LastOrDefault();
+        var lastAlignment = tracker.LastAlignment;
+
+        if (lastAlignment != null)
+        {
+            ImGui.TextColored(new Vector4(0.55f, 0.95f, 0.70f, 1f),
+                $"Aligned: {EnemyCastTracker.FormatRelativeTime(lastAlignment.TimelineTimeSec)} via {lastAlignment.AbilityName} ({EnemyCastTracker.GetEventLabel(lastAlignment.EventKind)})");
+            ImGui.SameLine();
+            ImGui.TextDisabled($"entry {lastAlignment.BossIndex + 1}/{lastAlignment.BossEntryCount}");
+        }
+        else if (tracker.HasActiveTimeline)
+        {
+            ImGui.TextDisabled("No matching enemy actions logged for the active timeline yet.");
+        }
+        else
+        {
+            ImGui.TextDisabled("Load a timeline to begin tracking enemy actions.");
+        }
+
+        ImGui.Spacing();
+
+        var autoScroll = fightLogAutoScroll;
+        if (ImGui.Checkbox("Auto-scroll", ref autoScroll))
+            fightLogAutoScroll = autoScroll;
+
+        ImGui.SameLine();
+        if (ImGui.Button("Jump to latest"))
+        {
+            if (latestPull != null)
+                fightLogSelectedPull = latestPull.Index;
+            fightLogJumpToLatestRequested = true;
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Clear log"))
+        {
+            tracker.ClearAll();
+            fightLogSelectedPull = 0;
+        }
+
+        ImGui.SameLine();
+        ImGui.TextDisabled(latestPull == null
+            ? "No pulls"
+            : $"Viewing {(selectedPull == 0 ? "All" : $"Pull {selectedPull}")} · latest {latestPull.Label}");
+
+        ImGui.Spacing();
+
+        ImGui.BeginChild("##FightLogPulls", new Vector2(170, 0), true);
+        if (ImGui.Selectable("All", selectedPull == 0))
+            fightLogSelectedPull = 0;
+
+        for (var i = tracker.Pulls.Count - 1; i >= 0; i--)
+        {
+            var pull = tracker.Pulls[i];
+            var label = $"{pull.Label}\n{pull.FormatRange()}";
+            if (ImGui.Selectable(label, selectedPull == pull.Index, ImGuiSelectableFlags.None, new Vector2(0, 34)))
+                fightLogSelectedPull = pull.Index;
+        }
+        ImGui.EndChild();
+
+        ImGui.SameLine();
+        ImGui.BeginChild("##FightLogEvents", Vector2.Zero, true);
+
+        var filteredEvents = tracker.Events
+            .Where(entry => selectedPull == 0 || entry.PullIndex == selectedPull)
+            .OrderByDescending(entry => entry.Seq)
+            .ToList();
+
+        if (filteredEvents.Count == 0)
+        {
+            ImGui.TextDisabled("No enemy action history captured.");
+            ImGui.EndChild();
+            return;
+        }
+
+        var tableFlags =
+            ImGuiTableFlags.RowBg |
+            ImGuiTableFlags.BordersOuter |
+            ImGuiTableFlags.BordersV |
+            ImGuiTableFlags.ScrollY |
+            ImGuiTableFlags.SizingStretchProp;
+
+        if (ImGui.BeginTable("##FightLogTable", 5, tableFlags))
+        {
+            ImGui.TableSetupColumn("Time", ImGuiTableColumnFlags.WidthFixed, 90f);
+            ImGui.TableSetupColumn("Source", ImGuiTableColumnFlags.WidthFixed, 150f);
+            ImGui.TableSetupColumn("Event", ImGuiTableColumnFlags.WidthFixed, 90f);
+            ImGui.TableSetupColumn("Target", ImGuiTableColumnFlags.WidthFixed, 170f);
+            ImGui.TableSetupColumn("Detail", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableHeadersRow();
+
+            foreach (var entry in filteredEvents)
+            {
+                ImGui.TableNextRow();
+
+                ImGui.TableSetColumnIndex(0);
+                ImGui.TextUnformatted(EnemyCastTracker.FormatRelativeTime(entry.RelativeTimeSec));
+
+                ImGui.TableSetColumnIndex(1);
+                ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.45f, 0.45f, 1f));
+                ImGui.TextUnformatted(entry.SourceName);
+                ImGui.PopStyleColor();
+
+                ImGui.TableSetColumnIndex(2);
+                ImGui.PushStyleColor(ImGuiCol.Text, entry.Kind == EnemyCastTracker.EventKind.Ability
+                    ? new Vector4(0.95f, 0.85f, 0.40f, 1f)
+                    : new Vector4(1f, 0.60f, 0.25f, 1f));
+                ImGui.TextUnformatted(EnemyCastTracker.GetEventLabel(entry.Kind));
+                ImGui.PopStyleColor();
+
+                ImGui.TableSetColumnIndex(3);
+                if (string.IsNullOrWhiteSpace(entry.TargetName))
+                    ImGui.TextDisabled("-");
+                else
+                    ImGui.TextUnformatted(entry.TargetName);
+
+                ImGui.TableSetColumnIndex(4);
+                if (entry.TriggeredAlignment)
+                    ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.60f, 0.95f, 0.70f, 1f));
+                ImGui.TextUnformatted(EnemyCastTracker.BuildDetailText(entry));
+                if (entry.TriggeredAlignment)
+                    ImGui.PopStyleColor();
+            }
+
+            ImGui.EndTable();
+        }
+
+        if (fightLogJumpToLatestRequested || fightLogAutoScroll)
+        {
+            ImGui.SetScrollY(0f);
+            fightLogJumpToLatestRequested = false;
+        }
+
+        ImGui.EndChild();
+    }
+
+    private int ResolveFightLogSelection(EnemyCastTracker tracker)
+    {
+        if (fightLogSelectedPull == 0)
+            return 0;
+
+        return tracker.Pulls.Any(pull => pull.Index == fightLogSelectedPull)
+            ? fightLogSelectedPull
+            : 0;
+    }
 
     private void DrawConfigTab()
     {
